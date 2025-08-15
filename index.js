@@ -17,6 +17,16 @@ const pool = new pg.Pool({
 app.use(cors());
 app.use(express.json());
 
+// 🔍 مسار فحص الاتصال بقاعدة البيانات
+app.get("/health/db", async (_req, res) => {
+  try {
+    await pool.query("SELECT 1");
+    res.json({ ok: true, db: "connected" });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String(e) });
+  }
+});
+
 // مسار تجريبي للتأكد أن السيرفر شغال
 app.get("/", (req, res) => {
   res.send("🚀 API is running");
