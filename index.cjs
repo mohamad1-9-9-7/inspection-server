@@ -52,17 +52,21 @@ async function ensureSchema() {
     CREATE INDEX IF NOT EXISTS idx_reports_type ON reports(type);
     CREATE INDEX IF NOT EXISTS idx_reports_created_at ON reports(created_at);
 
-    -- فهرس فريد على (type, payload->>'reportDate') ليدعم الـ UPSERT
+    -- (اختياري) فهرس فريد لدعم upsert لاحقًا. إذا عندك بيانات مكررة ممكن يفشل.
     DO $$
     BEGIN
       IF NOT EXISTS (
-        SELECT 1
-        FROM   pg_indexes
-        WHERE  schemaname = 'public'
-        AND    indexname  = 'ux_reports_type_reportdate'
+        SELECT 1 FROM pg_indexes
+        WHERE schemaname = 'public'
+          AND indexname  = 'ux_reports_type_reportdate'
       ) THEN
-        EXECUTE 'CREATE UNIQUE INDEX ux_reports_type_reportdate
-                 ON reports (type, (payload->>''reportDate''))';
+        BEGIN
+          EXECUTE 'CREATE UNIQUE INDEX ux_reports_type_reportdate
+                   ON reports (type, (payload->>''reportDate''))';
+        EXCEPTION WHEN OTHERS THEN
+          -- لا توقف التشغيل لو فشل إنشاء الفهرس (مثلاً لوجود مكررات)
+          RAISE NOTICE 'Skipping unique index creation: %', SQLERRM;
+        END;
       END IF;
     END $$;
   `);
@@ -123,7 +127,7 @@ app.post("/api/reports", async (req, res) => {
   }
 });
 
-/** تعديل (UPSERT) حسب (type + reportDate) */
+/** تعديل (UPSERT) حسب (type + reportDate) — أسلوب خطوتين لتفادي مشاكل الفهرس */
 app.put("/api/reports", async (req, res) => {
   try {
     const { reporter, type, payload } = req.body || {};
@@ -131,22 +135,35 @@ app.put("/api/reports", async (req, res) => {
     if (!type || !isPlainObject(payload) || !reportDate) {
       return res.status(400).json({ ok: false, error: "type & payload.reportDate required" });
     }
-    const { rows } = await pool.query(
+
+    // 1) UPDATE أولاً
+    const upd = await pool.query(
+      `UPDATE reports
+         SET reporter = $1,
+             payload  = $2,
+             updated_at = now()
+       WHERE type = $3
+         AND payload->>'reportDate' = $4
+       RETURNING *`,
+      [reporter || "anonymous", payload, type, reportDate]
+    );
+
+    if (upd.rowCount > 0) {
+      return res.json({ ok: true, report: upd.rows[0], method: "update" });
+    }
+
+    // 2) لو ما لقى سجل، INSERT
+    const ins = await pool.query(
       `INSERT INTO reports (reporter, type, payload)
        VALUES ($1, $2, $3)
-       -- ✅ استخدام الأعمدة/التعبير بدل اسم الـ CONSTRAINT
-       ON CONFLICT (type, (payload->>'reportDate'))
-       DO UPDATE SET
-         reporter   = EXCLUDED.reporter,
-         payload    = EXCLUDED.payload,
-         updated_at = now()
        RETURNING *`,
       [reporter || "anonymous", type, payload]
     );
-    res.json({ ok: true, report: rows[0] });
+    return res.status(201).json({ ok: true, report: ins.rows[0], method: "insert" });
+
   } catch (e) {
-    console.error(e);
-    res.status(500).json({ ok: false, error: "db upsert failed" });
+    console.error("PUT /api/reports error:", e);
+    res.status(500).json({ ok: false, error: "db upsert (2-step) failed" });
   }
 });
 
@@ -164,8 +181,8 @@ app.put("/api/reports/:id", async (req, res) => {
     let p = 1;
 
     if (reporter !== undefined) { updates.push(`reporter = $${p++}`); params.push(reporter); }
-    if (type     !== undefined) { updates.push(`type = $${p++}`);     params.push(type); }
-    if (payload  !== undefined) { updates.push(`payload = $${p++}`);  params.push(payload); }
+    if (type     !== undefined) { updates.push(`type     = $${p++}`); params.push(type); }
+    if (payload  !== undefined) { updates.push(`payload  = $${p++}`); params.push(payload); }
 
     updates.push(`updated_at = now()`);
 
