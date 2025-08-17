@@ -83,7 +83,7 @@ app.get("/healthz", async (_req, res) => {
     res.status(500).json({ ok: false, error: String(e?.message || e) });
   }
 });
-app.get("/version", (_req, res) => res.json({ v: "open-crud-4" }));
+app.get("/version", (_req, res) => res.json({ v: "open-crud-5" }));
 app.get("/diag/ping", (_req, res) => res.json({ ok: true }));
 app.get("/diag/db", async (_req, res) => {
   try {
@@ -129,11 +129,12 @@ app.post("/api/reports", async (req, res) => {
     if (!type || !isPlainObject(payload)) {
       return res.status(400).json({ ok: false, error: "type & payload are required" });
     }
+    const payloadJson = JSON.stringify(payload);
     const { rows } = await pool.query(
       `INSERT INTO reports (reporter, type, payload)
        VALUES ($1, $2, $3::jsonb)
        RETURNING *`,
-      [reporter || "anonymous", type, payload]
+      [reporter || "anonymous", type, payloadJson]
     );
     res.status(201).json({ ok: true, report: rows[0] });
   } catch (e) {
@@ -142,7 +143,7 @@ app.post("/api/reports", async (req, res) => {
   }
 });
 
-/** تعديل (UPSERT) حسب (type + reportDate) — أسلوب خطوتين لتفادي مشاكل الفهرس + تصريح jsonb */
+/** تعديل (UPSERT) حسب (type + reportDate) — خطوتين + تصريح jsonb */
 app.put("/api/reports", async (req, res) => {
   try {
     let { reporter, type, payload } = req.body || {};
@@ -154,6 +155,8 @@ app.put("/api/reports", async (req, res) => {
 
     console.log("PUT /api/reports BODY =", JSON.stringify({ reporter, type, payload }));
 
+    const payloadJson = JSON.stringify(payload);
+
     // 1) UPDATE أولاً
     const upd = await pool.query(
       `UPDATE reports
@@ -163,7 +166,7 @@ app.put("/api/reports", async (req, res) => {
        WHERE type = $3
          AND payload->>'reportDate' = $4
        RETURNING *`,
-      [reporter || "anonymous", payload, type, String(reportDate)]
+      [reporter || "anonymous", payloadJson, type, String(reportDate)]
     );
 
     if (upd.rowCount > 0) {
@@ -175,12 +178,66 @@ app.put("/api/reports", async (req, res) => {
       `INSERT INTO reports (reporter, type, payload)
        VALUES ($1, $2, $3::jsonb)
        RETURNING *`,
-      [reporter || "anonymous", type, payload]
+      [reporter || "anonymous", type, payloadJson]
     );
     return res.status(201).json({ ok: true, report: ins.rows[0], method: "insert" });
 
   } catch (e) {
     console.error("PUT /api/reports ERROR =", e);
+    res.status(500).json({ ok: false, error: String(e?.message || e) });
+  }
+});
+
+/** مسار مخصوص للمرتجعات لتحديث items فقط: PUT /api/reports/returns?reportDate=YYYY-MM-DD
+ *  Body: { items: [...], _clientSavedAt?: number }
+ *  - يحدث items لو موجود
+ *  - إذا غير موجود ينشئ سجل جديد type='returns'
+ */
+app.put("/api/reports/returns", async (req, res) => {
+  try {
+    const reportDate = String(req.query.reportDate || "");
+    const body = parseMaybeJSON(req.body);
+    const items = Array.isArray(body?.items) ? body.items : null;
+    const clientTs = body?._clientSavedAt;
+
+    if (!reportDate) {
+      return res.status(400).json({ ok: false, error: "reportDate required" });
+    }
+    if (!Array.isArray(items)) {
+      return res.status(400).json({ ok: false, error: "items array required" });
+    }
+
+    // حاول تحديث items فقط
+    const itemsJson = JSON.stringify(items);
+    const upd = await pool.query(
+      `UPDATE reports
+         SET payload = jsonb_set(payload, '{items}', $1::jsonb, true),
+             updated_at = now()
+       WHERE type = 'returns'
+         AND payload->>'reportDate' = $2
+       RETURNING *`,
+      [itemsJson, reportDate]
+    );
+    if (upd.rowCount > 0) {
+      return res.json({ ok: true, report: upd.rows[0], method: "update-items" });
+    }
+
+    // لم يوجد سجل: أنشئ جديد
+    const newPayload = {
+      reportDate,
+      items,
+      _clientSavedAt: clientTs ?? Date.now(),
+    };
+    const newPayloadJson = JSON.stringify(newPayload);
+    const ins = await pool.query(
+      `INSERT INTO reports (reporter, type, payload)
+       VALUES ($1, $2, $3::jsonb)
+       RETURNING *`,
+      ["anonymous", "returns", newPayloadJson]
+    );
+    return res.status(201).json({ ok: true, report: ins.rows[0], method: "insert-items" });
+  } catch (e) {
+    console.error("PUT /api/reports/returns ERROR =", e);
     res.status(500).json({ ok: false, error: String(e?.message || e) });
   }
 });
@@ -202,7 +259,7 @@ app.put("/api/reports/:id", async (req, res) => {
 
     if (reporter !== undefined) { updates.push(`reporter = $${p++}`); params.push(reporter); }
     if (type     !== undefined) { updates.push(`type     = $${p++}`); params.push(type); }
-    if (payload  !== undefined) { updates.push(`payload  = $${p++}::jsonb`); params.push(payload); }
+    if (payload  !== undefined) { updates.push(`payload  = $${p++}::jsonb`); params.push(JSON.stringify(payload)); }
 
     updates.push(`updated_at = now()`);
 
