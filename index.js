@@ -1,63 +1,228 @@
-import express from "express";
-import cors from "cors";
-import dotenv from "dotenv";
-import pg from "pg";
+// index.js — Open-CRUD backend (Express + Postgres) with FULL public access
+// تشغيل محلي: PORT=5000 node index.js
+// متغيّرات البيئة: DATABASE_URL (Render Postgres)
 
-dotenv.config(); // قراءة ملف .env
+const express = require("express");
+const cors = require("cors");
+const pg = require("pg");
 
 const app = express();
 const PORT = process.env.PORT || 5000;
 
-// إعداد الاتصال بقاعدة البيانات
-const pool = new pg.Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false } // ضروري لـ Neon
+/* =================== CORS مفتوح للجميع =================== */
+app.use(
+  cors({
+    origin: "*",
+    methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allowedHeaders: ["Content-Type"],
+  })
+);
+// هيدر إضافي تحسّبًا
+app.use((req, res, next) => {
+  res.header("Access-Control-Allow-Origin", "*");
+  res.header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
+  res.header("Access-Control-Allow-Headers", "Content-Type");
+  if (req.method === "OPTIONS") return res.sendStatus(204);
+  next();
 });
 
-app.use(cors());
-app.use(express.json());
+/* =================== Body Parser =================== */
+app.use(express.json({ limit: "2mb" }));
 
-// 🔍 مسار فحص الاتصال بقاعدة البيانات
-app.get("/health/db", async (_req, res) => {
+/* =================== PostgreSQL =================== */
+const { Pool } = pg;
+// ✅ تفعيل SSL دائمًا (ضروري عادةً مع Render Postgres)
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false },
+});
+
+/* =================== تهيئة السكيمة =================== */
+async function ensureSchema() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS reports (
+      id          BIGSERIAL PRIMARY KEY,
+      reporter    TEXT,
+      type        TEXT NOT NULL,
+      payload     JSONB NOT NULL,         -- يحتوي reportDate و items
+      created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+      updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_reports_type ON reports(type);
+    CREATE INDEX IF NOT EXISTS idx_reports_created_at ON reports(created_at);
+
+    -- فهرس فريد على (type, payload->>'reportDate') ليدعم الـ UPSERT
+    DO $$
+    BEGIN
+      IF NOT EXISTS (
+        SELECT 1
+        FROM   pg_indexes
+        WHERE  schemaname = 'public'
+        AND    indexname  = 'ux_reports_type_reportdate'
+      ) THEN
+        EXECUTE 'CREATE UNIQUE INDEX ux_reports_type_reportdate
+                 ON reports (type, (payload->>''reportDate''))';
+      END IF;
+    END $$;
+  `);
+  console.log("✅ DB schema ready");
+}
+
+/* =================== Health =================== */
+app.get("/", (_req, res) => res.send("OK"));
+app.get("/healthz", async (_req, res) => {
   try {
     await pool.query("SELECT 1");
     res.json({ ok: true, db: "connected" });
   } catch (e) {
-    res.status(500).json({ ok: false, error: String(e) });
+    res.status(500).json({ ok: false, error: String(e?.message || e) });
   }
 });
+// نقطة سهلة لتأكيد النسخة المنشورة
+app.get("/version", (_req, res) => res.json({ v: "open-crud-2" }));
 
-// مسار تجريبي للتأكد أن السيرفر شغال
-app.get("/", (req, res) => {
-  res.send("🚀 API is running");
-});
+/* =================== Utilities =================== */
+function isPlainObject(x) {
+  return x && typeof x === "object" && !Array.isArray(x);
+}
 
-// مثال: جلب جميع التقارير
+/* =================== API =================== */
+/** قراءة كل التقارير أو حسب النوع */
 app.get("/api/reports", async (req, res) => {
+  const { type } = req.query;
   try {
-    const result = await pool.query("SELECT * FROM reports ORDER BY created_at DESC");
-    res.json(result.rows);
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Database error" });
+    const q = type
+      ? `SELECT * FROM reports WHERE type = $1 ORDER BY created_at DESC`
+      : `SELECT * FROM reports ORDER BY created_at DESC`;
+    const { rows } = await pool.query(q, type ? [type] : []);
+    res.json({ ok: true, data: rows });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ ok: false, error: "db select failed" });
   }
 });
 
-// مثال: إضافة تقرير جديد
+/** إضافة تقرير جديد (قد يُكرر لنفس اليوم إن لم تستخدم PUT/UPSERT) */
 app.post("/api/reports", async (req, res) => {
   try {
-    const { reporter, type, payload } = req.body;
-    const result = await pool.query(
-      "INSERT INTO reports (reporter, type, payload) VALUES ($1, $2, $3) RETURNING *",
-      [reporter, type, payload]
+    const { reporter, type, payload } = req.body || {};
+    if (!type || !isPlainObject(payload)) {
+      return res.status(400).json({ ok: false, error: "type & payload are required" });
+    }
+    const { rows } = await pool.query(
+      `INSERT INTO reports (reporter, type, payload)
+       VALUES ($1, $2, $3)
+       RETURNING *`,
+      [reporter || "anonymous", type, payload]
     );
-    res.status(201).json(result.rows[0]);
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Database error" });
+    res.status(201).json({ ok: true, report: rows[0] });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ ok: false, error: "db insert failed" });
   }
 });
 
-app.listen(PORT, () => {
-  console.log(`✅ Server running on port ${PORT}`);
+/** تعديل (UPSERT) حسب (type + reportDate) */
+app.put("/api/reports", async (req, res) => {
+  try {
+    const { reporter, type, payload } = req.body || {};
+    const reportDate = payload?.reportDate;
+    if (!type || !isPlainObject(payload) || !reportDate) {
+      return res.status(400).json({ ok: false, error: "type & payload.reportDate required" });
+    }
+    const { rows } = await pool.query(
+      `INSERT INTO reports (reporter, type, payload)
+       VALUES ($1, $2, $3)
+       -- ✅ استخدام الأعمدة/التعبير بدل اسم الـ CONSTRAINT
+       ON CONFLICT (type, (payload->>'reportDate'))
+       DO UPDATE SET
+         reporter   = EXCLUDED.reporter,
+         payload    = EXCLUDED.payload,
+         updated_at = now()
+       RETURNING *`,
+      [reporter || "anonymous", type, payload]
+    );
+    res.json({ ok: true, report: rows[0] });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ ok: false, error: "db upsert failed" });
+  }
 });
+
+/** تعديل بحسب ID */
+app.put("/api/reports/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { payload, reporter, type } = req.body || {};
+    if (!isPlainObject(payload) && reporter === undefined && type === undefined) {
+      return res.status(400).json({ ok: false, error: "nothing to update" });
+    }
+
+    const updates = [];
+    const params = [];
+    let p = 1;
+
+    if (reporter !== undefined) { updates.push(`reporter = $${p++}`); params.push(reporter); }
+    if (type     !== undefined) { updates.push(`type = $${p++}`);     params.push(type); }
+    if (payload  !== undefined) { updates.push(`payload = $${p++}`);  params.push(payload); }
+
+    updates.push(`updated_at = now()`);
+
+    const { rows, rowCount } = await pool.query(
+      `UPDATE reports SET ${updates.join(", ")}
+       WHERE id = $${p}
+       RETURNING *`,
+      [...params, id]
+    );
+    if (!rowCount) return res.status(404).json({ ok: false, error: "not found" });
+    res.json({ ok: true, report: rows[0] });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ ok: false, error: "db update failed" });
+  }
+});
+
+/** حذف حسب النوع + التاريخ */
+app.delete("/api/reports", async (req, res) => {
+  try {
+    const { type, reportDate } = req.query;
+    if (!type || !reportDate) {
+      return res.status(400).json({ ok: false, error: "type & reportDate required" });
+    }
+    const { rowCount } = await pool.query(
+      `DELETE FROM reports
+       WHERE type = $1 AND payload->>'reportDate' = $2`,
+      [type, reportDate]
+    );
+    res.json({ ok: true, deleted: rowCount });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ ok: false, error: "db delete failed" });
+  }
+});
+
+/** حذف حسب ID */
+app.delete("/api/reports/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { rowCount } = await pool.query(`DELETE FROM reports WHERE id = $1`, [id]);
+    if (!rowCount) return res.status(404).json({ ok: false, error: "not found" });
+    res.json({ ok: true, deleted: rowCount });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ ok: false, error: "db delete failed" });
+  }
+});
+
+/* =================== Boot =================== */
+ensureSchema()
+  .then(() => {
+    app.listen(PORT, () =>
+      console.log(`✅ API running on :${PORT} (FULL public access: read/write/delete enabled)`)
+    );
+  })
+  .catch((err) => {
+    console.error("❌ DB init failed:", err);
+    process.exit(1);
+  });
