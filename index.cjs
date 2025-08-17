@@ -83,7 +83,7 @@ app.get("/healthz", async (_req, res) => {
     res.status(500).json({ ok: false, error: String(e?.message || e) });
   }
 });
-app.get("/version", (_req, res) => res.json({ v: "open-crud-3" }));
+app.get("/version", (_req, res) => res.json({ v: "open-crud-4" }));
 app.get("/diag/ping", (_req, res) => res.json({ ok: true }));
 app.get("/diag/db", async (_req, res) => {
   try {
@@ -97,6 +97,12 @@ app.get("/diag/db", async (_req, res) => {
 /* =================== Utilities =================== */
 function isPlainObject(x) {
   return x && typeof x === "object" && !Array.isArray(x);
+}
+function parseMaybeJSON(val) {
+  if (val && typeof val === "string") {
+    try { return JSON.parse(val); } catch { /* leave as-is */ }
+  }
+  return val;
 }
 
 /* =================== API =================== */
@@ -118,39 +124,41 @@ app.get("/api/reports", async (req, res) => {
 /** إضافة تقرير جديد (قد يُكرر لنفس اليوم إن لم تستخدم PUT/UPSERT) */
 app.post("/api/reports", async (req, res) => {
   try {
-    const { reporter, type, payload } = req.body || {};
+    let { reporter, type, payload } = req.body || {};
+    payload = parseMaybeJSON(payload);
     if (!type || !isPlainObject(payload)) {
       return res.status(400).json({ ok: false, error: "type & payload are required" });
     }
     const { rows } = await pool.query(
       `INSERT INTO reports (reporter, type, payload)
-       VALUES ($1, $2, $3)
+       VALUES ($1, $2, $3::jsonb)
        RETURNING *`,
       [reporter || "anonymous", type, payload]
     );
     res.status(201).json({ ok: true, report: rows[0] });
   } catch (e) {
     console.error(e);
-    res.status(500).json({ ok: false, error: "db insert failed" });
+    res.status(500).json({ ok: false, error: String(e?.message || e) });
   }
 });
 
-/** تعديل (UPSERT) حسب (type + reportDate) — أسلوب خطوتين لتفادي مشاكل الفهرس */
+/** تعديل (UPSERT) حسب (type + reportDate) — أسلوب خطوتين لتفادي مشاكل الفهرس + تصريح jsonb */
 app.put("/api/reports", async (req, res) => {
   try {
-    const { reporter, type, payload } = req.body || {};
+    let { reporter, type, payload } = req.body || {};
+    payload = parseMaybeJSON(payload);
     const reportDate = payload?.reportDate;
     if (!type || !isPlainObject(payload) || !reportDate) {
       return res.status(400).json({ ok: false, error: "type & payload.reportDate required" });
     }
 
-    console.log("PUT /api/reports BODY =", JSON.stringify(req.body)); // تشخيص
+    console.log("PUT /api/reports BODY =", JSON.stringify({ reporter, type, payload }));
 
     // 1) UPDATE أولاً
     const upd = await pool.query(
       `UPDATE reports
          SET reporter = $1,
-             payload  = $2,
+             payload  = $2::jsonb,
              updated_at = now()
        WHERE type = $3
          AND payload->>'reportDate' = $4
@@ -165,7 +173,7 @@ app.put("/api/reports", async (req, res) => {
     // 2) لو ما لقى سجل، INSERT
     const ins = await pool.query(
       `INSERT INTO reports (reporter, type, payload)
-       VALUES ($1, $2, $3)
+       VALUES ($1, $2, $3::jsonb)
        RETURNING *`,
       [reporter || "anonymous", type, payload]
     );
@@ -181,7 +189,9 @@ app.put("/api/reports", async (req, res) => {
 app.put("/api/reports/:id", async (req, res) => {
   try {
     const { id } = req.params;
-    const { payload, reporter, type } = req.body || {};
+    let { payload, reporter, type } = req.body || {};
+    payload = parseMaybeJSON(payload);
+
     if (!isPlainObject(payload) && reporter === undefined && type === undefined) {
       return res.status(400).json({ ok: false, error: "nothing to update" });
     }
@@ -192,7 +202,7 @@ app.put("/api/reports/:id", async (req, res) => {
 
     if (reporter !== undefined) { updates.push(`reporter = $${p++}`); params.push(reporter); }
     if (type     !== undefined) { updates.push(`type     = $${p++}`); params.push(type); }
-    if (payload  !== undefined) { updates.push(`payload  = $${p++}`); params.push(payload); }
+    if (payload  !== undefined) { updates.push(`payload  = $${p++}::jsonb`); params.push(payload); }
 
     updates.push(`updated_at = now()`);
 
@@ -206,7 +216,7 @@ app.put("/api/reports/:id", async (req, res) => {
     res.json({ ok: true, report: rows[0] });
   } catch (e) {
     console.error(e);
-    res.status(500).json({ ok: false, error: "db update failed" });
+    res.status(500).json({ ok: false, error: String(e?.message || e) });
   }
 });
 
@@ -225,7 +235,7 @@ app.delete("/api/reports", async (req, res) => {
     res.json({ ok: true, deleted: rowCount });
   } catch (e) {
     console.error(e);
-    res.status(500).json({ ok: false, error: "db delete failed" });
+    res.status(500).json({ ok: false, error: String(e?.message || e) });
   }
 });
 
@@ -238,7 +248,7 @@ app.delete("/api/reports/:id", async (req, res) => {
     res.json({ ok: true, deleted: rowCount });
   } catch (e) {
     console.error(e);
-    res.status(500).json({ ok: false, error: "db delete failed" });
+    res.status(500).json({ ok: false, error: String(e?.message || e) });
   }
 });
 
