@@ -1,5 +1,5 @@
-// index.js — Open-CRUD backend (Express + Postgres) with FULL public access
-// تشغيل محلي: PORT=5000 node index.js
+// index.cjs — Open-CRUD backend (Express + Postgres) with FULL public access
+// تشغيل محلي: PORT=5000 node index.cjs
 // متغيّرات البيئة: DATABASE_URL (Render Postgres)
 
 const express = require("express");
@@ -73,7 +73,7 @@ async function ensureSchema() {
   console.log("✅ DB schema ready");
 }
 
-/* =================== Health =================== */
+/* =================== Health & Diag =================== */
 app.get("/", (_req, res) => res.send("OK"));
 app.get("/healthz", async (_req, res) => {
   try {
@@ -83,8 +83,16 @@ app.get("/healthz", async (_req, res) => {
     res.status(500).json({ ok: false, error: String(e?.message || e) });
   }
 });
-// نقطة سهلة لتأكيد النسخة المنشورة
-app.get("/version", (_req, res) => res.json({ v: "open-crud-2" }));
+app.get("/version", (_req, res) => res.json({ v: "open-crud-3" }));
+app.get("/diag/ping", (_req, res) => res.json({ ok: true }));
+app.get("/diag/db", async (_req, res) => {
+  try {
+    const r = await pool.query("SELECT NOW() AS now");
+    res.json({ ok: true, now: r.rows[0].now });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String(e?.message || e) });
+  }
+});
 
 /* =================== Utilities =================== */
 function isPlainObject(x) {
@@ -136,6 +144,8 @@ app.put("/api/reports", async (req, res) => {
       return res.status(400).json({ ok: false, error: "type & payload.reportDate required" });
     }
 
+    console.log("PUT /api/reports BODY =", JSON.stringify(req.body)); // تشخيص
+
     // 1) UPDATE أولاً
     const upd = await pool.query(
       `UPDATE reports
@@ -145,7 +155,7 @@ app.put("/api/reports", async (req, res) => {
        WHERE type = $3
          AND payload->>'reportDate' = $4
        RETURNING *`,
-      [reporter || "anonymous", payload, type, reportDate]
+      [reporter || "anonymous", payload, type, String(reportDate)]
     );
 
     if (upd.rowCount > 0) {
@@ -162,8 +172,8 @@ app.put("/api/reports", async (req, res) => {
     return res.status(201).json({ ok: true, report: ins.rows[0], method: "insert" });
 
   } catch (e) {
-    console.error("PUT /api/reports error:", e);
-    res.status(500).json({ ok: false, error: "db upsert (2-step) failed" });
+    console.error("PUT /api/reports ERROR =", e);
+    res.status(500).json({ ok: false, error: String(e?.message || e) });
   }
 });
 
