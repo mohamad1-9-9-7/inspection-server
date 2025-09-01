@@ -1,12 +1,12 @@
 // index.cjs — Open-CRUD backend (Express + Postgres) + Cloudinary upload
 require("dotenv").config(); // يحمل DATABASE_URL و CLOUDINARY_URL
 
-const express   = require("express");
-const cors      = require("cors");
-const pg        = require("pg");
-const multer    = require("multer");
-const sharp     = require("sharp");
-const cloudinary= require("cloudinary").v2; // يستخدم CLOUDINARY_URL من .env تلقائياً
+const express    = require("express");
+const cors       = require("cors");
+const pg         = require("pg");
+const multer     = require("multer");
+// ❌ تمت إزالة sharp نهائياً
+const cloudinary = require("cloudinary").v2; // يستخدم CLOUDINARY_URL تلقائياً
 
 cloudinary.config({ secure: true });
 
@@ -63,7 +63,7 @@ async function ensureSchema() {
     );
   `);
 
-  // (جدول images سيبقى اختياري/قديم — لم نعد نستخدمه بعد التحويل إلى Cloudinary)
+  // جدول images قديم/اختياري — يُترك للتوافق مع الإصدارات القديمة
   await pool.query(`
     CREATE EXTENSION IF NOT EXISTS pgcrypto;
     CREATE TABLE IF NOT EXISTS images (
@@ -268,8 +268,8 @@ app.get("/health/db", async (_req, res) => {
   }
 });
 
-/* =================== Images API → Cloudinary =================== */
-// نسمح بأي اسم حقل: file / image / images[] (بنأخذ أول ملف)
+/* =================== Images API → Cloudinary (بدون sharp) =================== */
+// نقبل أي اسم حقل (file/image/images[]) ونأخذ أول ملف
 const uploadAny = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 20 * 1024 * 1024 }, // 20MB
@@ -285,36 +285,34 @@ function uploadBufferToCloudinary(buffer, opts = {}) {
   });
 }
 
-const MAX_DIM = 1280;
-const JPEG_QUALITY = 80;
-
 app.post("/api/images", uploadAny.any(), async (req, res) => {
   try {
     const f = (req.files && req.files[0]) || req.file;
-    if (!f) return res.status(400).json({ ok: false, error: "no file" });
+    const dataUrl = req.body?.data; // بديل لو أرسلت Base64
 
-    const isImage = (f.mimetype || "").startsWith("image/");
-
-    let bufferToUpload = f.buffer;
-    if (isImage) {
-      // ضغط/تصغير للصور فقط
-      let p = sharp(f.buffer, { failOnError: false });
-      const meta = await p.metadata();
-      if ((meta.width || 0) > MAX_DIM || (meta.height || 0) > MAX_DIM) {
-        p = p.resize({ width: MAX_DIM, height: MAX_DIM, fit: "inside", withoutEnlargement: true });
-      }
-      bufferToUpload = await p.jpeg({ quality: JPEG_QUALITY }).toBuffer();
+    let up;
+    if (f?.buffer) {
+      // رفع مباشر للملف كما هو (Cloudinary تتكفل بالتحسين)
+      up = await uploadBufferToCloudinary(f.buffer, { folder: "qcs", resource_type: "auto" });
+    } else if (typeof dataUrl === "string" && dataUrl.startsWith("data:")) {
+      up = await cloudinary.uploader.upload(dataUrl, { folder: "qcs" });
+    } else {
+      return res.status(400).json({ ok: false, error: "no file/data" });
     }
 
-    const up = await uploadBufferToCloudinary(bufferToUpload, {
-      public_id: undefined, // دع Cloudinary يحدد الاسم
-      folder: "qcs",
-      resource_type: "auto", // يقبل صور/PDF/ملفات
-    });
+    // رابط مُحسّن (صور فقط) 1280px وجودة ~80 — توليده عبر URL تحوي تحويلاً
+    let optimized_url = up.secure_url;
+    if ((up.resource_type || "image") === "image") {
+      optimized_url = cloudinary.url(up.public_id, {
+        secure: true,
+        transformation: [{ width: 1280, height: 1280, crop: "limit", quality: "80" }],
+      });
+    }
 
     return res.json({
       ok: true,
-      url: up.secure_url,
+      url: up.secure_url,          // الأصلي
+      optimized_url,               // المفضل للاستخدام في الواجهة
       public_id: up.public_id,
       width: up.width || null,
       height: up.height || null,
@@ -323,7 +321,7 @@ app.post("/api/images", uploadAny.any(), async (req, res) => {
       resource_type: up.resource_type || null,
     });
   } catch (e) {
-    console.error("Cloudinary upload failed:", e);
+    console.error("Cloudinary upload failed:", e?.message || e);
     res.status(500).json({ ok: false, error: "cloudinary upload failed" });
   }
 });
