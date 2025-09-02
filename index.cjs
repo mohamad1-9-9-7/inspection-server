@@ -298,6 +298,147 @@ app.post("/api/images", uploadAny.any(), async (req,res)=>{
   }
 });
 
+/* ========= Cloudinary delete helpers & route ========= */
+/** يستخرج public_id و resource_type و delivery_type من رابط Cloudinary (حتى مع التحويلات) */
+function parseCloudinaryUrl(u) {
+  try {
+    const { pathname } = new URL(u);
+    const parts = pathname.split("/").filter(Boolean);
+    // بنية: /<cloud_name>/<resource_type>/<delivery_type>/<transforms?>/v12345/<public_id>.<ext>
+    const rIdx = parts.findIndex((p) => p === "image" || p === "video" || p === "raw");
+    if (rIdx < 0 || !parts[rIdx + 1]) return null;
+    const resource_type = parts[rIdx];
+    const delivery_type = parts[rIdx + 1];
+
+    // تخطّي التحويلات حتى نصل إلى v12345
+    let vIdx = rIdx + 2;
+    while (vIdx < parts.length && !/^v\d+$/.test(parts[vIdx])) vIdx++;
+    if (vIdx >= parts.length - 1) return null;
+
+    const rest = parts.slice(vIdx + 1).join("/"); // قد يحوي مجلدات
+    const dot = rest.lastIndexOf(".");
+    const public_id = dot > 0 ? rest.slice(0, dot) : rest;
+
+    return { resource_type, delivery_type, public_id };
+  } catch {
+    return null;
+  }
+}
+
+/** حذف عنصر واحد عبر public_id (يدعم image/video/raw) */
+async function destroyOne({ public_id, resource_type = "image", delivery_type = "upload" }) {
+  const out = await cloudinary.uploader.destroy(public_id, {
+    resource_type,
+    type: delivery_type,
+    invalidate: true,
+  });
+  const ok = out?.result === "ok" || out?.result === "not found" || out?.result === "queued";
+  if (!ok) {
+    const err = new Error("CLOUDINARY_DESTROY_FAILED");
+    err.details = out;
+    throw err;
+  }
+  return out;
+}
+
+/** حذف من رابط واحد */
+async function destroyOneByUrl(url) {
+  const info = parseCloudinaryUrl(url);
+  if (!info) throw new Error("BAD_CLOUDINARY_URL");
+  return destroyOne({
+    public_id: info.public_id,
+    resource_type: info.resource_type,
+    delivery_type: info.delivery_type,
+  });
+}
+
+/**
+ * DELETE /api/images
+ * - رابط واحد:   ?url=...
+ * - publicId واحد: ?publicId=...
+ * - دفعة: body: { urls: [...], publicIds: [...], resourceType?, deliveryType? }
+ */
+app.delete("/api/images", async (req, res) => {
+  try {
+    const cfg = cloudinary.config();
+    const missing = ["cloud_name","api_key","api_secret"].filter((k) => !cfg[k]);
+    if (missing.length) return res.status(500).json({ ok:false, error:"CLOUDINARY_CONFIG_MISSING", missing });
+
+    const qUrl       = req.query?.url;
+    const qPublicId  = req.query?.publicId;
+    const bUrl       = req.body?.url;
+    const bPublicId  = req.body?.publicId;
+    const urls       = Array.isArray(req.body?.urls) ? req.body.urls : [];
+    const publicIds  = Array.isArray(req.body?.publicIds) ? req.body.publicIds : [];
+
+    const overrideResource = req.body?.resourceType; // "image" | "video" | "raw"
+    const overrideDelivery = req.body?.deliveryType; // "upload" | "private" | "authenticated" ...
+
+    const jobs = [];
+
+    // من الروابط
+    const allUrls = []
+      .concat(qUrl ? [qUrl] : [])
+      .concat(bUrl ? [bUrl] : [])
+      .concat(urls)
+      .filter(Boolean);
+
+    for (const u of [...new Set(allUrls)]) {
+      if (overrideResource || overrideDelivery) {
+        const info = parseCloudinaryUrl(u);
+        if (!info) {
+          jobs.push(Promise.reject(new Error("BAD_CLOUDINARY_URL")));
+        } else {
+          jobs.push(
+            destroyOne({
+              public_id: info.public_id,
+              resource_type: overrideResource || info.resource_type,
+              delivery_type: overrideDelivery || info.delivery_type,
+            })
+          );
+        }
+      } else {
+        jobs.push(destroyOneByUrl(u));
+      }
+    }
+
+    // من publicId
+    const allPublicIds = []
+      .concat(qPublicId ? [qPublicId] : [])
+      .concat(bPublicId ? [bPublicId] : [])
+      .concat(publicIds)
+      .filter(Boolean);
+
+    for (const pid of [...new Set(allPublicIds)]) {
+      jobs.push(
+        destroyOne({
+          public_id: pid,
+          resource_type: overrideResource || "image",
+          delivery_type: overrideDelivery || "upload",
+        })
+      );
+    }
+
+    if (!jobs.length) return res.status(400).json({ ok:false, error:"url/publicId or arrays required" });
+
+    const results = await Promise.allSettled(jobs);
+    const deleted = results.filter(r => r.status === "fulfilled").length;
+    const failed  = results.length - deleted;
+
+    res.json({
+      ok: failed === 0,
+      deleted,
+      failed,
+      results: results.map((r, i) =>
+        r.status === "fulfilled" ? { i, status: "ok" } : { i, status: "error", reason: String(r.reason?.message || r.reason) }
+      ),
+    });
+  } catch (e) {
+    console.error("DELETE /api/images ERROR:", e);
+    res.status(500).json({ ok:false, error:String(e?.message || e) });
+  }
+});
+
 /* --------- Legacy DB image serve --------- */
 app.get("/api/images/:id", async (req,res)=>{
   try{
