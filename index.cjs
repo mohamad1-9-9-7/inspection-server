@@ -76,24 +76,13 @@ const isObj = (x)=> x && typeof x==="object" && !Array.isArray(x);
 const parseMaybeJSON = (x)=> isObj(x) ? x : (typeof x==="string" ? (()=>{try{return JSON.parse(x)}catch{return x}})() : x);
 
 /* --------- Reports API --------- */
-// جلب قائمة التقارير فقط الحقول العامة (بدون تفاصيل وصور)
+// جلب قائمة التقارير كاملة (كل الأعمدة)
 app.get("/api/reports", async (req, res) => {
   try {
     const { type } = req.query;
-    // فقط الحقول العامة: id, type, created_at, payload->>uniqueKey, payload->>sequence, payload->>shipmentType, payload->>status, payload->>generalInfo
     const q = type
-      ? `SELECT id, type, created_at, payload->>'uniqueKey' AS uniqueKey,
-          payload->>'sequence' AS sequence,
-          payload->>'shipmentType' AS shipmentType,
-          payload->>'status' AS status,
-          payload->>'generalInfo' AS generalInfo
-         FROM reports WHERE type=$1 ORDER BY created_at DESC LIMIT 200`
-      : `SELECT id, type, created_at, payload->>'uniqueKey' AS uniqueKey,
-          payload->>'sequence' AS sequence,
-          payload->>'shipmentType' AS shipmentType,
-          payload->>'status' AS status,
-          payload->>'generalInfo' AS generalInfo
-         FROM reports ORDER BY created_at DESC LIMIT 200`;
+      ? `SELECT * FROM reports WHERE type=$1 ORDER BY created_at DESC LIMIT 200`
+      : `SELECT * FROM reports ORDER BY created_at DESC LIMIT 200`;
     const { rows } = await pool.query(q, type ? [type] : []);
     res.json({ ok: true, data: rows });
   } catch (e) {
@@ -107,14 +96,10 @@ app.get("/api/reports/:id", async (req, res) => {
   try {
     const { id } = req.params;
     const { type } = req.query;
-    // تعديل مهم: حول id إلى رقم وتحقق منه
-    const reportId = Number(id);
-    if (!reportId || isNaN(reportId)) return res.status(400).json({ ok: false, error: "invalid id" });
-
     const q = type
       ? `SELECT * FROM reports WHERE id=$1 AND type=$2 LIMIT 1`
       : `SELECT * FROM reports WHERE id=$1 LIMIT 1`;
-    const params = type ? [reportId, type] : [reportId];
+    const params = type ? [id, type] : [id];
     const { rows } = await pool.query(q, params);
     if (!rows.length) return res.status(404).json({ ok: false, error: "not found" });
     res.json({ ok: true, data: rows[0] });
@@ -224,9 +209,7 @@ app.delete("/api/reports", async (req,res)=>{
 
 app.delete("/api/reports/:id", async (req,res)=>{
   try{
-    const reportId = Number(req.params.id); // تحويل id إلى رقم
-    if (!reportId || isNaN(reportId)) return res.status(400).json({ ok: false, error: "invalid id" });
-    const { rowCount } = await pool.query(`DELETE FROM reports WHERE id=$1`, [reportId]);
+    const { rowCount } = await pool.query(`DELETE FROM reports WHERE id=$1`, [req.params.id]);
     if(!rowCount) return res.status(404).json({ ok:false, error:"not found" });
     res.json({ ok:true, deleted: rowCount });
   }catch(e){
