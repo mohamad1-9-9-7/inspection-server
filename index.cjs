@@ -107,10 +107,14 @@ app.get("/api/reports/:id", async (req, res) => {
   try {
     const { id } = req.params;
     const { type } = req.query;
+    // تعديل مهم: حول id إلى رقم وتحقق منه
+    const reportId = Number(id);
+    if (!reportId || isNaN(reportId)) return res.status(400).json({ ok: false, error: "invalid id" });
+
     const q = type
       ? `SELECT * FROM reports WHERE id=$1 AND type=$2 LIMIT 1`
       : `SELECT * FROM reports WHERE id=$1 LIMIT 1`;
-    const params = type ? [id, type] : [id];
+    const params = type ? [reportId, type] : [reportId];
     const { rows } = await pool.query(q, params);
     if (!rows.length) return res.status(404).json({ ok: false, error: "not found" });
     res.json({ ok: true, data: rows[0] });
@@ -220,7 +224,9 @@ app.delete("/api/reports", async (req,res)=>{
 
 app.delete("/api/reports/:id", async (req,res)=>{
   try{
-    const { rowCount } = await pool.query(`DELETE FROM reports WHERE id=$1`, [req.params.id]);
+    const reportId = Number(req.params.id); // تحويل id إلى رقم
+    if (!reportId || isNaN(reportId)) return res.status(400).json({ ok: false, error: "invalid id" });
+    const { rowCount } = await pool.query(`DELETE FROM reports WHERE id=$1`, [reportId]);
     if(!rowCount) return res.status(404).json({ ok:false, error:"not found" });
     res.json({ ok:true, deleted: rowCount });
   }catch(e){
