@@ -11,11 +11,19 @@ const app  = express();
 const PORT = process.env.PORT || 5000;
 
 /* --------- CORS --------- */
-app.use(cors({ origin: "*", methods: ["GET","POST","PUT","DELETE","OPTIONS"], allowedHeaders: ["Content-Type"] }));
+/* ✅ FIX: allow PATCH + allow Accept headers + correct preflight */
+app.use(
+  cors({
+    origin: "*",
+    methods: ["GET","POST","PUT","PATCH","DELETE","OPTIONS"],
+    allowedHeaders: ["Content-Type","Accept","Authorization"],
+  })
+);
+
 app.use((req,res,next)=>{
   res.header("Access-Control-Allow-Origin","*");
-  res.header("Access-Control-Allow-Methods","GET, POST, PUT, DELETE, OPTIONS");
-  res.header("Access-Control-Allow-Headers","Content-Type");
+  res.header("Access-Control-Allow-Methods","GET, POST, PUT, PATCH, DELETE, OPTIONS");
+  res.header("Access-Control-Allow-Headers","Content-Type, Accept, Authorization");
   if (req.method === "OPTIONS") return res.sendStatus(204);
   next();
 });
@@ -92,29 +100,47 @@ app.post("/api/reports", async (req,res)=>{
   try{
     let { reporter, type, payload } = req.body || {};
     payload = parseMaybeJSON(payload);
-    if(!type || !isObj(payload)) return res.status(400).json({ ok:false, error:"type & payload are required" });
+
+    if(!type || !isObj(payload)) {
+      return res.status(400).json({ ok:false, error:"type & payload are required" });
+    }
+
     const { rows } = await pool.query(
       `INSERT INTO reports (reporter,type,payload) VALUES ($1,$2,$3::jsonb) RETURNING *`,
       [reporter||"anonymous", type, payload]
     );
-    res.status(201).json({ ok:true, report: rows[0] });
+
+    return res.status(201).json({ ok:true, report: rows[0] });
   }catch(e){
-    console.error(e); res.status(500).json({ ok:false, error:String(e?.message||e) });
+    console.error("POST /api/reports ERROR =", e);
+
+    if (e && e.code === "23505") {
+      return res.status(409).json({
+        ok: false,
+        error: "DUPLICATE_REPORT",
+        message: "Report for this type and date already exists.",
+      });
+    }
+
+    return res.status(500).json({ ok:false, error:String(e?.message||e) });
   }
 });
 
+/* ✅ existing upsert by type + reportDate */
 app.put("/api/reports", async (req,res)=>{
   try{
     const { reporter, type } = req.body || {};
     let payload = parseMaybeJSON(req.body?.payload);
     const reportDate = payload?.reportDate || req.query?.reportDate || "";
     if(!type || !isObj(payload) || !reportDate) return res.status(400).json({ ok:false, error:"type + payload.reportDate required" });
+
     const upd = await pool.query(
       `UPDATE reports SET reporter = COALESCE($1,reporter), payload=$2::jsonb, updated_at=now()
        WHERE type=$3 AND payload->>'reportDate'=$4 RETURNING *`,
       [reporter||"anonymous", payload, type, reportDate]
     );
     if (upd.rowCount>0) return res.json({ ok:true, report: upd.rows[0], method:"update" });
+
     const ins = await pool.query(
       `INSERT INTO reports (reporter,type,payload) VALUES ($1,$2,$3::jsonb) RETURNING *`,
       [reporter||"anonymous", type, payload]
@@ -126,6 +152,39 @@ app.put("/api/reports", async (req,res)=>{
   }
 });
 
+/* ✅ FIX: update by ID (this is what your Edit Save needs) */
+async function updateReportById(req, res) {
+  try {
+    const id = String(req.params.id || "");
+    let { reporter, type, payload } = req.body || {};
+    payload = parseMaybeJSON(payload);
+
+    if (!id) return res.status(400).json({ ok: false, error: "id required" });
+    if (!isObj(payload)) return res.status(400).json({ ok: false, error: "payload is required" });
+
+    const { rows, rowCount } = await pool.query(
+      `UPDATE reports
+         SET reporter   = COALESCE($1, reporter),
+             type       = COALESCE($2, type),
+             payload    = $3::jsonb,
+             updated_at = now()
+       WHERE id = $4
+       RETURNING *`,
+      [reporter || null, type || null, payload, id]
+    );
+
+    if (!rowCount) return res.status(404).json({ ok:false, error:"not found" });
+    return res.json({ ok:true, report: rows[0] });
+  } catch (e) {
+    console.error("UPDATE /api/reports/:id ERROR =", e);
+    return res.status(500).json({ ok:false, error:String(e?.message||e) });
+  }
+}
+
+app.put("/api/reports/:id", updateReportById);
+app.patch("/api/reports/:id", updateReportById);
+
+/* --------- Special upserts --------- */
 app.put("/api/reports/returns", async (req,res)=>{
   try{
     const reportDate = String(req.query.reportDate||"");
@@ -207,7 +266,6 @@ app.delete("/api/reports/:id", async (req,res)=>{
       secure: true,
     });
   } else {
-    // يعتمد على CLOUDINARY_URL=cloudinary://KEY:SECRET@CLOUD_NAME
     cloudinary.config({ secure: true });
   }
   const cfg = cloudinary.config();
@@ -246,7 +304,6 @@ function uploadBufferToCloudinary(buffer, opts = {}) {
 
 app.post("/api/images", uploadAny.any(), async (req,res)=>{
   try{
-    // تأكد من الإعدادات قبل الرفع
     const cfg = cloudinary.config();
     const missing = ["cloud_name","api_key","api_secret"].filter(k => !cfg[k]);
     if (missing.length) {
@@ -285,7 +342,6 @@ app.post("/api/images", uploadAny.any(), async (req,res)=>{
       resource_type: up.resource_type || null,
     });
   }catch(e){
-    // نُظهر سبب Cloudinary الحقيقي للواجهة لتسهيل التشخيص
     const errPayload = {
       ok:false,
       error:"cloudinary upload failed",
@@ -299,23 +355,20 @@ app.post("/api/images", uploadAny.any(), async (req,res)=>{
 });
 
 /* ========= Cloudinary delete helpers & route ========= */
-/** يستخرج public_id و resource_type و delivery_type من رابط Cloudinary (حتى مع التحويلات) */
 function parseCloudinaryUrl(u) {
   try {
     const { pathname } = new URL(u);
     const parts = pathname.split("/").filter(Boolean);
-    // بنية: /<cloud_name>/<resource_type>/<delivery_type>/<transforms?>/v12345/<public_id>.<ext>
     const rIdx = parts.findIndex((p) => p === "image" || p === "video" || p === "raw");
     if (rIdx < 0 || !parts[rIdx + 1]) return null;
     const resource_type = parts[rIdx];
     const delivery_type = parts[rIdx + 1];
 
-    // تخطّي التحويلات حتى نصل إلى v12345
     let vIdx = rIdx + 2;
     while (vIdx < parts.length && !/^v\d+$/.test(parts[vIdx])) vIdx++;
     if (vIdx >= parts.length - 1) return null;
 
-    const rest = parts.slice(vIdx + 1).join("/"); // قد يحوي مجلدات
+    const rest = parts.slice(vIdx + 1).join("/");
     const dot = rest.lastIndexOf(".");
     const public_id = dot > 0 ? rest.slice(0, dot) : rest;
 
@@ -325,7 +378,6 @@ function parseCloudinaryUrl(u) {
   }
 }
 
-/** حذف عنصر واحد عبر public_id (يدعم image/video/raw) */
 async function destroyOne({ public_id, resource_type = "image", delivery_type = "upload" }) {
   const out = await cloudinary.uploader.destroy(public_id, {
     resource_type,
@@ -341,7 +393,6 @@ async function destroyOne({ public_id, resource_type = "image", delivery_type = 
   return out;
 }
 
-/** حذف من رابط واحد */
 async function destroyOneByUrl(url) {
   const info = parseCloudinaryUrl(url);
   if (!info) throw new Error("BAD_CLOUDINARY_URL");
@@ -352,12 +403,6 @@ async function destroyOneByUrl(url) {
   });
 }
 
-/**
- * DELETE /api/images
- * - رابط واحد:   ?url=...
- * - publicId واحد: ?publicId=...
- * - دفعة: body: { urls: [...], publicIds: [...], resourceType?, deliveryType? }
- */
 app.delete("/api/images", async (req, res) => {
   try {
     const cfg = cloudinary.config();
@@ -371,12 +416,11 @@ app.delete("/api/images", async (req, res) => {
     const urls       = Array.isArray(req.body?.urls) ? req.body.urls : [];
     const publicIds  = Array.isArray(req.body?.publicIds) ? req.body.publicIds : [];
 
-    const overrideResource = req.body?.resourceType; // "image" | "video" | "raw"
-    const overrideDelivery = req.body?.deliveryType; // "upload" | "private" | "authenticated" ...
+    const overrideResource = req.body?.resourceType;
+    const overrideDelivery = req.body?.deliveryType;
 
     const jobs = [];
 
-    // من الروابط
     const allUrls = []
       .concat(qUrl ? [qUrl] : [])
       .concat(bUrl ? [bUrl] : [])
@@ -386,9 +430,8 @@ app.delete("/api/images", async (req, res) => {
     for (const u of [...new Set(allUrls)]) {
       if (overrideResource || overrideDelivery) {
         const info = parseCloudinaryUrl(u);
-        if (!info) {
-          jobs.push(Promise.reject(new Error("BAD_CLOUDINARY_URL")));
-        } else {
+        if (!info) jobs.push(Promise.reject(new Error("BAD_CLOUDINARY_URL")));
+        else {
           jobs.push(
             destroyOne({
               public_id: info.public_id,
@@ -402,7 +445,6 @@ app.delete("/api/images", async (req, res) => {
       }
     }
 
-    // من publicId
     const allPublicIds = []
       .concat(qPublicId ? [qPublicId] : [])
       .concat(bPublicId ? [bPublicId] : [])
