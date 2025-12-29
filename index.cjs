@@ -10,6 +10,10 @@ const cloudinary = require("cloudinary").v2;
 const app  = express();
 const PORT = process.env.PORT || 5000;
 
+/* ========= DEPLOY FINGERPRINT ========= */
+console.log("🔥 DEPLOY VERSION:", new Date().toISOString());
+console.log("🔥 NODE_ENV:", process.env.NODE_ENV || "undefined");
+
 /* --------- CORS --------- */
 /* ✅ FIX: allow PATCH + allow Accept headers + correct preflight */
 app.use(
@@ -83,16 +87,96 @@ async function ensureSchema(){
 const isObj = (x)=> x && typeof x==="object" && !Array.isArray(x);
 const parseMaybeJSON = (x)=> isObj(x) ? x : (typeof x==="string" ? (()=>{try{return JSON.parse(x)}catch{return x}})() : x);
 
+function clampInt(v, def, min, max) {
+  const n = Number.parseInt(String(v ?? ""), 10);
+  const x = Number.isFinite(n) ? n : def;
+  return Math.max(min, Math.min(max, x));
+}
+
 /* --------- Reports API --------- */
+/**
+ * ✅ NEW:
+ * - supports lite=1 to return only minimal fields (prevents OOM)
+ * - supports limit=...
+ */
 app.get("/api/reports", async (req,res)=>{
   try{
     const { type } = req.query;
-    const q = type ? `SELECT * FROM reports WHERE type=$1 ORDER BY created_at DESC LIMIT 200`
-                   : `SELECT * FROM reports ORDER BY created_at DESC LIMIT 200`;
-    const { rows } = await pool.query(q, type ? [type] : []);
+    const lite = String(req.query?.lite || "").toLowerCase();
+    const isLite = lite === "1" || lite === "true" || lite === "yes";
+    const limit = clampInt(req.query?.limit, 200, 1, 500);
+
+    let q = "";
+    let params = [];
+
+    if (isLite) {
+      if (type) {
+        q = `
+          SELECT
+            id,
+            reporter,
+            type,
+            created_at,
+            updated_at,
+            payload->>'reportDate' AS "reportDate",
+            payload->>'invoiceNo'  AS "invoiceNo"
+          FROM reports
+          WHERE type = $1
+          ORDER BY created_at DESC
+          LIMIT $2
+        `;
+        params = [type, limit];
+      } else {
+        q = `
+          SELECT
+            id,
+            reporter,
+            type,
+            created_at,
+            updated_at,
+            payload->>'reportDate' AS "reportDate",
+            payload->>'invoiceNo'  AS "invoiceNo"
+          FROM reports
+          ORDER BY created_at DESC
+          LIMIT $1
+        `;
+        params = [limit];
+      }
+    } else {
+      // original behavior (full payload) but with controllable limit
+      if (type) {
+        q = `SELECT * FROM reports WHERE type=$1 ORDER BY created_at DESC LIMIT $2`;
+        params = [type, limit];
+      } else {
+        q = `SELECT * FROM reports ORDER BY created_at DESC LIMIT $1`;
+        params = [limit];
+      }
+    }
+
+    const { rows } = await pool.query(q, params);
     res.json({ ok:true, data: rows });
   }catch(e){
-    console.error(e); res.status(500).json({ ok:false, error:"db select failed" });
+    console.error(e);
+    res.status(500).json({ ok:false, error:"db select failed" });
+  }
+});
+
+/* ✅ NEW: get single report by id (needed by FTR1 view) */
+app.get("/api/reports/:id", async (req, res) => {
+  try {
+    const id = String(req.params.id || "");
+    if (!id) return res.status(400).json({ ok:false, error:"id required" });
+
+    const { rows, rowCount } = await pool.query(
+      `SELECT * FROM reports WHERE id=$1`,
+      [id]
+    );
+
+    if (!rowCount) return res.status(404).json({ ok:false, error:"not found" });
+    return res.json({ ok:true, report: rows[0] });
+  } catch (e) {
+    console.error("GET /api/reports/:id ERROR =", e);
+    return res.status(500).json({ ok:false, error:String(e?.message||e) });
   }
 });
 
@@ -365,7 +449,7 @@ function parseCloudinaryUrl(u) {
     const delivery_type = parts[rIdx + 1];
 
     let vIdx = rIdx + 2;
-    while (vIdx < parts.length && !/^v\d+$/.test(parts[vIdx])) vIdx++;
+    while (vIdx < parts.length && !/^v\\d+$/.test(parts[vIdx])) vIdx++;
     if (vIdx >= parts.length - 1) return null;
 
     const rest = parts.slice(vIdx + 1).join("/");
@@ -497,5 +581,8 @@ app.get("/api/images/:id", async (req,res)=>{
 
 /* --------- Boot --------- */
 ensureSchema()
-  .then(()=> app.listen(PORT, ()=> console.log(`✅ API running on :${PORT} (FULL public access: read/write/delete enabled)`)))
+  .then(()=> app.listen(PORT, ()=> {
+    console.log(`✅ API running on :${PORT} (FULL public access: read/write/delete enabled)`);
+    console.log("🔥 STARTED AT:", new Date().toISOString());
+  }))
   .catch((err)=>{ console.error("❌ DB init failed:", err); process.exit(1); });
