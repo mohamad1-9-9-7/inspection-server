@@ -59,7 +59,9 @@ async function ensureSchema(){
       updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
     );
   `);
+
   await pool.query(`CREATE EXTENSION IF NOT EXISTS pgcrypto;`);
+
   await pool.query(`
     CREATE TABLE IF NOT EXISTS images (
       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -71,8 +73,10 @@ async function ensureSchema(){
       created_at TIMESTAMPTZ NOT NULL DEFAULT now()
     );
   `);
+
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_reports_type ON reports(type);`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_reports_created_at ON reports(created_at);`);
+
   await pool.query(`
     DO $$
     BEGIN
@@ -81,6 +85,29 @@ async function ensureSchema(){
       END IF;
     END $$;
   `);
+
+  /* ✅ NEW: Product Catalog (code -> name) saved on server */
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS product_catalog (
+      id BIGSERIAL PRIMARY KEY,
+      scope TEXT NOT NULL DEFAULT 'default',
+      code  TEXT NOT NULL,
+      name  TEXT NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+  `);
+
+  await pool.query(`
+    DO $$
+    BEGIN
+      IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE schemaname='public' AND indexname='ux_product_catalog_scope_code') THEN
+        EXECUTE 'CREATE UNIQUE INDEX ux_product_catalog_scope_code ON product_catalog (scope, code)';
+      END IF;
+    END $$;
+  `);
+
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_product_catalog_scope ON product_catalog (scope);`);
 }
 
 /* --------- Helpers --------- */
@@ -91,6 +118,10 @@ function clampInt(v, def, min, max) {
   const n = Number.parseInt(String(v ?? ""), 10);
   const x = Number.isFinite(n) ? n : def;
   return Math.max(min, Math.min(max, x));
+}
+
+function normText(v) {
+  return String(v ?? "").trim();
 }
 
 /* --------- Reports API --------- */
@@ -339,6 +370,69 @@ app.delete("/api/reports/:id", async (req,res)=>{
   }
 });
 
+/* ============================================================
+   ✅ Product Catalog API (Server persistent, prevents duplicates)
+   - GET  /api/product-catalog?scope=ftr2_preloading_products
+   - POST /api/product-catalog  { scope, code, name }
+============================================================ */
+app.get("/api/product-catalog", async (req, res) => {
+  try {
+    const scope = normText(req.query?.scope || "default");
+    const limit = clampInt(req.query?.limit, 2000, 1, 5000);
+
+    const { rows } = await pool.query(
+      `SELECT scope, code, name, created_at, updated_at
+         FROM product_catalog
+        WHERE scope = $1
+        ORDER BY code ASC
+        LIMIT $2`,
+      [scope, limit]
+    );
+
+    // helpful for frontend: also return map
+    const map = {};
+    for (const r of rows) map[String(r.code)] = String(r.name);
+
+    return res.json({ ok: true, scope, count: rows.length, items: rows, map });
+  } catch (e) {
+    console.error("GET /api/product-catalog ERROR =", e);
+    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+  }
+});
+
+app.post("/api/product-catalog", async (req, res) => {
+  try {
+    const scope = normText(req.body?.scope || "default");
+    const code  = normText(req.body?.code);
+    const name  = normText(req.body?.name);
+
+    if (!code || !name) {
+      return res.status(400).json({ ok: false, error: "code & name required" });
+    }
+
+    const { rows } = await pool.query(
+      `INSERT INTO product_catalog (scope, code, name)
+       VALUES ($1, $2, $3)
+       RETURNING scope, code, name, created_at, updated_at`,
+      [scope, code, name]
+    );
+
+    return res.status(201).json({ ok: true, item: rows[0] });
+  } catch (e) {
+    console.error("POST /api/product-catalog ERROR =", e);
+
+    if (e && e.code === "23505") {
+      return res.status(409).json({
+        ok: false,
+        error: "DUPLICATE_CODE",
+        message: "This code already exists in this scope.",
+      });
+    }
+
+    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+  }
+});
+
 /* --------- Cloudinary config (robust) --------- */
 (function configureCloudinary(){
   const hasSplit = process.env.CLOUDINARY_CLOUD_NAME && process.env.CLOUDINARY_API_KEY && process.env.CLOUDINARY_API_SECRET;
@@ -449,7 +543,7 @@ function parseCloudinaryUrl(u) {
     const delivery_type = parts[rIdx + 1];
 
     let vIdx = rIdx + 2;
-    while (vIdx < parts.length && !/^v\\d+$/.test(parts[vIdx])) vIdx++;
+    while (vIdx < parts.length && !/^v\d+$/.test(parts[vIdx])) vIdx++;
     if (vIdx >= parts.length - 1) return null;
 
     const rest = parts.slice(vIdx + 1).join("/");
