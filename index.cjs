@@ -247,6 +247,71 @@ app.get("/api/reports", async (req, res) => {
   }
 });
 
+/* ✅✅ FIX: CREATE report (هذا كان ناقص ويسبب 404 و Cannot POST) */
+app.post("/api/reports", async (req, res) => {
+  try {
+    const reporter = normText(req.body?.reporter || "anonymous");
+    const type = normText(req.body?.type);
+    const payload = req.body?.payload;
+
+    if (!type) return res.status(400).json({ ok: false, error: "type required" });
+    if (!payload || typeof payload !== "object") {
+      return res.status(400).json({ ok: false, error: "payload object required" });
+    }
+
+    const ins = await pool.query(
+      `INSERT INTO reports (reporter, type, payload)
+       VALUES ($1, $2, $3::jsonb)
+       RETURNING *`,
+      [reporter, type, JSON.stringify(payload)]
+    );
+
+    return res.status(201).json({ ok: true, report: ins.rows[0] });
+  } catch (e) {
+    // unique index: type + payload.reportDate
+    if (e && e.code === "23505") {
+      return res.status(409).json({
+        ok: false,
+        error: "DUPLICATE_REPORT_FOR_DATE",
+        message: "Report already exists for this type and reportDate.",
+      });
+    }
+    console.error("POST /api/reports ERROR =", e);
+    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+  }
+});
+
+/* ✅ OPTIONAL IMPORTANT: update report by id (many pages need this) */
+app.patch("/api/reports/:id", async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    if (!Number.isFinite(id) || id <= 0) return res.status(400).json({ ok: false, error: "bad id" });
+
+    const payload = req.body?.payload;
+    const reporter = req.body?.reporter;
+
+    if (!payload || typeof payload !== "object") {
+      return res.status(400).json({ ok: false, error: "payload object required" });
+    }
+
+    const upd = await pool.query(
+      `UPDATE reports
+          SET payload=$1::jsonb,
+              reporter=COALESCE($2, reporter),
+              updated_at=now()
+        WHERE id=$3
+        RETURNING *`,
+      [JSON.stringify(payload), reporter ? String(reporter) : null, id]
+    );
+
+    if (!upd.rowCount) return res.status(404).json({ ok: false, error: "not found" });
+    return res.json({ ok: true, report: upd.rows[0] });
+  } catch (e) {
+    console.error("PATCH /api/reports/:id ERROR =", e);
+    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+  }
+});
+
 /* ============================================================
    ✅ Training Session Token API (TEXT token stored in reports.payload.quizToken)
    GET  /api/training-session/by-token/:token
@@ -472,7 +537,6 @@ app.post("/api/training-session/by-token/:token/submit", async (req, res) => {
     client.release();
   }
 });
-
 
 app.put("/api/reports/qcs", async (req, res) => {
   try {
@@ -1095,7 +1159,9 @@ app.delete("/api/images", async (req, res) => {
       deleted,
       failed,
       results: results.map((r, i) =>
-        r.status === "fulfilled" ? { i, status: "ok" } : { i, status: "error", reason: String(r.reason?.message || r.reason) }
+        r.status === "fulfilled"
+          ? { i, status: "ok" }
+          : { i, status: "error", reason: String(r.reason?.message || r.reason) }
       ),
     });
   } catch (e) {
