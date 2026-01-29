@@ -152,7 +152,7 @@ async function ensureSchema() {
 
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_product_catalog_scope ON product_catalog (scope);`);
 
-  /* ✅ NEW: Training Links (token for /t/:token) */
+  /* ✅ NEW: Training Links (token for /t/:token) - UUID tokens */
   await pool.query(`
     CREATE TABLE IF NOT EXISTS training_links (
       token UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -170,6 +170,13 @@ async function ensureSchema() {
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_training_links_report_id ON training_links(report_id);`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_training_links_used_at ON training_links(used_at);`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_training_links_expires_at ON training_links(expires_at);`);
+
+  /* ✅ NEW: index on training_session payload.quizToken (TEXT token support) */
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS idx_reports_training_quiztoken
+    ON reports ((payload->>'quizToken'))
+    WHERE type='training_session';
+  `);
 }
 
 /* ============================================================
@@ -240,141 +247,232 @@ app.get("/api/reports", async (req, res) => {
   }
 });
 
-/* get single report by id */
-app.get("/api/reports/:id", async (req, res) => {
-  try {
-    const id = String(req.params.id || "");
-    if (!id) return res.status(400).json({ ok: false, error: "id required" });
+/* ============================================================
+   ✅ Training Session Token API (TEXT token stored in reports.payload.quizToken)
+   GET  /api/training-session/by-token/:token
+   POST /api/training-session/by-token/:token/submit
+   - Server computes score/result from stored quiz.correct
+============================================================ */
 
-    const { rows, rowCount } = await pool.query(`SELECT * FROM reports WHERE id=$1`, [id]);
-    if (!rowCount) return res.status(404).json({ ok: false, error: "not found" });
-    return res.json({ ok: true, report: rows[0] });
+/* helper: extract quiz from payload with fallbacks */
+function extractQuiz(payload) {
+  const q = payload?.quiz || payload?.quizData || payload?.trainingQuiz || {};
+  const questions =
+    Array.isArray(q?.questions) ? q.questions :
+    Array.isArray(payload?.questions) ? payload.questions :
+    [];
+  const module = q?.module || payload?.module || payload?.moduleName || "";
+  const passMark = Number(q?.passMark ?? payload?.passMark ?? payload?.PASS_MARK ?? 80);
+
+  return {
+    module,
+    passMark: Number.isFinite(passMark) ? passMark : 80,
+    questions,
+  };
+}
+
+/* helper: find existing submission for this token */
+function getSubmission(payload, token) {
+  const subMap = payload?.quizSubmissions && typeof payload.quizSubmissions === "object"
+    ? payload.quizSubmissions
+    : null;
+
+  if (subMap && subMap[token]) return subMap[token];
+
+  // legacy single field (just in case)
+  if (payload?.quizSubmission && payload.quizSubmission?.token === token) return payload.quizSubmission;
+
+  return null;
+}
+
+/* get training session by token (TEXT) */
+app.get("/api/training-session/by-token/:token", async (req, res) => {
+  try {
+    const token = normText(req.params.token);
+    if (!token) return res.status(400).json({ ok: false, error: "token required" });
+
+    const q = await pool.query(
+      `
+      SELECT id, reporter, type, created_at, updated_at, payload
+      FROM reports
+      WHERE type='training_session'
+        AND (payload->>'quizToken') = $1
+      ORDER BY created_at DESC
+      LIMIT 1
+      `,
+      [token]
+    );
+
+    if (!q.rowCount) return res.status(404).json({ ok: false, error: "SESSION_NOT_FOUND" });
+
+    const r = q.rows[0];
+    const payload = r.payload || {};
+    const quiz = extractQuiz(payload);
+
+    if (!Array.isArray(quiz.questions) || quiz.questions.length === 0) {
+      return res.status(400).json({ ok: false, error: "NO_QUIZ_IN_REPORT" });
+    }
+
+    // submission status (per token)
+    const existing = getSubmission(payload, token);
+
+    // participant info (optional — best effort)
+    const p =
+      payload?.participant ||
+      payload?.participants?.[0] ||
+      {};
+
+    return res.json({
+      ok: true,
+      token,
+      participant: {
+        slNo: normText(p?.slNo),
+        name: normText(p?.name),
+        designation: normText(p?.designation),
+        employeeId: normText(p?.employeeId),
+      },
+      quiz: {
+        module: quiz.module,
+        passMark: quiz.passMark,
+        questions: quiz.questions,
+      },
+      alreadySubmitted: !!existing,
+      lastSubmittedAt: existing?.submittedAt || existing?.submitted_at || null,
+    });
   } catch (e) {
-    console.error("GET /api/reports/:id ERROR =", e);
+    console.error("GET /api/training-session/by-token/:token ERROR =", e);
     return res.status(500).json({ ok: false, error: String(e?.message || e) });
   }
 });
 
-app.post("/api/reports", async (req, res) => {
+/* submit trainee quiz by token (TEXT) — expects { answers: number[] } */
+app.post("/api/training-session/by-token/:token/submit", async (req, res) => {
+  const client = await pool.connect();
   try {
-    let { reporter, type, payload } = req.body || {};
-    payload = parseMaybeJSON(payload);
+    const token = normText(req.params.token);
+    if (!token) return res.status(400).json({ ok: false, error: "token required" });
 
-    if (!type || !isObj(payload)) {
-      return res.status(400).json({ ok: false, error: "type & payload are required" });
-    }
+    const answers = safeArr(req.body?.answers);
 
-    const { rows } = await pool.query(
-      `INSERT INTO reports (reporter,type,payload) VALUES ($1,$2,$3::jsonb) RETURNING *`,
-      [reporter || "anonymous", type, payload]
+    if (!answers.length) return res.status(400).json({ ok: false, error: "answers required" });
+
+    await client.query("BEGIN");
+
+    // lock the report row by token
+    const q = await client.query(
+      `
+      SELECT id, payload
+      FROM reports
+      WHERE type='training_session'
+        AND (payload->>'quizToken') = $1
+      ORDER BY created_at DESC
+      LIMIT 1
+      FOR UPDATE
+      `,
+      [token]
     );
 
-    return res.status(201).json({ ok: true, report: rows[0] });
-  } catch (e) {
-    console.error("POST /api/reports ERROR =", e);
+    if (!q.rowCount) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ ok: false, error: "SESSION_NOT_FOUND" });
+    }
 
-    if (e && e.code === "23505") {
+    const reportId = q.rows[0].id;
+    const payload = q.rows[0].payload || {};
+    const quiz = extractQuiz(payload);
+
+    if (!Array.isArray(quiz.questions) || quiz.questions.length === 0) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ ok: false, error: "NO_QUIZ_IN_REPORT" });
+    }
+
+    // prevent re-submit (per token)
+    const existing = getSubmission(payload, token);
+    if (existing) {
+      await client.query("ROLLBACK");
       return res.status(409).json({
         ok: false,
-        error: "DUPLICATE_REPORT",
-        message: "Report for this type and date already exists.",
+        error: "ALREADY_SUBMITTED",
+        score: existing?.score ?? null,
+        result: existing?.result ?? null,
+        submittedAt: existing?.submittedAt ?? null,
       });
     }
 
-    return res.status(500).json({ ok: false, error: String(e?.message || e) });
-  }
-});
+    // validate length + types
+    if (answers.length !== quiz.questions.length) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({
+        ok: false,
+        error: "ANSWERS_LENGTH_MISMATCH",
+        expected: quiz.questions.length,
+        got: answers.length,
+      });
+    }
 
-/* upsert by type + reportDate */
-app.put("/api/reports", async (req, res) => {
-  try {
-    const { reporter, type } = req.body || {};
-    let payload = parseMaybeJSON(req.body?.payload);
-    const reportDate = payload?.reportDate || req.query?.reportDate || "";
-    if (!type || !isObj(payload) || !reportDate)
-      return res.status(400).json({ ok: false, error: "type + payload.reportDate required" });
+    for (let i = 0; i < answers.length; i++) {
+      if (!Number.isInteger(answers[i])) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({ ok: false, error: `INVALID_ANSWER_AT_${i}` });
+      }
+    }
 
-    const upd = await pool.query(
-      `UPDATE reports
-         SET reporter = COALESCE($1,reporter),
-             payload=$2::jsonb,
-             updated_at=now()
-       WHERE type=$3 AND payload->>'reportDate'=$4
-       RETURNING *`,
-      [reporter || "anonymous", payload, type, reportDate]
-    );
-    if (upd.rowCount > 0) return res.json({ ok: true, report: upd.rows[0], method: "update" });
+    // compute score from stored correct indices
+    let correctCount = 0;
+    for (let i = 0; i < quiz.questions.length; i++) {
+      const c = Number(quiz.questions[i]?.correct);
+      if (Number.isFinite(c) && answers[i] === c) correctCount++;
+    }
 
-    const ins = await pool.query(
-      `INSERT INTO reports (reporter,type,payload) VALUES ($1,$2,$3::jsonb) RETURNING *`,
-      [reporter || "anonymous", type, payload]
-    );
-    res.status(201).json({ ok: true, report: ins.rows[0], method: "insert" });
-  } catch (e) {
-    console.error("PUT /api/reports ERROR =", e);
-    res.status(500).json({ ok: false, error: String(e?.message || e) });
-  }
-});
+    const score = Math.round((correctCount / quiz.questions.length) * 100);
+    const passMark = quiz.passMark;
+    const result = score >= passMark ? "PASS" : "FAIL";
 
-/* update by ID */
-async function updateReportById(req, res) {
-  try {
-    const id = String(req.params.id || "");
-    let { reporter, type, payload } = req.body || {};
-    payload = parseMaybeJSON(payload);
-
-    if (!id) return res.status(400).json({ ok: false, error: "id required" });
-    if (!isObj(payload)) return res.status(400).json({ ok: false, error: "payload is required" });
-
-    const { rows, rowCount } = await pool.query(
-      `UPDATE reports
-         SET reporter   = COALESCE($1, reporter),
-             type       = COALESCE($2, type),
-             payload    = $3::jsonb,
-             updated_at = now()
-       WHERE id = $4
-       RETURNING *`,
-      [reporter || null, type || null, payload, id]
-    );
-
-    if (!rowCount) return res.status(404).json({ ok: false, error: "not found" });
-    return res.json({ ok: true, report: rows[0] });
-  } catch (e) {
-    console.error("UPDATE /api/reports/:id ERROR =", e);
-    return res.status(500).json({ ok: false, error: String(e?.message || e) });
-  }
-}
-
-app.put("/api/reports/:id", updateReportById);
-app.patch("/api/reports/:id", updateReportById);
-
-/* Special upserts */
-app.put("/api/reports/returns", async (req, res) => {
-  try {
-    const reportDate = String(req.query.reportDate || "");
-    const { items = [], _clientSavedAt } = req.body || {};
-    if (!reportDate) return res.status(400).json({ ok: false, error: "reportDate query required" });
-    const payload = {
-      reportDate,
-      items: Array.isArray(items) ? items : [],
-      _clientSavedAt: _clientSavedAt || Date.now(),
+    const submission = {
+      token,
+      submittedAt: new Date().toISOString(),
+      passMark,
+      score,
+      result,
+      answers,
     };
-    const upd = await pool.query(
-      `UPDATE reports SET reporter = COALESCE(reporter,'anonymous'), payload=$1::jsonb, updated_at=now()
-       WHERE type='returns' AND payload->>'reportDate'=$2 RETURNING *`,
-      [payload, reportDate]
-    );
-    if (upd.rowCount > 0) return res.json({ ok: true, report: upd.rows[0], method: "update" });
-    const ins = await pool.query(
-      `INSERT INTO reports (reporter,type,payload) VALUES ('anonymous','returns',$1::jsonb) RETURNING *`,
-      [payload]
-    );
-    res.status(201).json({ ok: true, report: ins.rows[0], method: "insert" });
+
+    const subMap =
+      payload?.quizSubmissions && typeof payload.quizSubmissions === "object"
+        ? payload.quizSubmissions
+        : {};
+
+    const newPayload = {
+      ...payload,
+      quizSubmissions: { ...subMap, [token]: submission },
+    };
+
+    await client.query(`UPDATE reports SET payload=$1::jsonb, updated_at=now() WHERE id=$2`, [
+      newPayload,
+      reportId,
+    ]);
+
+    await client.query("COMMIT");
+
+    return res.json({
+      ok: true,
+      reportId,
+      score,
+      result,
+      passMark,
+      submittedAt: submission.submittedAt,
+    });
   } catch (e) {
-    console.error("PUT /api/reports/returns ERROR =", e);
-    res.status(500).json({ ok: false, error: String(e?.message || e) });
+    try {
+      await client.query("ROLLBACK");
+    } catch {}
+    console.error("POST /api/training-session/by-token/:token/submit ERROR =", e);
+    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+  } finally {
+    client.release();
   }
 });
+
 
 app.put("/api/reports/qcs", async (req, res) => {
   try {
@@ -490,12 +588,7 @@ app.post("/api/product-catalog", async (req, res) => {
 });
 
 /* ============================================================
-   ✅ Training Links API (for /t/:token)
-   - POST /api/training-links
-     body: { reportId, participants:[{slNo,name}], module?, expiresInDays? }
-   - GET  /api/training-links/:token
-   - POST /api/training-links/:token/submit
-     body: { score, result, passMark, module, answers:[...] }
+   ✅ Training Links API (UUID token system - still kept)
 ============================================================ */
 app.post("/api/training-links", async (req, res) => {
   try {
@@ -759,7 +852,7 @@ app.post("/api/training-links/:token/submit", async (req, res) => {
     });
   } catch (e) {
     try {
-      await pool.query("ROLLBACK");
+      await client.query("ROLLBACK");
     } catch {}
     console.error("POST /api/training-links/:token/submit ERROR =", e);
     return res.status(500).json({ ok: false, error: String(e?.message || e) });
