@@ -312,6 +312,68 @@ app.patch("/api/reports/:id", async (req, res) => {
   }
 });
 
+/* ======================================================================
+   ✅ ADDED ONLY THIS BLOCK: Generic upsert by type in PATH
+   Supports: PUT /api/reports/meat_daily?reportDate=YYYY-MM-DD
+====================================================================== */
+app.put("/api/reports/:type", async (req, res) => {
+  try {
+    const type = normText(req.params.type);
+    if (!type) return res.status(400).json({ ok: false, error: "type param required" });
+
+    // payload priority:
+    // 1) req.body.payload (if object)
+    // 2) otherwise treat the whole body (minus known fields) as payload
+    let payload = req.body?.payload;
+    if (!payload || typeof payload !== "object") {
+      payload = { ...(req.body || {}) };
+      delete payload.reporter;
+      delete payload.type;
+      delete payload.payload;
+    }
+
+    // reportDate can come from payload OR query
+    const reportDate = normText(payload?.reportDate || req.query?.reportDate || "");
+    if (!reportDate) {
+      return res.status(400).json({
+        ok: false,
+        error: "reportDate required (payload.reportDate or ?reportDate=)",
+      });
+    }
+
+    payload.reportDate = reportDate;
+    const reporter = normText(req.body?.reporter || "anonymous");
+
+    // update first
+    const upd = await pool.query(
+      `UPDATE reports
+          SET reporter = COALESCE($1, reporter),
+              payload=$2::jsonb,
+              updated_at=now()
+        WHERE type=$3 AND payload->>'reportDate'=$4
+        RETURNING *`,
+      [reporter || null, JSON.stringify(payload), type, reportDate]
+    );
+
+    if (upd.rowCount > 0) {
+      return res.json({ ok: true, report: upd.rows[0], method: "update" });
+    }
+
+    // insert if not found
+    const ins = await pool.query(
+      `INSERT INTO reports (reporter, type, payload)
+       VALUES ($1, $2, $3::jsonb)
+       RETURNING *`,
+      [reporter, type, JSON.stringify(payload)]
+    );
+
+    return res.status(201).json({ ok: true, report: ins.rows[0], method: "insert" });
+  } catch (e) {
+    console.error("PUT /api/reports/:type ERROR =", e);
+    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+  }
+});
+
 /* ============================================================
    ✅ Training Session Token API (TEXT token stored in reports.payload.quizToken)
    GET  /api/training-session/by-token/:token?p=participantKey
