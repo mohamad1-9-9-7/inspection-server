@@ -314,9 +314,11 @@ app.patch("/api/reports/:id", async (req, res) => {
 
 /* ============================================================
    ✅ Training Session Token API (TEXT token stored in reports.payload.quizToken)
-   GET  /api/training-session/by-token/:token
+   GET  /api/training-session/by-token/:token?p=participantKey
    POST /api/training-session/by-token/:token/submit
    - Server computes score/result from stored quiz.correct
+   - ✅ allows multiple trainees per same token (tracked by participantKey)
+   - ✅ saves quizAttempt snapshot (questions + chosen + correct) for View Answers
 ============================================================ */
 
 /* helper: extract quiz from payload with fallbacks */
@@ -336,13 +338,37 @@ function extractQuiz(payload) {
   };
 }
 
-/* helper: find existing submission for this token */
-function getSubmission(payload, token) {
+/* ✅ NEW: build participantKey consistently */
+function makeParticipantKeyFromBody(body) {
+  const pk = normText(body?.participantKey);
+  if (pk) return pk;
+
+  const p = body?.participant || {};
+  const employeeId = normText(p?.employeeId);
+  const name = normText(p?.name).toLowerCase();
+
+  if (employeeId) return `eid:${employeeId}`;
+  if (name) return `name:${name}`;
+  return "";
+}
+
+/* ✅ NEW: map-key inside payload.quizSubmissions */
+function submissionKey(token, participantKey) {
+  const pk = normText(participantKey);
+  if (pk) return `p:${pk}`;     // per trainee
+  return `t:${normText(token)}`; // legacy fallback
+}
+
+/* ✅ NEW: find existing submission for token + participantKey */
+function getSubmission(payload, token, participantKey) {
   const subMap = payload?.quizSubmissions && typeof payload.quizSubmissions === "object"
     ? payload.quizSubmissions
     : null;
 
-  if (subMap && subMap[token]) return subMap[token];
+  if (subMap) {
+    const k = submissionKey(token, participantKey);
+    if (k && subMap[k]) return subMap[k];
+  }
 
   // legacy single field (just in case)
   if (payload?.quizSubmission && payload.quizSubmission?.token === token) return payload.quizSubmission;
@@ -354,6 +380,7 @@ function getSubmission(payload, token) {
 app.get("/api/training-session/by-token/:token", async (req, res) => {
   try {
     const token = normText(req.params.token);
+    const pKey = normText(req.query?.p || ""); // ✅ participantKey from query
     if (!token) return res.status(400).json({ ok: false, error: "token required" });
 
     const q = await pool.query(
@@ -378,10 +405,10 @@ app.get("/api/training-session/by-token/:token", async (req, res) => {
       return res.status(400).json({ ok: false, error: "NO_QUIZ_IN_REPORT" });
     }
 
-    // submission status (per token)
-    const existing = getSubmission(payload, token);
+    // ✅ submission status (per participantKey)
+    const existing = pKey ? getSubmission(payload, token, pKey) : null;
 
-    // participant info (optional — best effort)
+    // participant info (best effort from report payload)
     const p =
       payload?.participant ||
       payload?.participants?.[0] ||
@@ -410,7 +437,7 @@ app.get("/api/training-session/by-token/:token", async (req, res) => {
   }
 });
 
-/* submit trainee quiz by token (TEXT) — expects { answers: number[] } */
+/* submit trainee quiz by token (TEXT) — expects { participant, participantKey, answers:number[] } */
 app.post("/api/training-session/by-token/:token/submit", async (req, res) => {
   const client = await pool.connect();
   try {
@@ -418,8 +445,25 @@ app.post("/api/training-session/by-token/:token/submit", async (req, res) => {
     if (!token) return res.status(400).json({ ok: false, error: "token required" });
 
     const answers = safeArr(req.body?.answers);
-
     if (!answers.length) return res.status(400).json({ ok: false, error: "answers required" });
+
+    // ✅ participant identity (required to allow multi trainees per same link)
+    const participant = isObj(req.body?.participant) ? req.body.participant : {};
+    const pName = normText(participant?.name);
+    const pDesignation = normText(participant?.designation);
+    const pEmployeeId = normText(participant?.employeeId);
+
+    const pKey = makeParticipantKeyFromBody(req.body);
+    if (!pKey) {
+      return res.status(400).json({ ok: false, error: "participantKey required (or participant.employeeId/name)" });
+    }
+    if (!pName) {
+      return res.status(400).json({ ok: false, error: "participant.name required" });
+    }
+    // لو بدك تخليه اختياري احكيلي — حالياً نخليه مطلوب لأنه أفضل للتتبع
+    if (!pEmployeeId) {
+      return res.status(400).json({ ok: false, error: "participant.employeeId required" });
+    }
 
     await client.query("BEGIN");
 
@@ -451,8 +495,8 @@ app.post("/api/training-session/by-token/:token/submit", async (req, res) => {
       return res.status(400).json({ ok: false, error: "NO_QUIZ_IN_REPORT" });
     }
 
-    // prevent re-submit (per token)
-    const existing = getSubmission(payload, token);
+    // ✅ prevent re-submit (per participantKey, NOT per token)
+    const existing = getSubmission(payload, token, pKey);
     if (existing) {
       await client.query("ROLLBACK");
       return res.status(409).json({
@@ -492,10 +536,30 @@ app.post("/api/training-session/by-token/:token/submit", async (req, res) => {
     const score = Math.round((correctCount / quiz.questions.length) * 100);
     const passMark = quiz.passMark;
     const result = score >= passMark ? "PASS" : "FAIL";
+    const submittedAt = new Date().toISOString();
+
+    // ✅ snapshot compatible with View Answers modal in admin page
+    const attemptSnapshot = {
+      module: quiz.module || "",
+      submittedAt,
+      passMark,
+      score,
+      result,
+      answers: quiz.questions.map((qq, i) => ({
+        q_ar: qq?.q_ar || "",
+        q_en: qq?.q_en || "",
+        options_ar: Array.isArray(qq?.options_ar) ? qq.options_ar : [],
+        options_en: Array.isArray(qq?.options_en) ? qq.options_en : [],
+        correct: Number.isFinite(Number(qq?.correct)) ? Number(qq.correct) : 0,
+        chosen: answers[i],
+      })),
+    };
 
     const submission = {
       token,
-      submittedAt: new Date().toISOString(),
+      participantKey: pKey,
+      participant: { name: pName, designation: pDesignation, employeeId: pEmployeeId },
+      submittedAt,
       passMark,
       score,
       result,
@@ -507,13 +571,58 @@ app.post("/api/training-session/by-token/:token/submit", async (req, res) => {
         ? payload.quizSubmissions
         : {};
 
+    const subKey = submissionKey(token, pKey);
+
+    // ✅ update participants list in report payload (so it appears automatically)
+    const participants = safeArr(payload?.participants);
+    const eidKey = normKey(pEmployeeId);
+    const nameKey = normKey(pName);
+
+    let found = false;
+    const updatedParticipants = participants.map((pp) => {
+      const ppEid = normKey(pp?.employeeId || "");
+      const ppName = normKey(pp?.name || "");
+
+      const hit = (eidKey && ppEid && ppEid === eidKey) || (!eidKey && ppName && ppName === nameKey);
+      if (!hit) return pp;
+
+      found = true;
+      return {
+        ...pp,
+        name: pName || pp?.name || "",
+        designation: pDesignation || pp?.designation || "",
+        employeeId: pEmployeeId || pp?.employeeId || "",
+        score: String(score),
+        result: String(result).toUpperCase(),
+        lastQuizAt: todayISO(),
+        quizAttempt: attemptSnapshot,
+      };
+    });
+
+    let finalParticipants = updatedParticipants;
+    if (!found) {
+      finalParticipants = updatedParticipants.concat([
+        {
+          slNo: String(updatedParticipants.length + 1),
+          name: pName,
+          designation: pDesignation,
+          employeeId: pEmployeeId,
+          score: String(score),
+          result: String(result).toUpperCase(),
+          lastQuizAt: todayISO(),
+          quizAttempt: attemptSnapshot,
+        },
+      ]);
+    }
+
     const newPayload = {
       ...payload,
-      quizSubmissions: { ...subMap, [token]: submission },
+      participants: finalParticipants,
+      quizSubmissions: { ...subMap, [subKey]: submission },
     };
 
     await client.query(`UPDATE reports SET payload=$1::jsonb, updated_at=now() WHERE id=$2`, [
-      newPayload,
+      JSON.stringify(newPayload),
       reportId,
     ]);
 
@@ -522,10 +631,11 @@ app.post("/api/training-session/by-token/:token/submit", async (req, res) => {
     return res.json({
       ok: true,
       reportId,
+      participantKey: pKey,
       score,
       result,
       passMark,
-      submittedAt: submission.submittedAt,
+      submittedAt,
     });
   } catch (e) {
     try {
