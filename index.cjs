@@ -247,6 +247,24 @@ app.get("/api/reports", async (req, res) => {
   }
 });
 
+/* ✅✅✅ NEW: GET report by id (fixes 404 when opening old reports) */
+app.get("/api/reports/:id", async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    if (!Number.isFinite(id) || id <= 0) {
+      return res.status(400).json({ ok: false, error: "bad id" });
+    }
+
+    const q = await pool.query(`SELECT * FROM reports WHERE id=$1`, [id]);
+    if (!q.rowCount) return res.status(404).json({ ok: false, error: "not found" });
+
+    return res.json({ ok: true, report: q.rows[0] });
+  } catch (e) {
+    console.error("GET /api/reports/:id ERROR =", e);
+    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+  }
+});
+
 /* ✅✅ FIX: CREATE report (هذا كان ناقص ويسبب 404 و Cannot POST) */
 app.post("/api/reports", async (req, res) => {
   try {
@@ -312,11 +330,55 @@ app.patch("/api/reports/:id", async (req, res) => {
   }
 });
 
+/* ✅✅✅ NEW: PUT report by id (so your React pages using PUT /api/reports/:id work)
+   IMPORTANT: MUST be before PUT /api/reports/:type
+*/
+app.put("/api/reports/:id", async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    if (!Number.isFinite(id) || id <= 0) {
+      return res.status(400).json({ ok: false, error: "bad id" });
+    }
+
+    const type = normText(req.body?.type); // optional but recommended
+    const payload = req.body?.payload;
+
+    if (!payload || typeof payload !== "object") {
+      return res.status(400).json({ ok: false, error: "payload object required" });
+    }
+
+    const upd = await pool.query(
+      `UPDATE reports
+          SET type = COALESCE(NULLIF($1,''), type),
+              payload=$2::jsonb,
+              updated_at=now()
+        WHERE id=$3
+        RETURNING *`,
+      [type || null, JSON.stringify(payload), id]
+    );
+
+    if (!upd.rowCount) return res.status(404).json({ ok: false, error: "not found" });
+    return res.json({ ok: true, report: upd.rows[0] });
+  } catch (e) {
+    if (e && e.code === "23505") {
+      return res.status(409).json({
+        ok: false,
+        error: "DUPLICATE_REPORT_FOR_DATE",
+        message: "Report already exists for this type and reportDate.",
+      });
+    }
+    console.error("PUT /api/reports/:id ERROR =", e);
+    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+  }
+});
+
 /* ======================================================================
    ✅ ADDED ONLY THIS BLOCK: Generic upsert by type in PATH
    Supports: PUT /api/reports/meat_daily?reportDate=YYYY-MM-DD
+
+   ✅ IMPORTANT FIX: restrict :type to NON-NUMERIC (prevents id being treated as type)
 ====================================================================== */
-app.put("/api/reports/:type", async (req, res) => {
+app.put("/api/reports/:type([A-Za-z_][A-Za-z0-9_-]*)", async (req, res) => {
   try {
     const type = normText(req.params.type);
     if (!type) return res.status(400).json({ ok: false, error: "type param required" });
@@ -522,7 +584,6 @@ app.post("/api/training-session/by-token/:token/submit", async (req, res) => {
     if (!pName) {
       return res.status(400).json({ ok: false, error: "participant.name required" });
     }
-    // لو بدك تخليه اختياري احكيلي — حالياً نخليه مطلوب لأنه أفضل للتتبع
     if (!pEmployeeId) {
       return res.status(400).json({ ok: false, error: "participant.employeeId required" });
     }
