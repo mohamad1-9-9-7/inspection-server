@@ -15,7 +15,6 @@ console.log("🔥 DEPLOY VERSION:", new Date().toISOString());
 console.log("🔥 NODE_ENV:", process.env.NODE_ENV || "undefined");
 
 /* --------- CORS --------- */
-/* ✅ allow PATCH + allow Accept headers + correct preflight */
 app.use(
   cors({
     origin: "*",
@@ -129,7 +128,6 @@ async function ensureSchema() {
     END $$;
   `);
 
-  /* ✅ Product Catalog (code -> name) saved on server */
   await pool.query(`
     CREATE TABLE IF NOT EXISTS product_catalog (
       id BIGSERIAL PRIMARY KEY,
@@ -152,7 +150,6 @@ async function ensureSchema() {
 
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_product_catalog_scope ON product_catalog (scope);`);
 
-  /* ✅ NEW: Training Links (token for /t/:token) - UUID tokens */
   await pool.query(`
     CREATE TABLE IF NOT EXISTS training_links (
       token UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -171,21 +168,32 @@ async function ensureSchema() {
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_training_links_used_at ON training_links(used_at);`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_training_links_expires_at ON training_links(expires_at);`);
 
-  /* ✅ NEW: index on training_session payload.quizToken (TEXT token support) */
   await pool.query(`
     CREATE INDEX IF NOT EXISTS idx_reports_training_quiztoken
     ON reports ((payload->>'quizToken'))
     WHERE type='training_session';
   `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS supplier_links (
+      token UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      report_id BIGINT NOT NULL REFERENCES reports(id) ON DELETE CASCADE,
+      supplier_name TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      expires_at TIMESTAMPTZ,
+      used_at TIMESTAMPTZ,
+      meta JSONB NOT NULL DEFAULT '{}'::jsonb
+    );
+  `);
+
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_supplier_links_report_id ON supplier_links(report_id);`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_supplier_links_used_at ON supplier_links(used_at);`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_supplier_links_expires_at ON supplier_links(expires_at);`);
 }
 
 /* ============================================================
    Reports API
 ============================================================ */
-/**
- * ✅ supports lite=1 to return only minimal fields (prevents OOM)
- * ✅ supports limit=...
- */
 app.get("/api/reports", async (req, res) => {
   try {
     const { type } = req.query;
@@ -247,7 +255,6 @@ app.get("/api/reports", async (req, res) => {
   }
 });
 
-/* ✅✅ FIX: CREATE report */
 app.post("/api/reports", async (req, res) => {
   try {
     const reporter = normText(req.body?.reporter || "anonymous");
@@ -280,7 +287,6 @@ app.post("/api/reports", async (req, res) => {
   }
 });
 
-/* ✅✅✅ PUT /api/reports (upsert by type + payload.reportDate) */
 app.put("/api/reports", async (req, res) => {
   try {
     const reporter = normText(req.body?.reporter || "anonymous");
@@ -334,10 +340,6 @@ app.put("/api/reports", async (req, res) => {
   }
 });
 
-/* ✅✅✅ ADD BACK RETURNS (FIX 400 + bad id issue)
-   - This matches your old frontend: body { items } and query ?reportDate=
-   - MUST be before /api/reports/:type(...)
-*/
 app.put("/api/reports/returns", async (req, res) => {
   try {
     const reportDate = String(req.query.reportDate || "");
@@ -377,7 +379,6 @@ app.put("/api/reports/returns", async (req, res) => {
   }
 });
 
-/* ✅ SPECIFIC: QCS */
 app.put("/api/reports/qcs", async (req, res) => {
   try {
     const reportDate = String(req.query.reportDate || "");
@@ -414,10 +415,6 @@ app.put("/api/reports/qcs", async (req, res) => {
   }
 });
 
-/* ======================================================================
-   Generic upsert by type in PATH
-   Supports: PUT /api/reports/meat_daily?reportDate=YYYY-MM-DD
-====================================================================== */
 app.put("/api/reports/:type([A-Za-z_][A-Za-z0-9_-]*)", async (req, res) => {
   try {
     const type = normText(req.params.type);
@@ -470,7 +467,6 @@ app.put("/api/reports/:type([A-Za-z_][A-Za-z0-9_-]*)", async (req, res) => {
   }
 });
 
-/* ✅✅✅ IMPORTANT: id routes must be NUMERIC only */
 app.get("/api/reports/:id(\\d+)", async (req, res) => {
   try {
     const id = Number(req.params.id);
@@ -584,17 +580,334 @@ app.delete("/api/reports/:id(\\d+)", async (req, res) => {
   }
 });
 
-/* ============================================================
-   ✅ Training Session Token API (TEXT token stored in reports.payload.quizToken)
-============================================================ */
+/* ======================================================================
+   Supplier Links API (UUID token system)
+====================================================================== */
+const SUPPLIER_TYPE = "supplier_self_assessment_form";
 
-/* helper: extract quiz from payload with fallbacks */
+app.post("/api/supplier-links", async (req, res) => {
+  try {
+    const reportId = Number(req.body?.reportId);
+    const expiresInDays = clampInt(req.body?.expiresInDays, 14, 1, 120);
+
+    if (!Number.isFinite(reportId) || reportId <= 0) {
+      return res.status(400).json({ ok: false, error: "reportId required" });
+    }
+
+    const r = await pool.query(`SELECT id, type, payload FROM reports WHERE id=$1`, [reportId]);
+    if (!r.rowCount) return res.status(404).json({ ok: false, error: "report not found" });
+
+    const report = r.rows[0];
+    if (String(report.type) !== SUPPLIER_TYPE) {
+      return res.status(400).json({ ok: false, error: "WRONG_REPORT_TYPE", expected: SUPPLIER_TYPE, got: report.type });
+    }
+
+    const payload = report.payload || {};
+    const supplier_name =
+      normText(req.body?.supplierName) ||
+      normText(payload?.fields?.company_name) ||
+      normText(payload?.company_name) ||
+      "";
+
+    const expiresAt = new Date(Date.now() + expiresInDays * 24 * 60 * 60 * 1000).toISOString();
+
+    const ins = await pool.query(
+      `INSERT INTO supplier_links (report_id, supplier_name, expires_at, meta)
+       VALUES ($1,$2,$3,$4::jsonb)
+       RETURNING token, report_id, supplier_name, created_at, expires_at, used_at, meta`,
+      [reportId, supplier_name || null, expiresAt, JSON.stringify({ createdBy: "admin" })]
+    );
+
+    return res.status(201).json({ ok: true, link: ins.rows[0] });
+  } catch (e) {
+    console.error("POST /api/supplier-links ERROR =", e);
+    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+  }
+});
+
+app.get("/api/supplier-links/:token", async (req, res) => {
+  try {
+    const token = normText(req.params.token);
+    if (!token) return res.status(400).json({ ok: false, error: "token required" });
+
+    const q = await pool.query(
+      `SELECT token, report_id, supplier_name, created_at, expires_at, used_at, meta
+         FROM supplier_links
+        WHERE token = $1::uuid`,
+      [token]
+    );
+    if (!q.rowCount) return res.status(404).json({ ok: false, error: "invalid token" });
+
+    const link = q.rows[0];
+    if (link.expires_at && new Date(link.expires_at).getTime() < Date.now()) {
+      return res.status(410).json({ ok: false, error: "TOKEN_EXPIRED" });
+    }
+
+    const r = await pool.query(`SELECT id, type, payload, created_at, updated_at FROM reports WHERE id=$1`, [link.report_id]);
+    if (!r.rowCount) return res.status(404).json({ ok: false, error: "report not found" });
+
+    const report = r.rows[0];
+    if (String(report.type) !== SUPPLIER_TYPE) {
+      return res.status(400).json({ ok: false, error: "WRONG_REPORT_TYPE", expected: SUPPLIER_TYPE, got: report.type });
+    }
+
+    const payload = report.payload || {};
+    const alreadySubmitted = payload?.meta?.submitted === true || !!payload?.meta?.submittedAt || !!link.used_at;
+
+    return res.json({
+      ok: true,
+      link: {
+        token: link.token,
+        reportId: link.report_id,
+        supplierName: link.supplier_name || "",
+        createdAt: link.created_at,
+        expiresAt: link.expires_at,
+        usedAt: link.used_at,
+      },
+      report: {
+        id: report.id,
+        type: report.type,
+        created_at: report.created_at,
+        updated_at: report.updated_at,
+        title: normText(payload?.title || ""),
+        recordDate: normText(payload?.recordDate || ""),
+        uniqueKey: normText(payload?.uniqueKey || ""),
+      },
+      form: {
+        fields: isObj(payload?.fields) ? payload.fields : {},
+        answers: isObj(payload?.answers) ? payload.answers : {},
+        notes: normText(payload?.notes || ""),
+        attachments: Array.isArray(payload?.attachments) ? payload.attachments : [],
+      },
+      alreadySubmitted: !!alreadySubmitted,
+      lastSubmittedAt: payload?.meta?.submittedAt || null,
+    });
+  } catch (e) {
+    console.error("GET /api/supplier-links/:token ERROR =", e);
+    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+  }
+});
+
+app.post("/api/supplier-links/:token/submit", async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const token = normText(req.params.token);
+    if (!token) return res.status(400).json({ ok: false, error: "token required" });
+
+    const body = isObj(req.body) ? req.body : {};
+    const fields = isObj(body.fields) ? body.fields : {};
+    const answers = isObj(body.answers) ? body.answers : {};
+    const attachments = Array.isArray(body.attachments) ? body.attachments : [];
+
+    await client.query("BEGIN");
+
+    const q1 = await client.query(
+      `SELECT token, report_id, supplier_name, expires_at, used_at, meta
+         FROM supplier_links
+        WHERE token = $1::uuid
+        FOR UPDATE`,
+      [token]
+    );
+
+    if (!q1.rowCount) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ ok: false, error: "invalid token" });
+    }
+
+    const link = q1.rows[0];
+
+    if (link.expires_at && new Date(link.expires_at).getTime() < Date.now()) {
+      await client.query("ROLLBACK");
+      return res.status(410).json({ ok: false, error: "TOKEN_EXPIRED" });
+    }
+
+    if (link.used_at) {
+      await client.query("ROLLBACK");
+      return res.status(409).json({ ok: false, error: "ALREADY_SUBMITTED" });
+    }
+
+    const q2 = await client.query(`SELECT id, type, payload FROM reports WHERE id=$1 FOR UPDATE`, [link.report_id]);
+    if (!q2.rowCount) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ ok: false, error: "report not found" });
+    }
+
+    const report = q2.rows[0];
+    if (String(report.type) !== SUPPLIER_TYPE) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ ok: false, error: "WRONG_REPORT_TYPE", expected: SUPPLIER_TYPE, got: report.type });
+    }
+
+    const payload = report.payload || {};
+    const alreadySubmitted = payload?.meta?.submitted === true || !!payload?.meta?.submittedAt;
+    if (alreadySubmitted) {
+      await client.query("ROLLBACK");
+      return res.status(409).json({ ok: false, error: "ALREADY_SUBMITTED" });
+    }
+
+    const submittedAt = new Date().toISOString();
+
+    const mergedFields = { ...(isObj(payload.fields) ? payload.fields : {}), ...(fields || {}) };
+    const mergedAnswers = { ...(isObj(payload.answers) ? payload.answers : {}), ...(answers || {}) };
+
+    const newPayload = {
+      ...payload,
+      fields: mergedFields,
+      answers: mergedAnswers,
+      attachments: attachments.length ? attachments : Array.isArray(payload.attachments) ? payload.attachments : [],
+      meta: {
+        ...(isObj(payload.meta) ? payload.meta : {}),
+        submitted: true,
+        submittedAt,
+        savedAt: (payload?.meta && payload.meta.savedAt) || new Date().toISOString(),
+      },
+      public: {
+        mode: "SUPPLIER_LINK",
+        token,
+        submittedAt,
+      },
+    };
+
+    await client.query(
+      `UPDATE reports
+          SET payload=$1::jsonb,
+              updated_at=now()
+        WHERE id=$2`,
+      [JSON.stringify(newPayload), link.report_id]
+    );
+
+    await client.query(`UPDATE supplier_links SET used_at=now() WHERE token=$1::uuid`, [token]);
+
+    await client.query("COMMIT");
+
+    return res.json({ ok: true, reportId: link.report_id, token, submittedAt });
+  } catch (e) {
+    try {
+      await client.query("ROLLBACK");
+    } catch {}
+    console.error("POST /api/supplier-links/:token/submit ERROR =", e);
+    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+  } finally {
+    client.release();
+  }
+});
+
+/* ======================================================================
+   Supplier Public Token API (kept)
+====================================================================== */
+app.get("/api/reports/public/:token", async (req, res) => {
+  try {
+    const token = normText(req.params.token || "");
+    if (!token) return res.status(400).json({ ok: false, error: "token required" });
+
+    const q = await pool.query(
+      `
+      SELECT *
+      FROM reports
+      WHERE (payload->'public'->>'token') = $1
+      ORDER BY created_at DESC
+      LIMIT 1
+      `,
+      [token]
+    );
+
+    if (!q.rowCount) return res.status(404).json({ ok: false, error: "NOT_FOUND" });
+    return res.json({ ok: true, report: q.rows[0] });
+  } catch (e) {
+    console.error("GET /api/reports/public/:token ERROR =", e);
+    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+  }
+});
+
+app.post("/api/reports/public/:token/submit", async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const token = normText(req.params.token || "");
+    if (!token) return res.status(400).json({ ok: false, error: "token required" });
+
+    const body = isObj(req.body) ? req.body : {};
+    const fields = isObj(body.fields) ? body.fields : {};
+    const answers = isObj(body.answers) ? body.answers : {};
+    const attachments = Array.isArray(body.attachments) ? body.attachments : [];
+
+    await client.query("BEGIN");
+
+    const q = await client.query(
+      `
+      SELECT id, payload
+      FROM reports
+      WHERE (payload->'public'->>'token') = $1
+      ORDER BY created_at DESC
+      LIMIT 1
+      FOR UPDATE
+      `,
+      [token]
+    );
+
+    if (!q.rowCount) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ ok: false, error: "NOT_FOUND" });
+    }
+
+    const row = q.rows[0];
+    const id = row.id;
+    const payload = row.payload || {};
+
+    const alreadySubmitted = payload?.meta?.submitted === true || !!payload?.public?.submittedAt;
+    if (alreadySubmitted) {
+      await client.query("ROLLBACK");
+      return res.status(409).json({ ok: false, error: "ALREADY_SUBMITTED" });
+    }
+
+    const submittedAt = new Date().toISOString();
+
+    const newPayload = {
+      ...payload,
+      fields: { ...(payload.fields || {}), ...(fields || {}) },
+      answers: { ...(payload.answers || {}), ...(answers || {}) },
+      attachments: attachments.length ? attachments : payload.attachments || [],
+      meta: {
+        ...(payload.meta || {}),
+        submitted: true,
+        submittedAt,
+        savedAt: payload?.meta?.savedAt || Date.now(),
+      },
+      public: {
+        ...(payload.public || {}),
+        mode: payload?.public?.mode || "PUBLIC",
+        token: payload?.public?.token || token,
+        submittedAt,
+      },
+    };
+
+    await client.query(
+      `UPDATE reports
+         SET payload=$1::jsonb,
+             updated_at=now()
+       WHERE id=$2`,
+      [JSON.stringify(newPayload), id]
+    );
+
+    await client.query("COMMIT");
+    return res.json({ ok: true, id, submittedAt });
+  } catch (e) {
+    try {
+      await client.query("ROLLBACK");
+    } catch {}
+    console.error("POST /api/reports/public/:token/submit ERROR =", e);
+    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+  } finally {
+    client.release();
+  }
+});
+
+/* ============================================================
+   Training Session Token API (TEXT token stored in reports.payload.quizToken)
+============================================================ */
 function extractQuiz(payload) {
   const q = payload?.quiz || payload?.quizData || payload?.trainingQuiz || {};
   const questions =
-    Array.isArray(q?.questions) ? q.questions :
-    Array.isArray(payload?.questions) ? payload.questions :
-    [];
+    Array.isArray(q?.questions) ? q.questions : Array.isArray(payload?.questions) ? payload.questions : [];
   const module = q?.module || payload?.module || payload?.moduleName || "";
   const passMark = Number(q?.passMark ?? payload?.passMark ?? payload?.PASS_MARK ?? 80);
 
@@ -605,10 +918,11 @@ function extractQuiz(payload) {
   };
 }
 
-/* ✅ NEW: build participantKey consistently */
 function makeParticipantKeyFromBody(body) {
   const pk = normText(body?.participantKey);
+  const pk2 = normText(body?.participant_key);
   if (pk) return pk;
+  if (pk2) return pk2;
 
   const p = body?.participant || {};
   const employeeId = normText(p?.employeeId);
@@ -619,18 +933,15 @@ function makeParticipantKeyFromBody(body) {
   return "";
 }
 
-/* ✅ NEW: map-key inside payload.quizSubmissions */
 function submissionKey(token, participantKey) {
   const pk = normText(participantKey);
   if (pk) return `p:${pk}`;
   return `t:${normText(token)}`;
 }
 
-/* ✅ NEW: find existing submission for token + participantKey */
 function getSubmission(payload, token, participantKey) {
-  const subMap = payload?.quizSubmissions && typeof payload.quizSubmissions === "object"
-    ? payload.quizSubmissions
-    : null;
+  const subMap =
+    payload?.quizSubmissions && typeof payload.quizSubmissions === "object" ? payload.quizSubmissions : null;
 
   if (subMap) {
     const k = submissionKey(token, participantKey);
@@ -641,7 +952,6 @@ function getSubmission(payload, token, participantKey) {
   return null;
 }
 
-/* get training session by token (TEXT) */
 app.get("/api/training-session/by-token/:token", async (req, res) => {
   try {
     const token = normText(req.params.token);
@@ -672,10 +982,7 @@ app.get("/api/training-session/by-token/:token", async (req, res) => {
 
     const existing = pKey ? getSubmission(payload, token, pKey) : null;
 
-    const p =
-      payload?.participant ||
-      payload?.participants?.[0] ||
-      {};
+    const p = payload?.participant || payload?.participants?.[0] || {};
 
     return res.json({
       ok: true,
@@ -700,7 +1007,6 @@ app.get("/api/training-session/by-token/:token", async (req, res) => {
   }
 });
 
-/* submit trainee quiz by token (TEXT) — expects { participant, participantKey, answers:number[] } */
 app.post("/api/training-session/by-token/:token/submit", async (req, res) => {
   const client = await pool.connect();
   try {
@@ -823,9 +1129,7 @@ app.post("/api/training-session/by-token/:token/submit", async (req, res) => {
     };
 
     const subMap =
-      payload?.quizSubmissions && typeof payload.quizSubmissions === "object"
-        ? payload.quizSubmissions
-        : {};
+      payload?.quizSubmissions && typeof payload.quizSubmissions === "object" ? payload.quizSubmissions : {};
 
     const subKey = submissionKey(token, pKey);
 
@@ -964,7 +1268,7 @@ app.post("/api/product-catalog", async (req, res) => {
 });
 
 /* ============================================================
-   ✅ Training Links API (UUID token system - still kept)
+   Training Links API (UUID token system - still kept)
 ============================================================ */
 app.post("/api/training-links", async (req, res) => {
   try {
@@ -995,14 +1299,7 @@ app.post("/api/training-links", async (req, res) => {
         `INSERT INTO training_links (report_id, participant_slno, participant_name, module, expires_at, meta)
          VALUES ($1,$2,$3,$4,$5,$6::jsonb)
          RETURNING token, report_id, participant_slno, participant_name, module, expires_at, created_at, used_at`,
-        [
-          reportId,
-          slNo || null,
-          name,
-          module || null,
-          expiresAt,
-          JSON.stringify({ createdBy: "admin" }),
-        ]
+        [reportId, slNo || null, name, module || null, expiresAt, JSON.stringify({ createdBy: "admin" })]
       );
       created.push(ins.rows[0]);
     }
@@ -1230,10 +1527,7 @@ app.post("/api/training-links/:token/submit", async (req, res) => {
 
 /* --------- Cloudinary config (robust) --------- */
 (function configureCloudinary() {
-  const hasSplit =
-    process.env.CLOUDINARY_CLOUD_NAME &&
-    process.env.CLOUDINARY_API_KEY &&
-    process.env.CLOUDINARY_API_SECRET;
+  const hasSplit = process.env.CLOUDINARY_CLOUD_NAME && process.env.CLOUDINARY_API_KEY && process.env.CLOUDINARY_API_SECRET;
 
   if (hasSplit) {
     cloudinary.config({
@@ -1341,7 +1635,6 @@ app.post("/api/images", uploadAny.any(), async (req, res) => {
   }
 });
 
-/* ========= Cloudinary delete helpers & route ========= */
 function parseCloudinaryUrl(u) {
   try {
     const { pathname } = new URL(u);
@@ -1459,9 +1752,7 @@ app.delete("/api/images", async (req, res) => {
       deleted,
       failed,
       results: results.map((r, i) =>
-        r.status === "fulfilled"
-          ? { i, status: "ok" }
-          : { i, status: "error", reason: String(r.reason?.message || r.reason) }
+        r.status === "fulfilled" ? { i, status: "ok" } : { i, status: "error", reason: String(r.reason?.message || r.reason) }
       ),
     });
   } catch (e) {
@@ -1470,7 +1761,6 @@ app.delete("/api/images", async (req, res) => {
   }
 });
 
-/* --------- Legacy DB image serve --------- */
 app.get("/api/images/:id", async (req, res) => {
   try {
     const r = await pool.query("SELECT filename,mimetype,data FROM images WHERE id=$1", [req.params.id]);
