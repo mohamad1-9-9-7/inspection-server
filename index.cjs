@@ -793,14 +793,17 @@ app.post("/api/supplier-links/:token/submit", async (req, res) => {
 });
 
 /* ======================================================================
-   Supplier Public Token API (kept)
+   ✅ SUPPLIER PUBLIC TOKEN API (AUTO-CREATE if not found)
 ====================================================================== */
+
 app.get("/api/reports/public/:token", async (req, res) => {
+  const client = await pool.connect();
   try {
     const token = normText(req.params.token || "");
     if (!token) return res.status(400).json({ ok: false, error: "token required" });
 
-    const q = await pool.query(
+    // 1) try find
+    const q = await client.query(
       `
       SELECT *
       FROM reports
@@ -811,90 +814,123 @@ app.get("/api/reports/public/:token", async (req, res) => {
       [token]
     );
 
-    if (!q.rowCount) return res.status(404).json({ ok: false, error: "NOT_FOUND" });
-    return res.json({ ok: true, report: q.rows[0] });
+    if (q.rowCount) {
+      return res.json({ ok: true, report: q.rows[0], created: false });
+    }
+
+    // 2) not found → auto-create placeholder report
+    await client.query("BEGIN");
+
+    const nowIso = new Date().toISOString();
+    const recDate = todayISO();
+
+    const payload = {
+      recordDate: recDate,
+      title: `Supplier Self-Assessment Form • Supplier • ${recDate}`,
+      uniqueKey: `supplier__${recDate}__${token}`,
+
+      fields: {},
+      answers: {},
+      notes: "",
+
+      public: {
+        token,
+        mode: "PUBLIC",
+        createdAt: nowIso,
+        submittedAt: null,
+      },
+
+      meta: {
+        submitted: false,
+        createdBy: "AUTO_PUBLIC_LINK",
+        savedAt: nowIso,
+      },
+    };
+
+    const ins = await client.query(
+      `INSERT INTO reports (reporter, type, payload)
+       VALUES ($1, $2, $3::jsonb)
+       RETURNING *`,
+      ["public", "supplier_self_assessment_form", JSON.stringify(payload)]
+    );
+
+    await client.query("COMMIT");
+    return res.json({ ok: true, report: ins.rows[0], created: true });
   } catch (e) {
+    try { await client.query("ROLLBACK"); } catch {}
     console.error("GET /api/reports/public/:token ERROR =", e);
     return res.status(500).json({ ok: false, error: String(e?.message || e) });
+  } finally {
+    client.release();
   }
 });
+/* ======================================================================
+   ✅ SUPPLIER PUBLIC TOKEN API (AUTO-CREATE if not found)
+====================================================================== */
 
-app.post("/api/reports/public/:token/submit", async (req, res) => {
+app.get("/api/reports/public/:token", async (req, res) => {
   const client = await pool.connect();
   try {
     const token = normText(req.params.token || "");
     if (!token) return res.status(400).json({ ok: false, error: "token required" });
 
-    const body = isObj(req.body) ? req.body : {};
-    const fields = isObj(body.fields) ? body.fields : {};
-    const answers = isObj(body.answers) ? body.answers : {};
-    const attachments = Array.isArray(body.attachments) ? body.attachments : [];
-
-    await client.query("BEGIN");
-
+    // 1) try find
     const q = await client.query(
       `
-      SELECT id, payload
+      SELECT *
       FROM reports
       WHERE (payload->'public'->>'token') = $1
       ORDER BY created_at DESC
       LIMIT 1
-      FOR UPDATE
       `,
       [token]
     );
 
-    if (!q.rowCount) {
-      await client.query("ROLLBACK");
-      return res.status(404).json({ ok: false, error: "NOT_FOUND" });
+    if (q.rowCount) {
+      return res.json({ ok: true, report: q.rows[0], created: false });
     }
 
-    const row = q.rows[0];
-    const id = row.id;
-    const payload = row.payload || {};
+    // 2) not found → auto-create placeholder report
+    await client.query("BEGIN");
 
-    const alreadySubmitted = payload?.meta?.submitted === true || !!payload?.public?.submittedAt;
-    if (alreadySubmitted) {
-      await client.query("ROLLBACK");
-      return res.status(409).json({ ok: false, error: "ALREADY_SUBMITTED" });
-    }
+    const nowIso = new Date().toISOString();
+    const recDate = todayISO();
 
-    const submittedAt = new Date().toISOString();
+    const payload = {
+      recordDate: recDate,
+      title: `Supplier Self-Assessment Form • Supplier • ${recDate}`,
+      uniqueKey: `supplier__${recDate}__${token}`,
 
-    const newPayload = {
-      ...payload,
-      fields: { ...(payload.fields || {}), ...(fields || {}) },
-      answers: { ...(payload.answers || {}), ...(answers || {}) },
-      attachments: attachments.length ? attachments : payload.attachments || [],
-      meta: {
-        ...(payload.meta || {}),
-        submitted: true,
-        submittedAt,
-        savedAt: payload?.meta?.savedAt || Date.now(),
-      },
+      fields: {},
+      answers: {},
+      notes: "",
+
       public: {
-        ...(payload.public || {}),
-        mode: payload?.public?.mode || "PUBLIC",
-        token: payload?.public?.token || token,
-        submittedAt,
+        token,
+        mode: "PUBLIC",
+        createdAt: nowIso,
+        submittedAt: null,
+      },
+
+      meta: {
+        submitted: false,
+        createdBy: "AUTO_PUBLIC_LINK",
+        savedAt: nowIso,
       },
     };
 
-    await client.query(
-      `UPDATE reports
-         SET payload=$1::jsonb,
-             updated_at=now()
-       WHERE id=$2`,
-      [JSON.stringify(newPayload), id]
+    const ins = await client.query(
+      `INSERT INTO reports (reporter, type, payload)
+       VALUES ($1, $2, $3::jsonb)
+       RETURNING *`,
+      ["public", "supplier_self_assessment_form", JSON.stringify(payload)]
     );
 
     await client.query("COMMIT");
-    return res.json({ ok: true, id, submittedAt });
+    return res.json({ ok: true, report: ins.rows[0], created: true });
   } catch (e) {
-    try {
-      await client.query("ROLLBACK");
-    } catch {}
-    console.error("POST /api/reports/public/:token/submit ERROR =", e);
+    try { await client.query("ROLLBACK"); } catch {}
+    console.error("GET /api/reports/public/:token ERROR =", e);
     return res.status(500).json({ ok: false, error: String(e?.message || e) });
   } finally {
     client.release();
