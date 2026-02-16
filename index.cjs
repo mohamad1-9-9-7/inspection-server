@@ -794,6 +794,7 @@ app.post("/api/supplier-links/:token/submit", async (req, res) => {
 
 /* ======================================================================
    ✅ SUPPLIER PUBLIC TOKEN API (AUTO-CREATE if not found)
+   ✅ + FIX: ADD POST /submit (THIS WAS MISSING -> caused your 404)
 ====================================================================== */
 
 app.get("/api/reports/public/:token", async (req, res) => {
@@ -832,6 +833,7 @@ app.get("/api/reports/public/:token", async (req, res) => {
       fields: {},
       answers: {},
       notes: "",
+      questions: [],
 
       public: {
         token,
@@ -857,80 +859,117 @@ app.get("/api/reports/public/:token", async (req, res) => {
     await client.query("COMMIT");
     return res.json({ ok: true, report: ins.rows[0], created: true });
   } catch (e) {
-    try { await client.query("ROLLBACK"); } catch {}
+    try {
+      await client.query("ROLLBACK");
+    } catch {}
     console.error("GET /api/reports/public/:token ERROR =", e);
     return res.status(500).json({ ok: false, error: String(e?.message || e) });
   } finally {
     client.release();
   }
 });
-/* ======================================================================
-   ✅ SUPPLIER PUBLIC TOKEN API (AUTO-CREATE if not found)
-====================================================================== */
 
-app.get("/api/reports/public/:token", async (req, res) => {
+/* ✅✅✅ THIS IS THE IMPORTANT FIX */
+app.post("/api/reports/public/:token/submit", async (req, res) => {
   const client = await pool.connect();
   try {
     const token = normText(req.params.token || "");
     if (!token) return res.status(400).json({ ok: false, error: "token required" });
 
-    // 1) try find
+    const body = isObj(req.body) ? req.body : {};
+    const fields = isObj(body.fields) ? body.fields : {};
+    const answers = isObj(body.answers) ? body.answers : {};
+    const attachments = Array.isArray(body.attachments) ? body.attachments : [];
+
+    await client.query("BEGIN");
+
+    // Lock the report row (if exists)
     const q = await client.query(
       `
-      SELECT *
+      SELECT id, type, payload
       FROM reports
       WHERE (payload->'public'->>'token') = $1
       ORDER BY created_at DESC
       LIMIT 1
+      FOR UPDATE
       `,
       [token]
     );
 
+    let reportId;
+    let payload;
+
     if (q.rowCount) {
-      return res.json({ ok: true, report: q.rows[0], created: false });
+      reportId = q.rows[0].id;
+      payload = q.rows[0].payload || {};
+      if (payload?.meta?.submitted === true || payload?.meta?.submittedAt) {
+        await client.query("ROLLBACK");
+        return res.status(409).json({ ok: false, error: "ALREADY_SUBMITTED" });
+      }
+    } else {
+      // If not found (rare), auto-create then submit in same transaction
+      const nowIso = new Date().toISOString();
+      const recDate = todayISO();
+
+      payload = {
+        recordDate: recDate,
+        title: `Supplier Self-Assessment Form • Supplier • ${recDate}`,
+        uniqueKey: `supplier__${recDate}__${token}`,
+        fields: {},
+        answers: {},
+        notes: "",
+        questions: [],
+        public: { token, mode: "PUBLIC", createdAt: nowIso, submittedAt: null },
+        meta: { submitted: false, createdBy: "AUTO_PUBLIC_LINK", savedAt: nowIso },
+      };
+
+      const ins = await client.query(
+        `INSERT INTO reports (reporter, type, payload)
+         VALUES ($1, $2, $3::jsonb)
+         RETURNING id, payload`,
+        ["public", "supplier_self_assessment_form", JSON.stringify(payload)]
+      );
+
+      reportId = ins.rows[0].id;
+      payload = ins.rows[0].payload || payload;
     }
 
-    // 2) not found → auto-create placeholder report
-    await client.query("BEGIN");
+    const submittedAt = new Date().toISOString();
 
-    const nowIso = new Date().toISOString();
-    const recDate = todayISO();
+    const mergedFields = { ...(isObj(payload.fields) ? payload.fields : {}), ...(fields || {}) };
+    const mergedAnswers = { ...(isObj(payload.answers) ? payload.answers : {}), ...(answers || {}) };
 
-    const payload = {
-      recordDate: recDate,
-      title: `Supplier Self-Assessment Form • Supplier • ${recDate}`,
-      uniqueKey: `supplier__${recDate}__${token}`,
-
-      fields: {},
-      answers: {},
-      notes: "",
-
+    const newPayload = {
+      ...payload,
+      fields: mergedFields,
+      answers: mergedAnswers,
+      attachments: attachments.length ? attachments : Array.isArray(payload.attachments) ? payload.attachments : [],
+      meta: {
+        ...(isObj(payload.meta) ? payload.meta : {}),
+        submitted: true,
+        submittedAt,
+        savedAt: (payload?.meta && payload.meta.savedAt) || new Date().toISOString(),
+      },
       public: {
+        ...(isObj(payload.public) ? payload.public : {}),
         token,
         mode: "PUBLIC",
-        createdAt: nowIso,
-        submittedAt: null,
-      },
-
-      meta: {
-        submitted: false,
-        createdBy: "AUTO_PUBLIC_LINK",
-        savedAt: nowIso,
+        submittedAt,
       },
     };
 
-    const ins = await client.query(
-      `INSERT INTO reports (reporter, type, payload)
-       VALUES ($1, $2, $3::jsonb)
-       RETURNING *`,
-      ["public", "supplier_self_assessment_form", JSON.stringify(payload)]
-    );
+    await client.query(`UPDATE reports SET payload=$1::jsonb, updated_at=now() WHERE id=$2`, [
+      JSON.stringify(newPayload),
+      reportId,
+    ]);
 
     await client.query("COMMIT");
-    return res.json({ ok: true, report: ins.rows[0], created: true });
+    return res.json({ ok: true, reportId, token, submittedAt });
   } catch (e) {
-    try { await client.query("ROLLBACK"); } catch {}
-    console.error("GET /api/reports/public/:token ERROR =", e);
+    try {
+      await client.query("ROLLBACK");
+    } catch {}
+    console.error("POST /api/reports/public/:token/submit ERROR =", e);
     return res.status(500).json({ ok: false, error: String(e?.message || e) });
   } finally {
     client.release();
