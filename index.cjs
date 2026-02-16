@@ -604,10 +604,7 @@ app.post("/api/supplier-links", async (req, res) => {
 
     const payload = report.payload || {};
     const supplier_name =
-      normText(req.body?.supplierName) ||
-      normText(payload?.fields?.company_name) ||
-      normText(payload?.company_name) ||
-      "";
+      normText(req.body?.supplierName) || normText(payload?.fields?.company_name) || normText(payload?.company_name) || "";
 
     const expiresAt = new Date(Date.now() + expiresInDays * 24 * 60 * 60 * 1000).toISOString();
 
@@ -794,9 +791,7 @@ app.post("/api/supplier-links/:token/submit", async (req, res) => {
 
 /* ======================================================================
    ✅ SUPPLIER PUBLIC TOKEN API (AUTO-CREATE if not found)
-   ✅ + FIX: ADD POST /submit (THIS WAS MISSING -> caused your 404)
 ====================================================================== */
-
 app.get("/api/reports/public/:token", async (req, res) => {
   const client = await pool.connect();
   try {
@@ -869,7 +864,7 @@ app.get("/api/reports/public/:token", async (req, res) => {
   }
 });
 
-/* ✅✅✅ THIS IS THE IMPORTANT FIX */
+/* ✅ submit */
 app.post("/api/reports/public/:token/submit", async (req, res) => {
   const client = await pool.connect();
   try {
@@ -883,7 +878,6 @@ app.post("/api/reports/public/:token/submit", async (req, res) => {
 
     await client.query("BEGIN");
 
-    // Lock the report row (if exists)
     const q = await client.query(
       `
       SELECT id, type, payload
@@ -907,7 +901,6 @@ app.post("/api/reports/public/:token/submit", async (req, res) => {
         return res.status(409).json({ ok: false, error: "ALREADY_SUBMITTED" });
       }
     } else {
-      // If not found (rare), auto-create then submit in same transaction
       const nowIso = new Date().toISOString();
       const recDate = todayISO();
 
@@ -981,8 +974,7 @@ app.post("/api/reports/public/:token/submit", async (req, res) => {
 ============================================================ */
 function extractQuiz(payload) {
   const q = payload?.quiz || payload?.quizData || payload?.trainingQuiz || {};
-  const questions =
-    Array.isArray(q?.questions) ? q.questions : Array.isArray(payload?.questions) ? payload.questions : [];
+  const questions = Array.isArray(q?.questions) ? q.questions : Array.isArray(payload?.questions) ? payload.questions : [];
   const module = q?.module || payload?.module || payload?.moduleName || "";
   const passMark = Number(q?.passMark ?? payload?.passMark ?? payload?.PASS_MARK ?? 80);
 
@@ -1015,8 +1007,7 @@ function submissionKey(token, participantKey) {
 }
 
 function getSubmission(payload, token, participantKey) {
-  const subMap =
-    payload?.quizSubmissions && typeof payload.quizSubmissions === "object" ? payload.quizSubmissions : null;
+  const subMap = payload?.quizSubmissions && typeof payload.quizSubmissions === "object" ? payload.quizSubmissions : null;
 
   if (subMap) {
     const k = submissionKey(token, participantKey);
@@ -1056,7 +1047,6 @@ app.get("/api/training-session/by-token/:token", async (req, res) => {
     }
 
     const existing = pKey ? getSubmission(payload, token, pKey) : null;
-
     const p = payload?.participant || payload?.participants?.[0] || {};
 
     return res.json({
@@ -1097,15 +1087,9 @@ app.post("/api/training-session/by-token/:token/submit", async (req, res) => {
     const pEmployeeId = normText(participant?.employeeId);
 
     const pKey = makeParticipantKeyFromBody(req.body);
-    if (!pKey) {
-      return res.status(400).json({ ok: false, error: "participantKey required (or participant.employeeId/name)" });
-    }
-    if (!pName) {
-      return res.status(400).json({ ok: false, error: "participant.name required" });
-    }
-    if (!pEmployeeId) {
-      return res.status(400).json({ ok: false, error: "participant.employeeId required" });
-    }
+    if (!pKey) return res.status(400).json({ ok: false, error: "participantKey required (or participant.employeeId/name)" });
+    if (!pName) return res.status(400).json({ ok: false, error: "participant.name required" });
+    if (!pEmployeeId) return res.status(400).json({ ok: false, error: "participant.employeeId required" });
 
     await client.query("BEGIN");
 
@@ -1203,9 +1187,7 @@ app.post("/api/training-session/by-token/:token/submit", async (req, res) => {
       answers,
     };
 
-    const subMap =
-      payload?.quizSubmissions && typeof payload.quizSubmissions === "object" ? payload.quizSubmissions : {};
-
+    const subMap = payload?.quizSubmissions && typeof payload.quizSubmissions === "object" ? payload.quizSubmissions : {};
     const subKey = submissionKey(token, pKey);
 
     const participants = safeArr(payload?.participants);
@@ -1625,6 +1607,71 @@ app.post("/api/training-links/:token/submit", async (req, res) => {
   }
 })();
 
+/* ============================================================
+   Files helpers (Cloudinary redirect + Proxy)
+============================================================ */
+
+/** GET cloudinary url by publicId (works when you stored only public_id / filename) */
+app.get("/api/files/cloudinary/:publicId", async (req, res) => {
+  try {
+    const cfg = cloudinary.config();
+    const missing = ["cloud_name", "api_key", "api_secret"].filter((k) => !cfg[k]);
+    if (missing.length) return res.status(500).json({ ok: false, error: "CLOUDINARY_CONFIG_MISSING", missing });
+
+    let publicId = String(req.params.publicId || "").trim();
+    if (!publicId) return res.status(400).json({ ok: false, error: "publicId required" });
+
+    // if user stored "xxxx.pdf" remove extension for api.resource
+    publicId = publicId.replace(/\.(pdf|png|jpg|jpeg|webp|gif)$/i, "");
+
+    // try raw first (PDF usually raw), then image
+    let r = null;
+    try {
+      r = await cloudinary.api.resource(publicId, { resource_type: "raw" });
+    } catch (e1) {
+      r = await cloudinary.api.resource(publicId, { resource_type: "image" });
+    }
+
+    const url = r?.secure_url || r?.url;
+    if (!url) return res.status(404).json({ ok: false, error: "NO_URL_FOUND" });
+
+    // redirect so iframe can load it
+    return res.redirect(302, url);
+  } catch (e) {
+    console.error("GET /api/files/cloudinary/:publicId ERROR =", e);
+    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+  }
+});
+
+/** Proxy any public URL (useful when url is full https but cross-site / headers issues) */
+app.get("/api/files/proxy", async (req, res) => {
+  try {
+    const fetchFn = globalThis.fetch;
+    if (typeof fetchFn !== "function") {
+      return res.status(500).json({ ok: false, error: "FETCH_NOT_AVAILABLE", hint: "Use Node 18+ on server" });
+    }
+
+    const url = String(req.query.url || "").trim();
+    if (!url) return res.status(400).json({ ok: false, error: "Missing url" });
+
+    const r = await fetchFn(url);
+    if (!r.ok) {
+      const txt = await r.text().catch(() => "");
+      return res.status(r.status).send(txt || `Upstream error ${r.status}`);
+    }
+
+    const contentType = r.headers.get("content-type") || "application/octet-stream";
+    res.setHeader("Content-Type", contentType);
+    res.setHeader("Content-Disposition", "inline");
+
+    const buf = Buffer.from(await r.arrayBuffer());
+    res.send(buf);
+  } catch (e) {
+    console.error("GET /api/files/proxy ERROR =", e);
+    res.status(500).json({ ok: false, error: String(e?.message || e) });
+  }
+});
+
 /* --------- Health routes --------- */
 app.get("/health/db", async (_req, res) => {
   try {
@@ -1827,7 +1874,9 @@ app.delete("/api/images", async (req, res) => {
       deleted,
       failed,
       results: results.map((r, i) =>
-        r.status === "fulfilled" ? { i, status: "ok" } : { i, status: "error", reason: String(r.reason?.message || r.reason) }
+        r.status === "fulfilled"
+          ? { i, status: "ok" }
+          : { i, status: "error", reason: String(r.reason?.message || r.reason) }
       ),
     });
   } catch (e) {
