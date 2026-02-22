@@ -85,6 +85,10 @@ function safeArr(x) {
   return Array.isArray(x) ? x : [];
 }
 
+function safeObj(x) {
+  return isObj(x) ? x : {};
+}
+
 function normKey(s) {
   return String(s ?? "").trim().toLowerCase();
 }
@@ -675,6 +679,7 @@ app.get("/api/supplier-links/:token", async (req, res) => {
         answers: isObj(payload?.answers) ? payload.answers : {},
         notes: normText(payload?.notes || ""),
         attachments: Array.isArray(payload?.attachments) ? payload.attachments : [],
+        fieldAttachments: isObj(payload?.fieldAttachments) ? payload.fieldAttachments : {},
       },
       alreadySubmitted: !!alreadySubmitted,
       lastSubmittedAt: payload?.meta?.submittedAt || null,
@@ -685,6 +690,7 @@ app.get("/api/supplier-links/:token", async (req, res) => {
   }
 });
 
+/* ✅ UPDATED: supports recordDate + fieldAttachments */
 app.post("/api/supplier-links/:token/submit", async (req, res) => {
   const client = await pool.connect();
   try {
@@ -692,9 +698,12 @@ app.post("/api/supplier-links/:token/submit", async (req, res) => {
     if (!token) return res.status(400).json({ ok: false, error: "token required" });
 
     const body = isObj(req.body) ? req.body : {};
+    const recordDate = normText(body.recordDate || "");
     const fields = isObj(body.fields) ? body.fields : {};
     const answers = isObj(body.answers) ? body.answers : {};
     const attachments = Array.isArray(body.attachments) ? body.attachments : [];
+    const fieldAttachments =
+      isObj(body.fieldAttachments) && !Array.isArray(body.fieldAttachments) ? body.fieldAttachments : {};
 
     await client.query("BEGIN");
 
@@ -747,11 +756,16 @@ app.post("/api/supplier-links/:token/submit", async (req, res) => {
     const mergedFields = { ...(isObj(payload.fields) ? payload.fields : {}), ...(fields || {}) };
     const mergedAnswers = { ...(isObj(payload.answers) ? payload.answers : {}), ...(answers || {}) };
 
+    const existingFieldAtt = isObj(payload.fieldAttachments) ? payload.fieldAttachments : {};
+    const mergedFieldAtt = { ...existingFieldAtt, ...safeObj(fieldAttachments) };
+
     const newPayload = {
       ...payload,
+      recordDate: recordDate || normText(payload.recordDate) || todayISO(),
       fields: mergedFields,
       answers: mergedAnswers,
       attachments: attachments.length ? attachments : Array.isArray(payload.attachments) ? payload.attachments : [],
+      fieldAttachments: Object.keys(mergedFieldAtt).length ? mergedFieldAtt : existingFieldAtt,
       meta: {
         ...(isObj(payload.meta) ? payload.meta : {}),
         submitted: true,
@@ -829,6 +843,8 @@ app.get("/api/reports/public/:token", async (req, res) => {
       answers: {},
       notes: "",
       questions: [],
+      attachments: [],
+      fieldAttachments: {},
 
       public: {
         token,
@@ -864,7 +880,7 @@ app.get("/api/reports/public/:token", async (req, res) => {
   }
 });
 
-/* ✅ submit */
+/* ✅ UPDATED submit: supports recordDate + fieldAttachments */
 app.post("/api/reports/public/:token/submit", async (req, res) => {
   const client = await pool.connect();
   try {
@@ -872,9 +888,12 @@ app.post("/api/reports/public/:token/submit", async (req, res) => {
     if (!token) return res.status(400).json({ ok: false, error: "token required" });
 
     const body = isObj(req.body) ? req.body : {};
+    const recordDate = normText(body.recordDate || "");
     const fields = isObj(body.fields) ? body.fields : {};
     const answers = isObj(body.answers) ? body.answers : {};
     const attachments = Array.isArray(body.attachments) ? body.attachments : [];
+    const fieldAttachments =
+      isObj(body.fieldAttachments) && !Array.isArray(body.fieldAttachments) ? body.fieldAttachments : {};
 
     await client.query("BEGIN");
 
@@ -912,6 +931,8 @@ app.post("/api/reports/public/:token/submit", async (req, res) => {
         answers: {},
         notes: "",
         questions: [],
+        attachments: [],
+        fieldAttachments: {},
         public: { token, mode: "PUBLIC", createdAt: nowIso, submittedAt: null },
         meta: { submitted: false, createdBy: "AUTO_PUBLIC_LINK", savedAt: nowIso },
       };
@@ -932,11 +953,16 @@ app.post("/api/reports/public/:token/submit", async (req, res) => {
     const mergedFields = { ...(isObj(payload.fields) ? payload.fields : {}), ...(fields || {}) };
     const mergedAnswers = { ...(isObj(payload.answers) ? payload.answers : {}), ...(answers || {}) };
 
+    const existingFieldAtt = isObj(payload.fieldAttachments) ? payload.fieldAttachments : {};
+    const mergedFieldAtt = { ...existingFieldAtt, ...safeObj(fieldAttachments) };
+
     const newPayload = {
       ...payload,
+      recordDate: recordDate || normText(payload.recordDate) || todayISO(),
       fields: mergedFields,
       answers: mergedAnswers,
       attachments: attachments.length ? attachments : Array.isArray(payload.attachments) ? payload.attachments : [],
+      fieldAttachments: Object.keys(mergedFieldAtt).length ? mergedFieldAtt : existingFieldAtt,
       meta: {
         ...(isObj(payload.meta) ? payload.meta : {}),
         submitted: true,
