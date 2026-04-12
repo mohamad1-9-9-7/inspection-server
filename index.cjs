@@ -1925,6 +1925,37 @@ app.get("/api/images/:id", async (req, res) => {
   }
 });
 
+/* --------- Auth: verify role password --------- */
+app.post("/api/auth/verify-role", (req, res) => {
+  const { roleId, password } = req.body || {};
+
+  if (!roleId || typeof password !== "string") {
+    return res.status(400).json({ success: false, error: "Missing roleId or password" });
+  }
+
+  let passwords;
+  try {
+    passwords = JSON.parse(process.env.ROLE_PASSWORDS_JSON || "{}");
+  } catch {
+    return res.status(500).json({ success: false, error: "Server config error" });
+  }
+
+  const expected = passwords[roleId] ?? passwords["default"];
+
+  if (expected === undefined) {
+    return res.status(400).json({ success: false, error: "Unknown role" });
+  }
+
+  if (password === expected) {
+    return res.json({ success: true });
+  }
+
+  // تأخير 500ms لمنع brute-force
+  setTimeout(() => {
+    res.status(401).json({ success: false, error: "Wrong password" });
+  }, 500);
+});
+
 /* --------- Boot --------- */
 ensureSchema()
   .then(() =>
