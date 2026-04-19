@@ -222,7 +222,7 @@ app.get("/api/reports", async (req, res) => {
     const { type } = req.query;
     const lite = String(req.query?.lite || "").toLowerCase();
     const isLite = lite === "1" || lite === "true" || lite === "yes";
-    const limit = clampInt(req.query?.limit, 200, 1, 500);
+    const limit = clampInt(req.query?.limit, 200, 1, 5000);
 
     let q = "";
     let params = [];
