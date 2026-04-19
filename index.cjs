@@ -193,6 +193,25 @@ async function ensureSchema() {
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_supplier_links_report_id ON supplier_links(report_id);`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_supplier_links_used_at ON supplier_links(used_at);`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_supplier_links_expires_at ON supplier_links(expires_at);`);
+
+  /* ── Presence / visitor analytics ── */
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS presence (
+      visitor_id TEXT PRIMARY KEY,
+      last_seen  TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_presence_last_seen ON presence(last_seen);`);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS daily_visits (
+      day        DATE NOT NULL,
+      visitor_id TEXT NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      PRIMARY KEY (day, visitor_id)
+    );
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_daily_visits_day ON daily_visits(day);`);
 }
 
 /* ============================================================
@@ -1954,6 +1973,75 @@ app.post("/api/auth/verify-role", (req, res) => {
   setTimeout(() => {
     res.status(401).json({ success: false, error: "Wrong password" });
   }, 500);
+});
+
+/* ============================================================
+   Presence / Visitor Analytics
+   - POST /api/presence/ping  body:{ visitorId }  → { ok:true }
+   - POST /api/presence/bye   body:{ visitorId }  → { ok:true }
+   - GET  /api/presence/stats → { online, todayVisits, totalVisits }
+   Online window = 60 seconds. Daily date uses Asia/Dubai timezone.
+============================================================ */
+const PRESENCE_ONLINE_SECONDS = 60;
+
+app.post("/api/presence/ping", async (req, res) => {
+  const visitorId = String(req.body?.visitorId || "").slice(0, 128);
+  if (!visitorId) return res.status(400).json({ ok: false, error: "missingVisitorId" });
+
+  try {
+    await pool.query(
+      `INSERT INTO presence (visitor_id, last_seen)
+       VALUES ($1, now())
+       ON CONFLICT (visitor_id) DO UPDATE SET last_seen = EXCLUDED.last_seen`,
+      [visitorId]
+    );
+    await pool.query(
+      `INSERT INTO daily_visits (day, visitor_id)
+       VALUES ((now() AT TIME ZONE 'Asia/Dubai')::date, $1)
+       ON CONFLICT DO NOTHING`,
+      [visitorId]
+    );
+    res.json({ ok: true });
+  } catch (e) {
+    console.error("presence/ping error:", e);
+    res.status(500).json({ ok: false, error: "presence_ping_failed" });
+  }
+});
+
+app.post("/api/presence/bye", async (req, res) => {
+  const visitorId = String(req.body?.visitorId || "").slice(0, 128);
+  if (!visitorId) return res.json({ ok: true });
+  try {
+    await pool.query(`DELETE FROM presence WHERE visitor_id = $1`, [visitorId]);
+  } catch (e) {
+    console.error("presence/bye error:", e);
+  }
+  res.json({ ok: true });
+});
+
+app.get("/api/presence/stats", async (_req, res) => {
+  try {
+    const online = await pool.query(
+      `SELECT COUNT(*)::int AS c
+         FROM presence
+        WHERE last_seen > now() - ($1 || ' seconds')::interval`,
+      [String(PRESENCE_ONLINE_SECONDS)]
+    );
+    const today = await pool.query(
+      `SELECT COUNT(*)::int AS c
+         FROM daily_visits
+        WHERE day = (now() AT TIME ZONE 'Asia/Dubai')::date`
+    );
+    const total = await pool.query(`SELECT COUNT(*)::int AS c FROM daily_visits`);
+    res.json({
+      online:       online.rows[0]?.c || 0,
+      todayVisits:  today.rows[0]?.c  || 0,
+      totalVisits:  total.rows[0]?.c  || 0,
+    });
+  } catch (e) {
+    console.error("presence/stats error:", e);
+    res.status(500).json({ ok: false, error: "presence_stats_failed" });
+  }
 });
 
 /* --------- Boot --------- */
