@@ -1976,6 +1976,32 @@ app.post("/api/auth/verify-role", (req, res) => {
 });
 
 /* ============================================================
+   Reports summary — one query returns count + latest per type.
+   Used by the KPI dashboard so it doesn't have to fan out N fetches.
+============================================================ */
+app.get("/api/reports/summary", async (_req, res) => {
+  try {
+    const { rows } = await pool.query(`
+      SELECT
+        type,
+        COUNT(*)::int                                      AS count,
+        MAX(COALESCE(
+          NULLIF(payload->>'reportDate', ''),
+          to_char(created_at AT TIME ZONE 'Asia/Dubai', 'YYYY-MM-DD')
+        ))                                                 AS latest_date,
+        MAX(created_at)                                    AS last_created_at
+      FROM reports
+      GROUP BY type
+      ORDER BY count DESC
+    `);
+    res.json({ ok: true, data: rows });
+  } catch (e) {
+    console.error("reports/summary error:", e);
+    res.status(500).json({ ok: false, error: "summary_failed" });
+  }
+});
+
+/* ============================================================
    Presence / Visitor Analytics
    - POST /api/presence/ping  body:{ visitorId }  → { ok:true }
    - POST /api/presence/bye   body:{ visitorId }  → { ok:true }
