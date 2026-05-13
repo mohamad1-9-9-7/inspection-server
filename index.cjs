@@ -2070,6 +2070,102 @@ app.get("/api/presence/stats", async (_req, res) => {
   }
 });
 
+/* ============================================================
+   📨 Email (Nodemailer) — POST /api/email
+   Body: { to, cc?, bcc?, subject, text?, html?, attachments? }
+   attachments: [{ filename, content (base64), contentType }]
+============================================================ */
+const nodemailer = require("nodemailer");
+
+let __mailer = null;
+let __mailerError = null;
+function getMailer() {
+  if (__mailer) return __mailer;
+  const host = process.env.MAIL_HOST;
+  const port = parseInt(process.env.MAIL_PORT || "587", 10);
+  const user = process.env.MAIL_USER;
+  const pass = process.env.MAIL_PASS;
+  if (!host || !user || !pass) {
+    __mailerError = "MAIL_* env vars not configured (MAIL_HOST/MAIL_USER/MAIL_PASS)";
+    return null;
+  }
+  __mailer = nodemailer.createTransport({
+    host,
+    port,
+    secure: String(process.env.MAIL_SECURE || "false").toLowerCase() === "true",
+    auth: { user, pass },
+  });
+  __mailerError = null;
+  return __mailer;
+}
+
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+function normEmails(v) {
+  if (!v) return [];
+  const arr = Array.isArray(v) ? v : String(v).split(/[,;]+/);
+  return arr.map((s) => String(s).trim()).filter((s) => EMAIL_RE.test(s));
+}
+
+app.post("/api/email", async (req, res) => {
+  try {
+    const { to, cc, bcc, subject, text, html, attachments } = req.body || {};
+
+    const toList = normEmails(to);
+    const ccList = normEmails(cc);
+    const bccList = normEmails(bcc);
+
+    if (toList.length === 0) {
+      return res.status(400).json({ ok: false, error: "Missing or invalid 'to' field" });
+    }
+    if (!subject || typeof subject !== "string") {
+      return res.status(400).json({ ok: false, error: "Missing 'subject'" });
+    }
+    if (!text && !html) {
+      return res.status(400).json({ ok: false, error: "Missing 'text' or 'html' body" });
+    }
+
+    const mailer = getMailer();
+    if (!mailer) {
+      return res.status(503).json({ ok: false, error: __mailerError || "Mailer not configured" });
+    }
+
+    const fromName = process.env.MAIL_FROM_NAME || "Al Mawashi QA";
+    const fromAddr = process.env.MAIL_USER;
+
+    const attaches = Array.isArray(attachments)
+      ? attachments
+          .filter((a) => a && a.filename && a.content)
+          .map((a) => ({
+            filename: String(a.filename),
+            content: Buffer.from(String(a.content), "base64"),
+            contentType: a.contentType || "application/octet-stream",
+          }))
+      : [];
+
+    const info = await mailer.sendMail({
+      from: `"${fromName}" <${fromAddr}>`,
+      to: toList.join(", "),
+      cc: ccList.length ? ccList.join(", ") : undefined,
+      bcc: bccList.length ? bccList.join(", ") : undefined,
+      subject,
+      text: text || undefined,
+      html: html || undefined,
+      attachments: attaches.length ? attaches : undefined,
+    });
+
+    return res.json({ ok: true, messageId: info.messageId });
+  } catch (e) {
+    console.error("email send error:", e?.message || e);
+    return res.status(500).json({ ok: false, error: "email_send_failed" });
+  }
+});
+
+app.get("/health/mail", (_req, res) => {
+  const m = getMailer();
+  if (!m) return res.status(503).json({ ok: false, error: __mailerError });
+  res.json({ ok: true, host: process.env.MAIL_HOST, user: process.env.MAIL_USER });
+});
+
 /* --------- Boot --------- */
 ensureSchema()
   .then(() =>
