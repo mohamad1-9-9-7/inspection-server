@@ -2089,11 +2089,16 @@ function getMailer() {
     __mailerError = "MAIL_* env vars not configured (MAIL_HOST/MAIL_USER/MAIL_PASS)";
     return null;
   }
+  const rejectUnauth = String(process.env.MAIL_TLS_STRICT || "false").toLowerCase() === "true";
   __mailer = nodemailer.createTransport({
     host,
     port,
     secure: String(process.env.MAIL_SECURE || "false").toLowerCase() === "true",
     auth: { user, pass },
+    tls: { rejectUnauthorized: rejectUnauth, servername: host },
+    connectionTimeout: 15000,
+    greetingTimeout: 15000,
+    socketTimeout: 20000,
   });
   __mailerError = null;
   return __mailer;
@@ -2155,15 +2160,33 @@ app.post("/api/email", async (req, res) => {
 
     return res.json({ ok: true, messageId: info.messageId });
   } catch (e) {
-    console.error("email send error:", e?.message || e);
-    return res.status(500).json({ ok: false, error: "email_send_failed" });
+    console.error("email send error:", e);
+    const msg = String(e?.message || e || "unknown").slice(0, 500);
+    return res.status(500).json({
+      ok: false,
+      error: "email_send_failed",
+      detail: msg,
+      code: e?.code || null,
+      responseCode: e?.responseCode || null,
+    });
   }
 });
 
-app.get("/health/mail", (_req, res) => {
+app.get("/health/mail", async (_req, res) => {
   const m = getMailer();
   if (!m) return res.status(503).json({ ok: false, error: __mailerError });
-  res.json({ ok: true, host: process.env.MAIL_HOST, user: process.env.MAIL_USER });
+  try {
+    await m.verify();
+    res.json({ ok: true, verified: true, host: process.env.MAIL_HOST, user: process.env.MAIL_USER });
+  } catch (e) {
+    res.status(502).json({
+      ok: false,
+      verified: false,
+      host: process.env.MAIL_HOST,
+      detail: String(e?.message || e).slice(0, 500),
+      code: e?.code || null,
+    });
+  }
 });
 
 /* --------- Boot --------- */
