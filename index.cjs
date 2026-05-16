@@ -123,11 +123,29 @@ async function ensureSchema() {
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_reports_type ON reports(type);`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_reports_created_at ON reports(created_at);`);
 
+  // One report per (type, reportDate) — EXCEPT 'maintenance', which has many
+  // requests per day (each identified by its own requestNo). Migrate any old
+  // non-partial index to the partial form. Idempotent / safe to run every boot.
   await pool.query(`
     DO $$
+    DECLARE
+      def text;
     BEGIN
-      IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE schemaname='public' AND indexname='ux_reports_type_reportdate') THEN
-        EXECUTE 'CREATE UNIQUE INDEX ux_reports_type_reportdate ON reports (type, ((payload->>''reportDate'')))';
+      SELECT indexdef INTO def FROM pg_indexes
+        WHERE schemaname='public' AND indexname='ux_reports_type_reportdate';
+
+      IF def IS NOT NULL AND position('WHERE' IN upper(def)) = 0 THEN
+        -- existing index is the old GLOBAL one → drop so we can make it partial
+        EXECUTE 'DROP INDEX ux_reports_type_reportdate';
+      END IF;
+
+      IF NOT EXISTS (
+        SELECT 1 FROM pg_indexes
+         WHERE schemaname='public' AND indexname='ux_reports_type_reportdate'
+      ) THEN
+        EXECUTE 'CREATE UNIQUE INDEX ux_reports_type_reportdate '
+             || 'ON reports (type, ((payload->>''reportDate''))) '
+             || 'WHERE type <> ''maintenance''';
       END IF;
     END $$;
   `);
@@ -2067,125 +2085,6 @@ app.get("/api/presence/stats", async (_req, res) => {
   } catch (e) {
     console.error("presence/stats error:", e);
     res.status(500).json({ ok: false, error: "presence_stats_failed" });
-  }
-});
-
-/* ============================================================
-   📨 Email (Nodemailer) — POST /api/email
-   Body: { to, cc?, bcc?, subject, text?, html?, attachments? }
-   attachments: [{ filename, content (base64), contentType }]
-============================================================ */
-const nodemailer = require("nodemailer");
-
-let __mailer = null;
-let __mailerError = null;
-function getMailer() {
-  if (__mailer) return __mailer;
-  const host = process.env.MAIL_HOST;
-  const port = parseInt(process.env.MAIL_PORT || "587", 10);
-  const user = process.env.MAIL_USER;
-  const pass = process.env.MAIL_PASS;
-  if (!host || !user || !pass) {
-    __mailerError = "MAIL_* env vars not configured (MAIL_HOST/MAIL_USER/MAIL_PASS)";
-    return null;
-  }
-  const rejectUnauth = String(process.env.MAIL_TLS_STRICT || "false").toLowerCase() === "true";
-  __mailer = nodemailer.createTransport({
-    host,
-    port,
-    secure: String(process.env.MAIL_SECURE || "false").toLowerCase() === "true",
-    auth: { user, pass },
-    tls: { rejectUnauthorized: rejectUnauth, servername: host },
-    connectionTimeout: 15000,
-    greetingTimeout: 15000,
-    socketTimeout: 20000,
-  });
-  __mailerError = null;
-  return __mailer;
-}
-
-const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-function normEmails(v) {
-  if (!v) return [];
-  const arr = Array.isArray(v) ? v : String(v).split(/[,;]+/);
-  return arr.map((s) => String(s).trim()).filter((s) => EMAIL_RE.test(s));
-}
-
-app.post("/api/email", async (req, res) => {
-  try {
-    const { to, cc, bcc, subject, text, html, attachments } = req.body || {};
-
-    const toList = normEmails(to);
-    const ccList = normEmails(cc);
-    const bccList = normEmails(bcc);
-
-    if (toList.length === 0) {
-      return res.status(400).json({ ok: false, error: "Missing or invalid 'to' field" });
-    }
-    if (!subject || typeof subject !== "string") {
-      return res.status(400).json({ ok: false, error: "Missing 'subject'" });
-    }
-    if (!text && !html) {
-      return res.status(400).json({ ok: false, error: "Missing 'text' or 'html' body" });
-    }
-
-    const mailer = getMailer();
-    if (!mailer) {
-      return res.status(503).json({ ok: false, error: __mailerError || "Mailer not configured" });
-    }
-
-    const fromName = process.env.MAIL_FROM_NAME || "Al Mawashi QA";
-    const fromAddr = process.env.MAIL_USER;
-
-    const attaches = Array.isArray(attachments)
-      ? attachments
-          .filter((a) => a && a.filename && a.content)
-          .map((a) => ({
-            filename: String(a.filename),
-            content: Buffer.from(String(a.content), "base64"),
-            contentType: a.contentType || "application/octet-stream",
-          }))
-      : [];
-
-    const info = await mailer.sendMail({
-      from: `"${fromName}" <${fromAddr}>`,
-      to: toList.join(", "),
-      cc: ccList.length ? ccList.join(", ") : undefined,
-      bcc: bccList.length ? bccList.join(", ") : undefined,
-      subject,
-      text: text || undefined,
-      html: html || undefined,
-      attachments: attaches.length ? attaches : undefined,
-    });
-
-    return res.json({ ok: true, messageId: info.messageId });
-  } catch (e) {
-    console.error("email send error:", e);
-    const msg = String(e?.message || e || "unknown").slice(0, 500);
-    return res.status(500).json({
-      ok: false,
-      error: "email_send_failed",
-      detail: msg,
-      code: e?.code || null,
-      responseCode: e?.responseCode || null,
-    });
-  }
-});
-
-app.get("/health/mail", async (_req, res) => {
-  const m = getMailer();
-  if (!m) return res.status(503).json({ ok: false, error: __mailerError });
-  try {
-    await m.verify();
-    res.json({ ok: true, verified: true, host: process.env.MAIL_HOST, user: process.env.MAIL_USER });
-  } catch (e) {
-    res.status(502).json({
-      ok: false,
-      verified: false,
-      host: process.env.MAIL_HOST,
-      detail: String(e?.message || e).slice(0, 500),
-      code: e?.code || null,
-    });
   }
 });
 
