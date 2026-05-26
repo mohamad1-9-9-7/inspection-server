@@ -50,6 +50,14 @@ const pool = new Pool({
   connectionString: withSSL(process.env.DATABASE_URL),
   ssl: { rejectUnauthorized: false },
   keepAlive: true,
+  max: 5,
+  idleTimeoutMillis: 10000,      // أغلق الاتصالات الخاملة بعد 10 ثوانٍ
+  connectionTimeoutMillis: 5000, // لا تنتظر أكثر من 5 ثوانٍ للاتصال
+});
+
+// منع الكراش عند انقطاع اتصال Neon المفاجئ
+pool.on("error", (err) => {
+  console.error("⚠️ Pool connection error (auto-recovered):", err.message);
 });
 
 /* --------- Helpers --------- */
@@ -94,16 +102,51 @@ function normKey(s) {
   return String(s ?? "").trim().toLowerCase();
 }
 
-/* ─── Password helpers (crypto — no extra deps) ─── */
+/* ─── Password helpers — scrypt (built-in, bcrypt-class security) ─── */
+// New salts  : "scrypt:" + 64 hex chars  (N=16384 ~100ms per hash)
+// Legacy salts: raw 32-char hex           (HMAC-SHA256, auto-upgraded on next login)
+const SCRYPT_PFX    = "scrypt:";
+const SCRYPT_PARAMS = { N: 16384, r: 8, p: 1, maxmem: 32 * 1024 * 1024 };
+
 function genSalt() {
-  return crypto.randomBytes(16).toString("hex");
+  return SCRYPT_PFX + crypto.randomBytes(32).toString("hex");
 }
 function hashPw(password, salt) {
+  if (salt.startsWith(SCRYPT_PFX)) {
+    const rawSalt = Buffer.from(salt.slice(SCRYPT_PFX.length), "hex");
+    return crypto.scryptSync(String(password), rawSalt, 64, SCRYPT_PARAMS).toString("hex");
+  }
+  // Legacy HMAC-SHA256 — only used during migration verification
   return crypto.createHmac("sha256", salt).update(String(password)).digest("hex");
 }
 function verifyPw(password, salt, hash) {
   return hashPw(password, salt) === hash;
 }
+
+/* ─── Rate Limiting — login endpoint ─── */
+// Max 10 attempts per IP per 60 seconds; blocks brute-force attacks
+const _loginAttempts = new Map(); // ip → { count, resetAt }
+const RATE_MAX    = 10;
+const RATE_WIN_MS = 60_000;
+
+function rlCheck(ip) {
+  const now = Date.now();
+  let rec   = _loginAttempts.get(ip);
+  if (!rec || now > rec.resetAt) {
+    rec = { count: 0, resetAt: now + RATE_WIN_MS };
+    _loginAttempts.set(ip, rec);
+  }
+  rec.count++;
+  return rec.count <= RATE_MAX; // true = allowed
+}
+function rlReset(ip) { _loginAttempts.delete(ip); }
+
+// Clean stale entries every 5 min
+setInterval(() => {
+  const now = Date.now();
+  for (const [ip, rec] of _loginAttempts)
+    if (now > rec.resetAt) _loginAttempts.delete(ip);
+}, 5 * 60_000);
 
 /* --------- DB Schema --------- */
 async function ensureSchema() {
@@ -233,12 +276,18 @@ async function ensureSchema() {
       password_hash TEXT   NOT NULL,
       salt         TEXT    NOT NULL,
       permissions  JSONB   NOT NULL DEFAULT '[]'::jsonb,
+      crud_perms   JSONB   NOT NULL DEFAULT '{}'::jsonb,
+      employees    JSONB   NOT NULL DEFAULT '[]'::jsonb,
       is_active    BOOLEAN NOT NULL DEFAULT true,
       is_admin     BOOLEAN NOT NULL DEFAULT false,
       created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
       last_login   TIMESTAMPTZ
     );
   `);
+  /* migrate: add columns to existing tables if not present */
+  await pool.query(`ALTER TABLE app_users ADD COLUMN IF NOT EXISTS crud_perms        JSONB NOT NULL DEFAULT '{}'::jsonb`);
+  await pool.query(`ALTER TABLE app_users ADD COLUMN IF NOT EXISTS employees          JSONB NOT NULL DEFAULT '[]'::jsonb`);
+  await pool.query(`ALTER TABLE app_users ADD COLUMN IF NOT EXISTS allowed_branches   JSONB NOT NULL DEFAULT '[]'::jsonb`);
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS activity_log (
@@ -2152,14 +2201,25 @@ app.get("/api/presence/stats", async (_req, res) => {
 /* POST /api/auth/login  { username, password } */
 app.post("/api/auth/login", async (req, res) => {
   try {
+    const ip       = req.headers["x-forwarded-for"]?.split(",")[0]?.trim() || req.socket.remoteAddress || "unknown";
     const username = normText(req.body?.username);
     const password = normText(req.body?.password);
+
+    /* ── Rate limiting ── */
+    if (!rlCheck(ip)) {
+      return res.status(429).json({
+        ok: false,
+        error: "too_many_attempts",
+        message: "Too many login attempts. Please wait 1 minute.",
+      });
+    }
+
     if (!username || !password)
       return res.status(400).json({ ok: false, error: "username and password required" });
 
     const q = await pool.query(
       `SELECT id, username, display_name, password_hash, salt,
-              permissions, is_active, is_admin, last_login
+              permissions, crud_perms, employees, allowed_branches, is_active, is_admin, last_login
          FROM app_users WHERE username = $1 LIMIT 1`,
       [username]
     );
@@ -2174,11 +2234,21 @@ app.post("/api/auth/login", async (req, res) => {
     if (!verifyPw(password, user.salt, user.password_hash))
       return res.status(401).json({ ok: false, error: "invalid_credentials" });
 
+    /* ── On success: reset rate limit + auto-upgrade legacy HMAC hash → scrypt ── */
+    rlReset(ip);
+    if (!user.salt.startsWith(SCRYPT_PFX)) {
+      const newSalt = genSalt();
+      const newHash = hashPw(password, newSalt);
+      await pool.query(
+        `UPDATE app_users SET password_hash=$1, salt=$2 WHERE id=$3`,
+        [newHash, newSalt, user.id]
+      ).catch(() => {}); // non-fatal
+    }
+
     /* Update last_login */
     await pool.query(`UPDATE app_users SET last_login=now() WHERE id=$1`, [user.id]);
 
     /* Log activity */
-    const ip = req.headers["x-forwarded-for"]?.split(",")[0]?.trim() || req.socket.remoteAddress || "";
     await pool.query(
       `INSERT INTO activity_log (user_id, username, action, detail, ip_addr)
        VALUES ($1, $2, 'login', $3::jsonb, $4)`,
@@ -2188,12 +2258,15 @@ app.post("/api/auth/login", async (req, res) => {
     res.json({
       ok: true,
       user: {
-        id: user.id,
-        username: user.username,
-        displayName: user.display_name,
-        permissions: user.permissions,   // array of role IDs or ["*"]
-        isAdmin: user.is_admin,
-        lastLogin: user.last_login,
+        id:              user.id,
+        username:        user.username,
+        displayName:     user.display_name,
+        permissions:     user.permissions,        // array of role IDs or ["*"]
+        crudPerms:       user.crud_perms,         // { sectionId: ["view","write","edit","delete"] }
+        employees:       user.employees,          // ["Name1", "Name2", ...]
+        allowedBranches: user.allowed_branches || [], // [] = all, [...] = restricted
+        isAdmin:         user.is_admin,
+        lastLogin:       user.last_login,
       },
     });
   } catch (e) {
@@ -2231,8 +2304,8 @@ app.post("/api/auth/logout", async (req, res) => {
 app.get("/api/app-users", async (_req, res) => {
   try {
     const q = await pool.query(
-      `SELECT id, username, display_name, permissions, is_active, is_admin,
-              created_at, last_login
+      `SELECT id, username, display_name, permissions, crud_perms, employees, allowed_branches,
+              is_active, is_admin, created_at, last_login
          FROM app_users ORDER BY created_at ASC`
     );
     res.json({ ok: true, users: q.rows });
@@ -2242,14 +2315,17 @@ app.get("/api/app-users", async (_req, res) => {
   }
 });
 
-/* POST /api/app-users  { username, displayName, password, permissions, isAdmin } */
+/* POST /api/app-users  { username, displayName, password, permissions, crudPerms, employees, isAdmin } */
 app.post("/api/app-users", async (req, res) => {
   try {
-    const username    = normText(req.body?.username);
-    const displayName = normText(req.body?.displayName || req.body?.display_name || username);
-    const password    = normText(req.body?.password);
-    const permissions = Array.isArray(req.body?.permissions) ? req.body.permissions : [];
-    const isAdmin     = !!req.body?.isAdmin;
+    const username       = normText(req.body?.username);
+    const displayName    = normText(req.body?.displayName || req.body?.display_name || username);
+    const password       = normText(req.body?.password);
+    const permissions    = Array.isArray(req.body?.permissions) ? req.body.permissions : [];
+    const crudPerms      = (req.body?.crudPerms && typeof req.body.crudPerms === "object") ? req.body.crudPerms : {};
+    const employees      = Array.isArray(req.body?.employees) ? req.body.employees : [];
+    const allowedBranches = Array.isArray(req.body?.allowedBranches) ? req.body.allowedBranches : [];
+    const isAdmin        = !!req.body?.isAdmin;
 
     if (!username || !password)
       return res.status(400).json({ ok: false, error: "username and password required" });
@@ -2258,10 +2334,12 @@ app.post("/api/app-users", async (req, res) => {
     const hash = hashPw(password, salt);
 
     const q = await pool.query(
-      `INSERT INTO app_users (username, display_name, password_hash, salt, permissions, is_admin)
-       VALUES ($1,$2,$3,$4,$5::jsonb,$6)
-       RETURNING id, username, display_name, permissions, is_active, is_admin, created_at`,
-      [username, displayName, hash, salt, JSON.stringify(permissions), isAdmin]
+      `INSERT INTO app_users (username, display_name, password_hash, salt, permissions, crud_perms, employees, allowed_branches, is_admin)
+       VALUES ($1,$2,$3,$4,$5::jsonb,$6::jsonb,$7::jsonb,$8::jsonb,$9)
+       RETURNING id, username, display_name, permissions, crud_perms, employees, allowed_branches, is_active, is_admin, created_at`,
+      [username, displayName, hash, salt,
+       JSON.stringify(permissions), JSON.stringify(crudPerms), JSON.stringify(employees),
+       JSON.stringify(allowedBranches), isAdmin]
     );
 
     res.json({ ok: true, user: q.rows[0] });
@@ -2295,6 +2373,14 @@ app.put("/api/app-users/:id", async (req, res) => {
       sets.push(`permissions=$${idx++}::jsonb`);
       vals.push(JSON.stringify(Array.isArray(req.body.permissions) ? req.body.permissions : []));
     }
+    if (req.body?.crudPerms !== undefined) {
+      sets.push(`crud_perms=$${idx++}::jsonb`);
+      vals.push(JSON.stringify(typeof req.body.crudPerms === "object" ? req.body.crudPerms : {}));
+    }
+    if (req.body?.employees !== undefined) {
+      sets.push(`employees=$${idx++}::jsonb`);
+      vals.push(JSON.stringify(Array.isArray(req.body.employees) ? req.body.employees : []));
+    }
     if (req.body?.isAdmin !== undefined) {
       sets.push(`is_admin=$${idx++}`);
       vals.push(!!req.body.isAdmin);
@@ -2303,6 +2389,10 @@ app.put("/api/app-users/:id", async (req, res) => {
       sets.push(`is_active=$${idx++}`);
       vals.push(!!req.body.isActive);
     }
+    if (req.body?.allowedBranches !== undefined) {
+      sets.push(`allowed_branches=$${idx++}::jsonb`);
+      vals.push(JSON.stringify(Array.isArray(req.body.allowedBranches) ? req.body.allowedBranches : []));
+    }
 
     if (!sets.length)
       return res.status(400).json({ ok: false, error: "nothing to update" });
@@ -2310,7 +2400,7 @@ app.put("/api/app-users/:id", async (req, res) => {
     vals.push(id);
     const q = await pool.query(
       `UPDATE app_users SET ${sets.join(",")} WHERE id=$${idx}
-       RETURNING id, username, display_name, permissions, is_active, is_admin, created_at, last_login`,
+       RETURNING id, username, display_name, permissions, crud_perms, employees, allowed_branches, is_active, is_admin, created_at, last_login`,
       vals
     );
     if (!q.rowCount)
