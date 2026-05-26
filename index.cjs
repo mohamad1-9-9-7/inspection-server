@@ -3,6 +3,7 @@ require("dotenv").config();
 
 const express = require("express");
 const cors = require("cors");
+const crypto = require("crypto");
 const pg = require("pg");
 const multer = require("multer");
 const cloudinary = require("cloudinary").v2;
@@ -91,6 +92,17 @@ function safeObj(x) {
 
 function normKey(s) {
   return String(s ?? "").trim().toLowerCase();
+}
+
+/* ─── Password helpers (crypto — no extra deps) ─── */
+function genSalt() {
+  return crypto.randomBytes(16).toString("hex");
+}
+function hashPw(password, salt) {
+  return crypto.createHmac("sha256", salt).update(String(password)).digest("hex");
+}
+function verifyPw(password, salt, hash) {
+  return hashPw(password, salt) === hash;
 }
 
 /* --------- DB Schema --------- */
@@ -211,6 +223,50 @@ async function ensureSchema() {
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_supplier_links_report_id ON supplier_links(report_id);`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_supplier_links_used_at ON supplier_links(used_at);`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_supplier_links_expires_at ON supplier_links(expires_at);`);
+
+  /* ── App Users & Activity Log ── */
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS app_users (
+      id           UUID    PRIMARY KEY DEFAULT gen_random_uuid(),
+      username     TEXT    NOT NULL UNIQUE,
+      display_name TEXT    NOT NULL DEFAULT '',
+      password_hash TEXT   NOT NULL,
+      salt         TEXT    NOT NULL,
+      permissions  JSONB   NOT NULL DEFAULT '[]'::jsonb,
+      is_active    BOOLEAN NOT NULL DEFAULT true,
+      is_admin     BOOLEAN NOT NULL DEFAULT false,
+      created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+      last_login   TIMESTAMPTZ
+    );
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS activity_log (
+      id        BIGSERIAL PRIMARY KEY,
+      user_id   UUID,
+      username  TEXT NOT NULL,
+      action    TEXT NOT NULL,
+      detail    JSONB NOT NULL DEFAULT '{}'::jsonb,
+      ip_addr   TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+  `);
+
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_activity_log_username ON activity_log(username);`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_activity_log_created_at ON activity_log(created_at);`);
+
+  /* ── Seed default admin if table is empty ── */
+  const existsAdmin = await pool.query(`SELECT 1 FROM app_users WHERE username='admin' LIMIT 1`);
+  if (!existsAdmin.rowCount) {
+    const salt = genSalt();
+    const hash = hashPw("Admin@2025", salt);
+    await pool.query(
+      `INSERT INTO app_users (username, display_name, password_hash, salt, permissions, is_admin)
+       VALUES ('admin', 'Administrator', $1, $2, '["*"]'::jsonb, true)`,
+      [hash, salt]
+    );
+    console.log("✅ Default admin created (admin / Admin@2025)");
+  }
 
   /* ── Presence / visitor analytics ── */
   await pool.query(`
@@ -2085,6 +2141,226 @@ app.get("/api/presence/stats", async (_req, res) => {
   } catch (e) {
     console.error("presence/stats error:", e);
     res.status(500).json({ ok: false, error: "presence_stats_failed" });
+  }
+});
+
+/* ============================================================
+   AUTH — Named Account Login / Logout
+============================================================ */
+
+/* POST /api/auth/login  { username, password } */
+app.post("/api/auth/login", async (req, res) => {
+  try {
+    const username = normText(req.body?.username);
+    const password = normText(req.body?.password);
+    if (!username || !password)
+      return res.status(400).json({ ok: false, error: "username and password required" });
+
+    const q = await pool.query(
+      `SELECT id, username, display_name, password_hash, salt,
+              permissions, is_active, is_admin, last_login
+         FROM app_users WHERE username = $1 LIMIT 1`,
+      [username]
+    );
+    if (!q.rowCount)
+      return res.status(401).json({ ok: false, error: "invalid_credentials" });
+
+    const user = q.rows[0];
+
+    if (!user.is_active)
+      return res.status(403).json({ ok: false, error: "account_disabled" });
+
+    if (!verifyPw(password, user.salt, user.password_hash))
+      return res.status(401).json({ ok: false, error: "invalid_credentials" });
+
+    /* Update last_login */
+    await pool.query(`UPDATE app_users SET last_login=now() WHERE id=$1`, [user.id]);
+
+    /* Log activity */
+    const ip = req.headers["x-forwarded-for"]?.split(",")[0]?.trim() || req.socket.remoteAddress || "";
+    await pool.query(
+      `INSERT INTO activity_log (user_id, username, action, detail, ip_addr)
+       VALUES ($1, $2, 'login', $3::jsonb, $4)`,
+      [user.id, user.username, JSON.stringify({ displayName: user.display_name }), ip]
+    );
+
+    res.json({
+      ok: true,
+      user: {
+        id: user.id,
+        username: user.username,
+        displayName: user.display_name,
+        permissions: user.permissions,   // array of role IDs or ["*"]
+        isAdmin: user.is_admin,
+        lastLogin: user.last_login,
+      },
+    });
+  } catch (e) {
+    console.error("POST /api/auth/login ERROR:", e);
+    res.status(500).json({ ok: false, error: "server_error" });
+  }
+});
+
+/* POST /api/auth/logout  { username } */
+app.post("/api/auth/logout", async (req, res) => {
+  try {
+    const username = normText(req.body?.username);
+    if (username) {
+      const u = await pool.query(`SELECT id FROM app_users WHERE username=$1 LIMIT 1`, [username]);
+      const uid = u.rows[0]?.id || null;
+      const ip = req.headers["x-forwarded-for"]?.split(",")[0]?.trim() || req.socket.remoteAddress || "";
+      await pool.query(
+        `INSERT INTO activity_log (user_id, username, action, ip_addr)
+         VALUES ($1, $2, 'logout', $3)`,
+        [uid, username, ip]
+      );
+    }
+    res.json({ ok: true });
+  } catch (e) {
+    console.error("POST /api/auth/logout ERROR:", e);
+    res.json({ ok: true }); // always succeed
+  }
+});
+
+/* ============================================================
+   APP USERS — CRUD (admin only — validated client-side via isAdmin flag)
+============================================================ */
+
+/* GET /api/app-users */
+app.get("/api/app-users", async (_req, res) => {
+  try {
+    const q = await pool.query(
+      `SELECT id, username, display_name, permissions, is_active, is_admin,
+              created_at, last_login
+         FROM app_users ORDER BY created_at ASC`
+    );
+    res.json({ ok: true, users: q.rows });
+  } catch (e) {
+    console.error("GET /api/app-users ERROR:", e);
+    res.status(500).json({ ok: false, error: "server_error" });
+  }
+});
+
+/* POST /api/app-users  { username, displayName, password, permissions, isAdmin } */
+app.post("/api/app-users", async (req, res) => {
+  try {
+    const username    = normText(req.body?.username);
+    const displayName = normText(req.body?.displayName || req.body?.display_name || username);
+    const password    = normText(req.body?.password);
+    const permissions = Array.isArray(req.body?.permissions) ? req.body.permissions : [];
+    const isAdmin     = !!req.body?.isAdmin;
+
+    if (!username || !password)
+      return res.status(400).json({ ok: false, error: "username and password required" });
+
+    const salt = genSalt();
+    const hash = hashPw(password, salt);
+
+    const q = await pool.query(
+      `INSERT INTO app_users (username, display_name, password_hash, salt, permissions, is_admin)
+       VALUES ($1,$2,$3,$4,$5::jsonb,$6)
+       RETURNING id, username, display_name, permissions, is_active, is_admin, created_at`,
+      [username, displayName, hash, salt, JSON.stringify(permissions), isAdmin]
+    );
+
+    res.json({ ok: true, user: q.rows[0] });
+  } catch (e) {
+    if (e.code === "23505")
+      return res.status(409).json({ ok: false, error: "username_taken" });
+    console.error("POST /api/app-users ERROR:", e);
+    res.status(500).json({ ok: false, error: "server_error" });
+  }
+});
+
+/* PUT /api/app-users/:id  { displayName?, password?, permissions?, isAdmin?, isActive? } */
+app.put("/api/app-users/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const sets = [];
+    const vals = [];
+    let idx = 1;
+
+    if (req.body?.displayName !== undefined) {
+      sets.push(`display_name=$${idx++}`);
+      vals.push(normText(req.body.displayName));
+    }
+    if (req.body?.password) {
+      const salt = genSalt();
+      const hash = hashPw(normText(req.body.password), salt);
+      sets.push(`password_hash=$${idx++}`, `salt=$${idx++}`);
+      vals.push(hash, salt);
+    }
+    if (req.body?.permissions !== undefined) {
+      sets.push(`permissions=$${idx++}::jsonb`);
+      vals.push(JSON.stringify(Array.isArray(req.body.permissions) ? req.body.permissions : []));
+    }
+    if (req.body?.isAdmin !== undefined) {
+      sets.push(`is_admin=$${idx++}`);
+      vals.push(!!req.body.isAdmin);
+    }
+    if (req.body?.isActive !== undefined) {
+      sets.push(`is_active=$${idx++}`);
+      vals.push(!!req.body.isActive);
+    }
+
+    if (!sets.length)
+      return res.status(400).json({ ok: false, error: "nothing to update" });
+
+    vals.push(id);
+    const q = await pool.query(
+      `UPDATE app_users SET ${sets.join(",")} WHERE id=$${idx}
+       RETURNING id, username, display_name, permissions, is_active, is_admin, created_at, last_login`,
+      vals
+    );
+    if (!q.rowCount)
+      return res.status(404).json({ ok: false, error: "user_not_found" });
+
+    res.json({ ok: true, user: q.rows[0] });
+  } catch (e) {
+    console.error("PUT /api/app-users/:id ERROR:", e);
+    res.status(500).json({ ok: false, error: "server_error" });
+  }
+});
+
+/* DELETE /api/app-users/:id */
+app.delete("/api/app-users/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const q = await pool.query(`DELETE FROM app_users WHERE id=$1 RETURNING username`, [id]);
+    if (!q.rowCount)
+      return res.status(404).json({ ok: false, error: "user_not_found" });
+    res.json({ ok: true, deleted: q.rows[0].username });
+  } catch (e) {
+    console.error("DELETE /api/app-users/:id ERROR:", e);
+    res.status(500).json({ ok: false, error: "server_error" });
+  }
+});
+
+/* GET /api/activity-log?limit=50&username=xxx */
+app.get("/api/activity-log", async (req, res) => {
+  try {
+    const limit = clampInt(req.query?.limit, 100, 1, 500);
+    const usernameFilter = normText(req.query?.username || "");
+
+    let q;
+    if (usernameFilter) {
+      q = await pool.query(
+        `SELECT id, user_id, username, action, detail, ip_addr, created_at
+           FROM activity_log WHERE username=$1
+           ORDER BY created_at DESC LIMIT $2`,
+        [usernameFilter, limit]
+      );
+    } else {
+      q = await pool.query(
+        `SELECT id, user_id, username, action, detail, ip_addr, created_at
+           FROM activity_log ORDER BY created_at DESC LIMIT $1`,
+        [limit]
+      );
+    }
+    res.json({ ok: true, logs: q.rows });
+  } catch (e) {
+    console.error("GET /api/activity-log ERROR:", e);
+    res.status(500).json({ ok: false, error: "server_error" });
   }
 });
 
