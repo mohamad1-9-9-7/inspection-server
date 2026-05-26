@@ -2324,7 +2324,9 @@ app.post("/api/app-users", async (req, res) => {
     const permissions    = Array.isArray(req.body?.permissions) ? req.body.permissions : [];
     const crudPerms      = (req.body?.crudPerms && typeof req.body.crudPerms === "object") ? req.body.crudPerms : {};
     const employees      = Array.isArray(req.body?.employees) ? req.body.employees : [];
-    const allowedBranches = Array.isArray(req.body?.allowedBranches) ? req.body.allowedBranches : [];
+    /* Accept either array (legacy) OR object { sectionId: [items...] } (new per-section format) */
+    const _ab = req.body?.allowedBranches;
+    const allowedBranches = (_ab && typeof _ab === "object") ? _ab : [];
     const isAdmin        = !!req.body?.isAdmin;
 
     if (!username || !password)
@@ -2390,8 +2392,10 @@ app.put("/api/app-users/:id", async (req, res) => {
       vals.push(!!req.body.isActive);
     }
     if (req.body?.allowedBranches !== undefined) {
+      /* Accept either array (legacy) OR object { sectionId: [items...] } */
+      const _ab = req.body.allowedBranches;
       sets.push(`allowed_branches=$${idx++}::jsonb`);
-      vals.push(JSON.stringify(Array.isArray(req.body.allowedBranches) ? req.body.allowedBranches : []));
+      vals.push(JSON.stringify((_ab && typeof _ab === "object") ? _ab : []));
     }
 
     if (!sets.length)
