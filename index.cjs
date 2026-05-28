@@ -329,6 +329,54 @@ async function ensureSchema() {
     WHERE NOT EXISTS (SELECT 1 FROM subscription LIMIT 1)
   `);
 
+  /* ── Plans table ── */
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS plans (
+      id            SERIAL PRIMARY KEY,
+      name          TEXT           NOT NULL UNIQUE,
+      price         NUMERIC(10,2)  NOT NULL DEFAULT 0,
+      currency      VARCHAR(10)    NOT NULL DEFAULT 'USD',
+      max_branches  INT            NOT NULL DEFAULT -1,
+      max_users     INT            NOT NULL DEFAULT -1,
+      description   TEXT           NOT NULL DEFAULT '',
+      is_active     BOOLEAN        NOT NULL DEFAULT true,
+      created_at    TIMESTAMPTZ    NOT NULL DEFAULT now(),
+      updated_at    TIMESTAMPTZ    NOT NULL DEFAULT now()
+    );
+  `);
+  /* Seed default plans */
+  await pool.query(`
+    INSERT INTO plans (name, price, currency, max_branches, max_users, description) VALUES
+      ('Starter',    49,  'USD',  5,  3,  'Small operations up to 5 branches'),
+      ('Growth',     99,  'USD', 15, 10,  'Growing businesses up to 15 branches'),
+      ('Enterprise', 199, 'USD', -1, -1,  'Unlimited branches and users')
+    ON CONFLICT (name) DO NOTHING
+  `);
+
+  /* ── Companies table ── */
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS companies (
+      id            SERIAL PRIMARY KEY,
+      name          TEXT           NOT NULL,
+      contact_name  TEXT           NOT NULL DEFAULT '',
+      contact_email TEXT           NOT NULL DEFAULT '',
+      contact_phone TEXT           NOT NULL DEFAULT '',
+      plan_id       INT            REFERENCES plans(id) ON DELETE SET NULL,
+      status        VARCHAR(20)    NOT NULL DEFAULT 'active',
+      start_date    DATE,
+      end_date      DATE,
+      notes         TEXT           NOT NULL DEFAULT '',
+      created_at    TIMESTAMPTZ    NOT NULL DEFAULT now(),
+      updated_at    TIMESTAMPTZ    NOT NULL DEFAULT now()
+    );
+  `);
+  /* Seed current company if empty */
+  await pool.query(`
+    INSERT INTO companies (name, status, start_date, end_date, notes)
+    SELECT 'Al Mawashi', 'active', '2026-01-01', '2027-01-01', 'Primary client'
+    WHERE NOT EXISTS (SELECT 1 FROM companies LIMIT 1)
+  `);
+
   /* ── Seed default admin if table is empty ── */
   const existsAdmin = await pool.query(`SELECT 1 FROM app_users WHERE username='admin' LIMIT 1`);
   if (!existsAdmin.rowCount) {
@@ -2536,6 +2584,130 @@ app.get("/api/security/failed-logins", async (req, res) => {
     });
   } catch (e) {
     console.error("GET /api/security/failed-logins ERROR:", e);
+    res.status(500).json({ ok: false, error: "server_error" });
+  }
+});
+
+/* ============================================================
+   PLANS — CRUD
+============================================================ */
+
+app.get("/api/plans", async (req, res) => {
+  try {
+    const q = await pool.query(`SELECT * FROM plans ORDER BY price ASC`);
+    res.json({ ok: true, plans: q.rows });
+  } catch (e) {
+    console.error("GET /api/plans ERROR:", e);
+    res.status(500).json({ ok: false, error: "server_error" });
+  }
+});
+
+app.post("/api/plans", async (req, res) => {
+  try {
+    const { name, price, currency, max_branches, max_users, description } = req.body;
+    if (!name) return res.status(400).json({ ok: false, error: "name required" });
+    const q = await pool.query(
+      `INSERT INTO plans (name, price, currency, max_branches, max_users, description)
+       VALUES ($1,$2,$3,$4,$5,$6) RETURNING *`,
+      [name, price || 0, currency || "USD", max_branches ?? -1, max_users ?? -1, description || ""]
+    );
+    res.json({ ok: true, plan: q.rows[0] });
+  } catch (e) {
+    if (e.code === "23505") return res.status(409).json({ ok: false, error: "name_taken" });
+    console.error("POST /api/plans ERROR:", e);
+    res.status(500).json({ ok: false, error: "server_error" });
+  }
+});
+
+app.put("/api/plans/:id", async (req, res) => {
+  try {
+    const { name, price, currency, max_branches, max_users, description, is_active } = req.body;
+    const q = await pool.query(
+      `UPDATE plans SET name=$1, price=$2, currency=$3, max_branches=$4, max_users=$5,
+         description=$6, is_active=$7, updated_at=now()
+       WHERE id=$8 RETURNING *`,
+      [name, price, currency || "USD", max_branches ?? -1, max_users ?? -1,
+       description || "", is_active !== false, req.params.id]
+    );
+    if (!q.rowCount) return res.status(404).json({ ok: false, error: "not_found" });
+    res.json({ ok: true, plan: q.rows[0] });
+  } catch (e) {
+    console.error("PUT /api/plans/:id ERROR:", e);
+    res.status(500).json({ ok: false, error: "server_error" });
+  }
+});
+
+app.delete("/api/plans/:id", async (req, res) => {
+  try {
+    await pool.query(`UPDATE companies SET plan_id=NULL WHERE plan_id=$1`, [req.params.id]);
+    await pool.query(`DELETE FROM plans WHERE id=$1`, [req.params.id]);
+    res.json({ ok: true });
+  } catch (e) {
+    console.error("DELETE /api/plans/:id ERROR:", e);
+    res.status(500).json({ ok: false, error: "server_error" });
+  }
+});
+
+/* ============================================================
+   COMPANIES — CRUD
+============================================================ */
+
+app.get("/api/companies", async (req, res) => {
+  try {
+    const q = await pool.query(`
+      SELECT c.*, p.name AS plan_name, p.price AS plan_price, p.currency AS plan_currency
+      FROM companies c
+      LEFT JOIN plans p ON p.id = c.plan_id
+      ORDER BY c.created_at ASC
+    `);
+    res.json({ ok: true, companies: q.rows });
+  } catch (e) {
+    console.error("GET /api/companies ERROR:", e);
+    res.status(500).json({ ok: false, error: "server_error" });
+  }
+});
+
+app.post("/api/companies", async (req, res) => {
+  try {
+    const { name, contact_name, contact_email, contact_phone, plan_id, status, start_date, end_date, notes } = req.body;
+    if (!name) return res.status(400).json({ ok: false, error: "name required" });
+    const q = await pool.query(
+      `INSERT INTO companies (name, contact_name, contact_email, contact_phone, plan_id, status, start_date, end_date, notes)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *`,
+      [name, contact_name||"", contact_email||"", contact_phone||"",
+       plan_id||null, status||"active", start_date||null, end_date||null, notes||""]
+    );
+    res.json({ ok: true, company: q.rows[0] });
+  } catch (e) {
+    console.error("POST /api/companies ERROR:", e);
+    res.status(500).json({ ok: false, error: "server_error" });
+  }
+});
+
+app.put("/api/companies/:id", async (req, res) => {
+  try {
+    const { name, contact_name, contact_email, contact_phone, plan_id, status, start_date, end_date, notes } = req.body;
+    const q = await pool.query(
+      `UPDATE companies SET name=$1, contact_name=$2, contact_email=$3, contact_phone=$4,
+         plan_id=$5, status=$6, start_date=$7, end_date=$8, notes=$9, updated_at=now()
+       WHERE id=$10 RETURNING *`,
+      [name, contact_name||"", contact_email||"", contact_phone||"",
+       plan_id||null, status||"active", start_date||null, end_date||null, notes||"", req.params.id]
+    );
+    if (!q.rowCount) return res.status(404).json({ ok: false, error: "not_found" });
+    res.json({ ok: true, company: q.rows[0] });
+  } catch (e) {
+    console.error("PUT /api/companies/:id ERROR:", e);
+    res.status(500).json({ ok: false, error: "server_error" });
+  }
+});
+
+app.delete("/api/companies/:id", async (req, res) => {
+  try {
+    await pool.query(`DELETE FROM companies WHERE id=$1`, [req.params.id]);
+    res.json({ ok: true });
+  } catch (e) {
+    console.error("DELETE /api/companies/:id ERROR:", e);
     res.status(500).json({ ok: false, error: "server_error" });
   }
 });
