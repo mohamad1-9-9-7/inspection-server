@@ -304,18 +304,45 @@ async function ensureSchema() {
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_activity_log_username ON activity_log(username);`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_activity_log_created_at ON activity_log(created_at);`);
 
+  /* ── is_super_admin column ── */
+  await pool.query(`ALTER TABLE app_users ADD COLUMN IF NOT EXISTS is_super_admin BOOLEAN NOT NULL DEFAULT false`);
+
+  /* ── Subscription table ── */
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS subscription (
+      id          SERIAL PRIMARY KEY,
+      plan        VARCHAR(50)    NOT NULL DEFAULT 'enterprise',
+      status      VARCHAR(20)    NOT NULL DEFAULT 'active',
+      start_date  DATE           NOT NULL DEFAULT CURRENT_DATE,
+      end_date    DATE           NOT NULL DEFAULT (CURRENT_DATE + INTERVAL '365 days'),
+      price       NUMERIC(10,2),
+      currency    VARCHAR(10)    NOT NULL DEFAULT 'USD',
+      notes       TEXT           NOT NULL DEFAULT '',
+      updated_by  TEXT           NOT NULL DEFAULT 'system',
+      updated_at  TIMESTAMPTZ    NOT NULL DEFAULT now()
+    );
+  `);
+  /* Seed default subscription if empty */
+  await pool.query(`
+    INSERT INTO subscription (plan, status, start_date, end_date, notes, updated_by)
+    SELECT 'enterprise', 'active', '2026-01-01', '2027-01-01', 'Initial subscription', 'system'
+    WHERE NOT EXISTS (SELECT 1 FROM subscription LIMIT 1)
+  `);
+
   /* ── Seed default admin if table is empty ── */
   const existsAdmin = await pool.query(`SELECT 1 FROM app_users WHERE username='admin' LIMIT 1`);
   if (!existsAdmin.rowCount) {
     const salt = genSalt();
     const hash = hashPw("Admin@2025", salt);
     await pool.query(
-      `INSERT INTO app_users (username, display_name, password_hash, salt, permissions, is_admin)
-       VALUES ('admin', 'Administrator', $1, $2, '["*"]'::jsonb, true)`,
+      `INSERT INTO app_users (username, display_name, password_hash, salt, permissions, is_admin, is_super_admin)
+       VALUES ('admin', 'Administrator', $1, $2, '["*"]'::jsonb, true, true)`,
       [hash, salt]
     );
     console.log("✅ Default admin created (admin / Admin@2025)");
   }
+  /* Promote existing admin to super admin if not yet */
+  await pool.query(`UPDATE app_users SET is_super_admin=true WHERE username='admin' AND is_super_admin=false`);
 
   /* ── Presence / visitor analytics ── */
   await pool.query(`
@@ -2219,20 +2246,37 @@ app.post("/api/auth/login", async (req, res) => {
 
     const q = await pool.query(
       `SELECT id, username, display_name, password_hash, salt,
-              permissions, crud_perms, employees, allowed_branches, is_active, is_admin, last_login
+              permissions, crud_perms, employees, allowed_branches, is_active, is_admin, is_super_admin, last_login
          FROM app_users WHERE username = $1 LIMIT 1`,
       [username]
     );
-    if (!q.rowCount)
+    /* Helper: log a failed login attempt for the security monitor */
+    const logFailed = async (reason) => {
+      try {
+        await pool.query(
+          `INSERT INTO activity_log (user_id, username, action, detail, ip_addr)
+           VALUES ($1, $2, 'login_failed', $3::jsonb, $4)`,
+          [null, username, JSON.stringify({ reason }), ip]
+        );
+      } catch { /* don't break login on logging error */ }
+    };
+
+    if (!q.rowCount) {
+      await logFailed("unknown_user");
       return res.status(401).json({ ok: false, error: "invalid_credentials" });
+    }
 
     const user = q.rows[0];
 
-    if (!user.is_active)
+    if (!user.is_active) {
+      await logFailed("account_disabled");
       return res.status(403).json({ ok: false, error: "account_disabled" });
+    }
 
-    if (!verifyPw(password, user.salt, user.password_hash))
+    if (!verifyPw(password, user.salt, user.password_hash)) {
+      await logFailed("wrong_password");
       return res.status(401).json({ ok: false, error: "invalid_credentials" });
+    }
 
     /* ── On success: reset rate limit + auto-upgrade legacy HMAC hash → scrypt ── */
     rlReset(ip);
@@ -2266,6 +2310,7 @@ app.post("/api/auth/login", async (req, res) => {
         employees:       user.employees,          // ["Name1", "Name2", ...]
         allowedBranches: user.allowed_branches || [], // [] = all, [...] = restricted
         isAdmin:         user.is_admin,
+        isSuperAdmin:    user.is_super_admin,
         lastLogin:       user.last_login,
       },
     });
@@ -2455,6 +2500,83 @@ app.get("/api/activity-log", async (req, res) => {
     res.json({ ok: true, logs: q.rows });
   } catch (e) {
     console.error("GET /api/activity-log ERROR:", e);
+    res.status(500).json({ ok: false, error: "server_error" });
+  }
+});
+
+/* ─── Failed Logins Monitor — security audit ─── */
+/* Returns the last N failed login attempts + per-IP aggregation for the past hour. */
+app.get("/api/security/failed-logins", async (req, res) => {
+  try {
+    const limit = clampInt(req.query?.limit, 50, 1, 200);
+    const recent = await pool.query(
+      `SELECT id, username, detail, ip_addr, created_at
+         FROM activity_log
+        WHERE action='login_failed'
+        ORDER BY created_at DESC
+        LIMIT $1`,
+      [limit]
+    );
+    /* Aggregate per IP over the last hour to detect brute force */
+    const byIp = await pool.query(
+      `SELECT ip_addr, COUNT(*)::int AS attempts,
+              MAX(created_at) AS last_at,
+              ARRAY_AGG(DISTINCT username ORDER BY username) FILTER (WHERE username IS NOT NULL) AS usernames
+         FROM activity_log
+        WHERE action='login_failed' AND created_at > now() - INTERVAL '1 hour'
+        GROUP BY ip_addr
+        HAVING COUNT(*) >= 1
+        ORDER BY attempts DESC
+        LIMIT 50`
+    );
+    res.json({
+      ok: true,
+      recent: recent.rows,
+      byIpLastHour: byIp.rows,
+    });
+  } catch (e) {
+    console.error("GET /api/security/failed-logins ERROR:", e);
+    res.status(500).json({ ok: false, error: "server_error" });
+  }
+});
+
+/* ============================================================
+   SUBSCRIPTION — Get / Update
+============================================================ */
+
+/* GET /api/subscription */
+app.get("/api/subscription", async (req, res) => {
+  try {
+    const q = await pool.query(`SELECT * FROM subscription ORDER BY id DESC LIMIT 1`);
+    res.json({ ok: true, subscription: q.rows[0] || null });
+  } catch (e) {
+    console.error("GET /api/subscription ERROR:", e);
+    res.status(500).json({ ok: false, error: "server_error" });
+  }
+});
+
+/* PUT /api/subscription  { plan, status, start_date, end_date, price, currency, notes, updated_by } */
+app.put("/api/subscription", async (req, res) => {
+  try {
+    const { plan, status, start_date, end_date, price, currency, notes, updated_by } = req.body;
+    /* Ensure a row exists */
+    await pool.query(`
+      INSERT INTO subscription (plan, status, start_date, end_date, notes, updated_by)
+      SELECT 'enterprise','active', CURRENT_DATE, CURRENT_DATE + 365, '', 'system'
+      WHERE NOT EXISTS (SELECT 1 FROM subscription LIMIT 1)
+    `);
+    const q = await pool.query(
+      `UPDATE subscription SET
+         plan=$1, status=$2, start_date=$3, end_date=$4,
+         price=$5, currency=$6, notes=$7, updated_by=$8, updated_at=now()
+       WHERE id=(SELECT id FROM subscription ORDER BY id DESC LIMIT 1)
+       RETURNING *`,
+      [plan || "enterprise", status || "active", start_date, end_date,
+       price || null, currency || "USD", notes || "", updated_by || "admin"]
+    );
+    res.json({ ok: true, subscription: q.rows[0] });
+  } catch (e) {
+    console.error("PUT /api/subscription ERROR:", e);
     res.status(500).json({ ok: false, error: "server_error" });
   }
 });
