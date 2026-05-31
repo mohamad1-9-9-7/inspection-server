@@ -377,6 +377,23 @@ async function ensureSchema() {
     WHERE NOT EXISTS (SELECT 1 FROM companies LIMIT 1)
   `);
 
+  /* ── Multi-tenant: link app_users → companies ──
+     Added AFTER companies table+seed exist so the FK resolves.
+     company_id NULL = platform-level account (super-admin: sees all companies). */
+  await pool.query(`
+    ALTER TABLE app_users
+      ADD COLUMN IF NOT EXISTS company_id INT REFERENCES companies(id) ON DELETE SET NULL
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_app_users_company_id ON app_users(company_id)`);
+  /* Backfill: existing non-super-admin users with no company → primary (oldest) company.
+     Super-admins stay NULL = platform owner. */
+  await pool.query(`
+    UPDATE app_users
+       SET company_id = (SELECT id FROM companies ORDER BY id ASC LIMIT 1)
+     WHERE company_id IS NULL
+       AND is_super_admin = false
+  `);
+
   /* ── Seed default admin if table is empty ── */
   const existsAdmin = await pool.query(`SELECT 1 FROM app_users WHERE username='admin' LIMIT 1`);
   if (!existsAdmin.rowCount) {
@@ -2294,7 +2311,8 @@ app.post("/api/auth/login", async (req, res) => {
 
     const q = await pool.query(
       `SELECT id, username, display_name, password_hash, salt,
-              permissions, crud_perms, employees, allowed_branches, is_active, is_admin, is_super_admin, last_login
+              permissions, crud_perms, employees, allowed_branches, is_active, is_admin, is_super_admin, last_login,
+              company_id
          FROM app_users WHERE username = $1 LIMIT 1`,
       [username]
     );
@@ -2337,6 +2355,37 @@ app.post("/api/auth/login", async (req, res) => {
       ).catch(() => {}); // non-fatal
     }
 
+    /* ── Multi-tenant: resolve the user's company (NULL = platform/super-admin) ── */
+    let company = null;
+    if (user.company_id) {
+      const cq = await pool.query(
+        `SELECT c.id, c.name, c.status, c.start_date, c.end_date,
+                p.name AS plan_name, p.max_branches, p.max_users
+           FROM companies c
+           LEFT JOIN plans p ON p.id = c.plan_id
+          WHERE c.id = $1 LIMIT 1`,
+        [user.company_id]
+      );
+      company = cq.rows[0] || null;
+    }
+
+    /* Block login if the user's company subscription has lapsed (super-admins bypass).
+       Company "expired"/"suspended", or end_date in the past, denies access. */
+    if (!user.is_super_admin && company) {
+      const lapsed =
+        company.status === "expired" ||
+        company.status === "suspended" ||
+        (company.end_date && new Date(company.end_date) < new Date(new Date().toDateString()));
+      if (lapsed) {
+        await logFailed("company_subscription_lapsed");
+        return res.status(403).json({
+          ok: false,
+          error: "subscription_lapsed",
+          company: { name: company.name, status: company.status, end_date: company.end_date },
+        });
+      }
+    }
+
     /* Update last_login */
     await pool.query(`UPDATE app_users SET last_login=now() WHERE id=$1`, [user.id]);
 
@@ -2360,6 +2409,17 @@ app.post("/api/auth/login", async (req, res) => {
         isAdmin:         user.is_admin,
         isSuperAdmin:    user.is_super_admin,
         lastLogin:       user.last_login,
+        companyId:       user.company_id || null,  // NULL = platform-level (super-admin)
+        company:         company ? {               // resolved company snapshot (null for platform users)
+          id:        company.id,
+          name:      company.name,
+          status:    company.status,
+          startDate: company.start_date,
+          endDate:   company.end_date,
+          planName:  company.plan_name || null,
+          maxBranches: company.max_branches ?? -1,
+          maxUsers:    company.max_users ?? -1,
+        } : null,
       },
     });
   } catch (e) {
@@ -2394,12 +2454,24 @@ app.post("/api/auth/logout", async (req, res) => {
 ============================================================ */
 
 /* GET /api/app-users */
-app.get("/api/app-users", async (_req, res) => {
+app.get("/api/app-users", async (req, res) => {
   try {
+    /* Multi-tenant scoping: ?company_id=N restricts to that company.
+       Super-admin UI omits it to see everyone. */
+    const companyId = req.query.company_id ? parseInt(req.query.company_id) : null;
+    const params = [];
+    let where = "";
+    if (companyId) { params.push(companyId); where = `WHERE u.company_id = $1`; }
+
     const q = await pool.query(
-      `SELECT id, username, display_name, permissions, crud_perms, employees, allowed_branches,
-              is_active, is_admin, created_at, last_login
-         FROM app_users ORDER BY created_at ASC`
+      `SELECT u.id, u.username, u.display_name, u.permissions, u.crud_perms, u.employees, u.allowed_branches,
+              u.is_active, u.is_admin, u.is_super_admin, u.created_at, u.last_login,
+              u.company_id, c.name AS company_name
+         FROM app_users u
+         LEFT JOIN companies c ON c.id = u.company_id
+         ${where}
+         ORDER BY u.created_at ASC`,
+      params
     );
     res.json({ ok: true, users: q.rows });
   } catch (e) {
@@ -2421,6 +2493,8 @@ app.post("/api/app-users", async (req, res) => {
     const _ab = req.body?.allowedBranches;
     const allowedBranches = (_ab && typeof _ab === "object") ? _ab : [];
     const isAdmin        = !!req.body?.isAdmin;
+    /* Multi-tenant: which company this account belongs to (NULL = platform-level). */
+    const companyId      = req.body?.companyId != null ? parseInt(req.body.companyId) : null;
 
     if (!username || !password)
       return res.status(400).json({ ok: false, error: "username and password required" });
@@ -2429,12 +2503,12 @@ app.post("/api/app-users", async (req, res) => {
     const hash = hashPw(password, salt);
 
     const q = await pool.query(
-      `INSERT INTO app_users (username, display_name, password_hash, salt, permissions, crud_perms, employees, allowed_branches, is_admin)
-       VALUES ($1,$2,$3,$4,$5::jsonb,$6::jsonb,$7::jsonb,$8::jsonb,$9)
-       RETURNING id, username, display_name, permissions, crud_perms, employees, allowed_branches, is_active, is_admin, created_at`,
+      `INSERT INTO app_users (username, display_name, password_hash, salt, permissions, crud_perms, employees, allowed_branches, is_admin, company_id)
+       VALUES ($1,$2,$3,$4,$5::jsonb,$6::jsonb,$7::jsonb,$8::jsonb,$9,$10)
+       RETURNING id, username, display_name, permissions, crud_perms, employees, allowed_branches, is_active, is_admin, created_at, company_id`,
       [username, displayName, hash, salt,
        JSON.stringify(permissions), JSON.stringify(crudPerms), JSON.stringify(employees),
-       JSON.stringify(allowedBranches), isAdmin]
+       JSON.stringify(allowedBranches), isAdmin, Number.isFinite(companyId) ? companyId : null]
     );
 
     res.json({ ok: true, user: q.rows[0] });
@@ -2490,6 +2564,12 @@ app.put("/api/app-users/:id", async (req, res) => {
       sets.push(`allowed_branches=$${idx++}::jsonb`);
       vals.push(JSON.stringify((_ab && typeof _ab === "object") ? _ab : []));
     }
+    if (req.body?.companyId !== undefined) {
+      /* Multi-tenant: reassign account to a company (null = platform-level). */
+      const cid = req.body.companyId != null ? parseInt(req.body.companyId) : null;
+      sets.push(`company_id=$${idx++}`);
+      vals.push(Number.isFinite(cid) ? cid : null);
+    }
 
     if (!sets.length)
       return res.status(400).json({ ok: false, error: "nothing to update" });
@@ -2497,7 +2577,7 @@ app.put("/api/app-users/:id", async (req, res) => {
     vals.push(id);
     const q = await pool.query(
       `UPDATE app_users SET ${sets.join(",")} WHERE id=$${idx}
-       RETURNING id, username, display_name, permissions, crud_perms, employees, allowed_branches, is_active, is_admin, created_at, last_login`,
+       RETURNING id, username, display_name, permissions, crud_perms, employees, allowed_branches, is_active, is_admin, created_at, last_login, company_id`,
       vals
     );
     if (!q.rowCount)
