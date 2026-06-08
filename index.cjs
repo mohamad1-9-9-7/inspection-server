@@ -427,6 +427,82 @@ async function ensureSchema() {
     );
   `);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_daily_visits_day ON daily_visits(day);`);
+
+  /* ── Billing profile (single-row) — buyer info pre-fills every invoice ── */
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS billing_profile (
+      id              SERIAL PRIMARY KEY,
+      company_name    TEXT          NOT NULL DEFAULT '',
+      company_address TEXT          NOT NULL DEFAULT '',
+      tax_id          TEXT          NOT NULL DEFAULT '',
+      contact_email   TEXT          NOT NULL DEFAULT '',
+      contact_phone   TEXT          NOT NULL DEFAULT '',
+      notes           TEXT          NOT NULL DEFAULT '',
+      updated_at      TIMESTAMPTZ   NOT NULL DEFAULT now()
+    );
+  `);
+  /* Seed empty row so PUT-update pattern always finds a target */
+  await pool.query(`
+    INSERT INTO billing_profile (company_name)
+    SELECT '' WHERE NOT EXISTS (SELECT 1 FROM billing_profile LIMIT 1)
+  `);
+
+  /* ── Invoices — snapshot of subscription state at issuance time ── */
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS invoices (
+      id              SERIAL PRIMARY KEY,
+      invoice_number  TEXT          NOT NULL,
+      issue_date      DATE          NOT NULL DEFAULT CURRENT_DATE,
+      period_start    DATE,
+      period_end      DATE,
+      company_name    TEXT          NOT NULL DEFAULT '',
+      company_address TEXT          NOT NULL DEFAULT '',
+      tax_id          TEXT          NOT NULL DEFAULT '',
+      plan_name       TEXT          NOT NULL DEFAULT '',
+      accounts_count  INT           NOT NULL DEFAULT 0,
+      branches_count  INT           NOT NULL DEFAULT 0,
+      max_branches    INT,
+      max_users       INT,
+      amount          NUMERIC(10,2) NOT NULL DEFAULT 0,
+      currency        VARCHAR(10)   NOT NULL DEFAULT 'USD',
+      notes           TEXT          NOT NULL DEFAULT '',
+      created_by      TEXT          NOT NULL DEFAULT 'admin',
+      created_at      TIMESTAMPTZ   NOT NULL DEFAULT now()
+    );
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_invoices_issue_date ON invoices(issue_date DESC);`);
+
+  /* ════════════════════════════════════════════════════════════
+     EMAIL HISTORY — audit log of every email sent from the app.
+     METADATA ONLY (no body, no PDF binary) so the table stays small.
+     Designed for ISO/BRCGS audit trail + Analytics dashboard.
+  ═════════════════════════════════════════════════════════════ */
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS email_history (
+      id               SERIAL PRIMARY KEY,
+      sent_at          TIMESTAMPTZ   NOT NULL DEFAULT now(),
+      sent_by          TEXT          NOT NULL DEFAULT '',
+      report_type      TEXT          NOT NULL DEFAULT '',
+      report_title     TEXT          NOT NULL DEFAULT '',
+      report_date      DATE,
+      subject          TEXT          NOT NULL DEFAULT '',
+      to_emails        JSONB         NOT NULL DEFAULT '[]'::jsonb,
+      cc_emails        JSONB         NOT NULL DEFAULT '[]'::jsonb,
+      bcc_emails       JSONB         NOT NULL DEFAULT '[]'::jsonb,
+      recipient_count  INT           NOT NULL DEFAULT 0,
+      classification   VARCHAR(20)   NOT NULL DEFAULT 'internal',
+      priority         VARCHAR(10)   NOT NULL DEFAULT 'normal',
+      method           VARCHAR(20)   NOT NULL DEFAULT 'outlook',
+      attachment_count INT           NOT NULL DEFAULT 0,
+      note             TEXT          NOT NULL DEFAULT '',
+      template_id      TEXT,
+      status           VARCHAR(20)   NOT NULL DEFAULT 'sent',
+      created_at       TIMESTAMPTZ   NOT NULL DEFAULT now()
+    );
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_email_hist_sent_at     ON email_history(sent_at DESC);`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_email_hist_report_type ON email_history(report_type);`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_email_hist_sent_by     ON email_history(sent_by);`);
 }
 
 /* ============================================================
@@ -2829,6 +2905,319 @@ app.put("/api/subscription", async (req, res) => {
     res.json({ ok: true, subscription: q.rows[0] });
   } catch (e) {
     console.error("PUT /api/subscription ERROR:", e);
+    res.status(500).json({ ok: false, error: "server_error" });
+  }
+});
+
+/* ============================================================
+   BILLING PROFILE — single-row buyer info (Get / Update)
+============================================================ */
+
+app.get("/api/billing-profile", async (req, res) => {
+  try {
+    const q = await pool.query(`SELECT * FROM billing_profile ORDER BY id ASC LIMIT 1`);
+    res.json({ ok: true, profile: q.rows[0] || null });
+  } catch (e) {
+    console.error("GET /api/billing-profile ERROR:", e);
+    res.status(500).json({ ok: false, error: "server_error" });
+  }
+});
+
+app.put("/api/billing-profile", async (req, res) => {
+  try {
+    const { company_name, company_address, tax_id, contact_email, contact_phone, notes } = req.body;
+    /* Ensure a row exists */
+    await pool.query(`
+      INSERT INTO billing_profile (company_name)
+      SELECT '' WHERE NOT EXISTS (SELECT 1 FROM billing_profile LIMIT 1)
+    `);
+    const q = await pool.query(
+      `UPDATE billing_profile SET
+         company_name=$1, company_address=$2, tax_id=$3,
+         contact_email=$4, contact_phone=$5, notes=$6, updated_at=now()
+       WHERE id=(SELECT id FROM billing_profile ORDER BY id ASC LIMIT 1)
+       RETURNING *`,
+      [company_name || "", company_address || "", tax_id || "",
+       contact_email || "", contact_phone || "", notes || ""]
+    );
+    res.json({ ok: true, profile: q.rows[0] });
+  } catch (e) {
+    console.error("PUT /api/billing-profile ERROR:", e);
+    res.status(500).json({ ok: false, error: "server_error" });
+  }
+});
+
+/* ============================================================
+   INVOICES — list / get / create (immutable snapshots)
+============================================================ */
+
+app.get("/api/invoices", async (req, res) => {
+  try {
+    const q = await pool.query(`SELECT * FROM invoices ORDER BY id DESC LIMIT 500`);
+    res.json({ ok: true, invoices: q.rows });
+  } catch (e) {
+    console.error("GET /api/invoices ERROR:", e);
+    res.status(500).json({ ok: false, error: "server_error" });
+  }
+});
+
+app.get("/api/invoices/:id", async (req, res) => {
+  try {
+    const q = await pool.query(`SELECT * FROM invoices WHERE id=$1`, [req.params.id]);
+    if (!q.rowCount) return res.status(404).json({ ok: false, error: "not_found" });
+    res.json({ ok: true, invoice: q.rows[0] });
+  } catch (e) {
+    console.error("GET /api/invoices/:id ERROR:", e);
+    res.status(500).json({ ok: false, error: "server_error" });
+  }
+});
+
+app.post("/api/invoices", async (req, res) => {
+  try {
+    const {
+      issue_date, period_start, period_end,
+      company_name, company_address, tax_id,
+      plan_name, accounts_count, branches_count, max_branches, max_users,
+      amount, currency, notes, created_by,
+    } = req.body;
+
+    /* Generate INV-YYYY-NNNN — sequence resets per year, padded to 4 digits */
+    const year = new Date(issue_date || Date.now()).getFullYear();
+    const seqQ = await pool.query(
+      `SELECT COALESCE(MAX(CAST(SUBSTRING(invoice_number FROM '\\d+$') AS INT)), 0) + 1 AS next_seq
+         FROM invoices
+        WHERE invoice_number LIKE $1`,
+      [`INV-${year}-%`]
+    );
+    const seq = String(seqQ.rows[0].next_seq).padStart(4, "0");
+    const invoice_number = `INV-${year}-${seq}`;
+
+    const q = await pool.query(
+      `INSERT INTO invoices (
+         invoice_number, issue_date, period_start, period_end,
+         company_name, company_address, tax_id,
+         plan_name, accounts_count, branches_count, max_branches, max_users,
+         amount, currency, notes, created_by
+       ) VALUES (
+         $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16
+       ) RETURNING *`,
+      [
+        invoice_number,
+        issue_date || new Date(),
+        period_start || null,
+        period_end || null,
+        company_name || "",
+        company_address || "",
+        tax_id || "",
+        plan_name || "",
+        accounts_count || 0,
+        branches_count || 0,
+        max_branches ?? null,
+        max_users ?? null,
+        amount || 0,
+        currency || "USD",
+        notes || "",
+        created_by || "admin",
+      ]
+    );
+    res.json({ ok: true, invoice: q.rows[0] });
+  } catch (e) {
+    console.error("POST /api/invoices ERROR:", e);
+    res.status(500).json({ ok: false, error: "server_error" });
+  }
+});
+
+/* ════════════════════════════════════════════════════════════
+   EMAIL HISTORY — log + list + stats + cleanup
+═════════════════════════════════════════════════════════════ */
+
+/* Log a single email send. Called by the frontend after each successful send. */
+app.post("/api/email-history", async (req, res) => {
+  try {
+    const f = req.body || {};
+    const toEmails  = Array.isArray(f.to_emails)  ? f.to_emails  : [];
+    const ccEmails  = Array.isArray(f.cc_emails)  ? f.cc_emails  : [];
+    const bccEmails = Array.isArray(f.bcc_emails) ? f.bcc_emails : [];
+    const recipient_count = toEmails.length + ccEmails.length + bccEmails.length;
+    const q = await pool.query(
+      `INSERT INTO email_history (
+         sent_by, report_type, report_title, report_date,
+         subject, to_emails, cc_emails, bcc_emails, recipient_count,
+         classification, priority, method, attachment_count, note,
+         template_id, status
+       ) VALUES (
+         $1,$2,$3,$4,$5,$6::jsonb,$7::jsonb,$8::jsonb,$9,$10,$11,$12,$13,$14,$15,$16
+       ) RETURNING id, sent_at`,
+      [
+        String(f.sent_by || "").slice(0, 100),
+        String(f.report_type || "").slice(0, 100),
+        String(f.report_title || "").slice(0, 200),
+        f.report_date || null,
+        String(f.subject || "").slice(0, 500),
+        JSON.stringify(toEmails),
+        JSON.stringify(ccEmails),
+        JSON.stringify(bccEmails),
+        recipient_count,
+        String(f.classification || "internal").slice(0, 20),
+        String(f.priority || "normal").slice(0, 10),
+        String(f.method || "outlook").slice(0, 20),
+        Number(f.attachment_count) || 0,
+        String(f.note || "").slice(0, 2000),
+        f.template_id ? String(f.template_id).slice(0, 100) : null,
+        String(f.status || "sent").slice(0, 20),
+      ]
+    );
+    res.json({ ok: true, id: q.rows[0].id, sent_at: q.rows[0].sent_at });
+  } catch (e) {
+    console.error("POST /api/email-history ERROR:", e);
+    res.status(500).json({ ok: false, error: "server_error" });
+  }
+});
+
+/* List with filters. All filters optional. Pagination via limit + before_id cursor. */
+app.get("/api/email-history", async (req, res) => {
+  try {
+    const limit = Math.min(Math.max(parseInt(req.query.limit) || 100, 1), 500);
+    const where = [];
+    const params = [];
+    if (req.query.report_type) {
+      params.push(req.query.report_type);
+      where.push(`report_type = $${params.length}`);
+    }
+    if (req.query.sent_by) {
+      params.push(req.query.sent_by);
+      where.push(`sent_by = $${params.length}`);
+    }
+    if (req.query.classification) {
+      params.push(req.query.classification);
+      where.push(`classification = $${params.length}`);
+    }
+    if (req.query.from) {
+      params.push(req.query.from);
+      where.push(`sent_at >= $${params.length}::timestamptz`);
+    }
+    if (req.query.to) {
+      params.push(req.query.to);
+      where.push(`sent_at <= $${params.length}::timestamptz`);
+    }
+    if (req.query.search) {
+      params.push("%" + String(req.query.search).toLowerCase() + "%");
+      where.push(`(LOWER(subject) LIKE $${params.length} OR LOWER(to_emails::text) LIKE $${params.length} OR LOWER(cc_emails::text) LIKE $${params.length})`);
+    }
+    if (req.query.before_id) {
+      params.push(parseInt(req.query.before_id) || 0);
+      where.push(`id < $${params.length}`);
+    }
+    const sql = `SELECT * FROM email_history ${where.length ? "WHERE " + where.join(" AND ") : ""} ORDER BY id DESC LIMIT ${limit}`;
+    const q = await pool.query(sql, params);
+    res.json({ ok: true, logs: q.rows, hasMore: q.rows.length === limit });
+  } catch (e) {
+    console.error("GET /api/email-history ERROR:", e);
+    res.status(500).json({ ok: false, error: "server_error" });
+  }
+});
+
+/* Aggregated stats for the Analytics dashboard. Returns last `days` (default 30). */
+app.get("/api/email-history/stats", async (req, res) => {
+  try {
+    const days = Math.min(Math.max(parseInt(req.query.days) || 30, 1), 365);
+
+    const [summary, byType, byClass, dailyTrend, topRecipients, topSenders] = await Promise.all([
+      pool.query(`
+        SELECT
+          COUNT(*)                                              AS total,
+          COUNT(*) FILTER (WHERE sent_at >= now() - INTERVAL '${days} days') AS recent,
+          COUNT(*) FILTER (WHERE sent_at >= now() - INTERVAL '1 day')        AS today,
+          COUNT(DISTINCT sent_by)                               AS unique_senders,
+          SUM(recipient_count) FILTER (WHERE sent_at >= now() - INTERVAL '${days} days') AS total_recipients_recent,
+          SUM(attachment_count) FILTER (WHERE sent_at >= now() - INTERVAL '${days} days') AS total_attachments_recent,
+          COUNT(*) FILTER (WHERE method='outlook'  AND sent_at >= now() - INTERVAL '${days} days') AS method_outlook,
+          COUNT(*) FILTER (WHERE method='whatsapp' AND sent_at >= now() - INTERVAL '${days} days') AS method_whatsapp,
+          COUNT(*) FILTER (WHERE method='copy'     AND sent_at >= now() - INTERVAL '${days} days') AS method_copy
+        FROM email_history
+      `),
+      pool.query(`
+        SELECT report_type, COUNT(*)::int AS count
+        FROM email_history
+        WHERE sent_at >= now() - INTERVAL '${days} days'
+        GROUP BY report_type
+        ORDER BY count DESC
+        LIMIT 20
+      `),
+      pool.query(`
+        SELECT classification, COUNT(*)::int AS count
+        FROM email_history
+        WHERE sent_at >= now() - INTERVAL '${days} days'
+        GROUP BY classification
+        ORDER BY count DESC
+      `),
+      pool.query(`
+        SELECT DATE(sent_at)::text AS day, COUNT(*)::int AS count
+        FROM email_history
+        WHERE sent_at >= now() - INTERVAL '${days} days'
+        GROUP BY day
+        ORDER BY day ASC
+      `),
+      pool.query(`
+        SELECT email, COUNT(*)::int AS count
+        FROM (
+          SELECT jsonb_array_elements_text(to_emails) AS email FROM email_history
+          WHERE sent_at >= now() - INTERVAL '${days} days'
+          UNION ALL
+          SELECT jsonb_array_elements_text(cc_emails) FROM email_history
+          WHERE sent_at >= now() - INTERVAL '${days} days'
+        ) AS r
+        WHERE email IS NOT NULL AND email <> ''
+        GROUP BY email
+        ORDER BY count DESC
+        LIMIT 10
+      `),
+      pool.query(`
+        SELECT sent_by, COUNT(*)::int AS count
+        FROM email_history
+        WHERE sent_at >= now() - INTERVAL '${days} days' AND sent_by <> ''
+        GROUP BY sent_by
+        ORDER BY count DESC
+        LIMIT 10
+      `),
+    ]);
+
+    res.json({
+      ok: true,
+      days,
+      summary: summary.rows[0],
+      byType: byType.rows,
+      byClass: byClass.rows,
+      dailyTrend: dailyTrend.rows,
+      topRecipients: topRecipients.rows,
+      topSenders: topSenders.rows,
+    });
+  } catch (e) {
+    console.error("GET /api/email-history/stats ERROR:", e);
+    res.status(500).json({ ok: false, error: "server_error" });
+  }
+});
+
+/* Delete a single log entry (admin housekeeping). */
+app.delete("/api/email-history/:id", async (req, res) => {
+  try {
+    await pool.query(`DELETE FROM email_history WHERE id=$1`, [req.params.id]);
+    res.json({ ok: true });
+  } catch (e) {
+    console.error("DELETE /api/email-history/:id ERROR:", e);
+    res.status(500).json({ ok: false, error: "server_error" });
+  }
+});
+
+/* Bulk cleanup: delete entries older than `before` (YYYY-MM-DD). Manual only. */
+app.delete("/api/email-history", async (req, res) => {
+  try {
+    const before = req.query.before;
+    if (!before) return res.status(400).json({ ok: false, error: "before_required" });
+    const q = await pool.query(`DELETE FROM email_history WHERE sent_at < $1::timestamptz`, [before]);
+    res.json({ ok: true, deleted: q.rowCount });
+  } catch (e) {
+    console.error("DELETE /api/email-history ERROR:", e);
     res.status(500).json({ ok: false, error: "server_error" });
   }
 });
