@@ -51,14 +51,53 @@ const pool = new Pool({
   ssl: { rejectUnauthorized: false },
   keepAlive: true,
   max: 5,
-  idleTimeoutMillis: 10000,      // أغلق الاتصالات الخاملة بعد 10 ثوانٍ
-  connectionTimeoutMillis: 5000, // لا تنتظر أكثر من 5 ثوانٍ للاتصال
+  idleTimeoutMillis: 30000,
+  connectionTimeoutMillis: 15000,
 });
 
 // منع الكراش عند انقطاع اتصال Neon المفاجئ
 pool.on("error", (err) => {
   console.error("⚠️ Pool connection error (auto-recovered):", err.message);
 });
+const DB_CONNECTIVITY_ERROR_CODES = new Set([
+  "ECONNRESET",
+  "ECONNREFUSED",
+  "ENOTFOUND",
+  "ETIMEDOUT",
+  "EAI_AGAIN",
+  "08000",
+  "08001",
+  "08003",
+  "08006",
+  "53300",
+  "57P01",
+  "57P02",
+  "57P03",
+]);
+
+function isDbConnectivityError(err) {
+  const message = String(err?.message || err || "").toLowerCase();
+  return (
+    DB_CONNECTIVITY_ERROR_CODES.has(String(err?.code || "")) ||
+    message.includes("connection terminated") ||
+    message.includes("connection timeout") ||
+    message.includes("timeout expired") ||
+    message.includes("terminating connection")
+  );
+}
+
+async function rollbackQuietly(client) {
+  if (!client) return;
+  try {
+    await client.query("ROLLBACK");
+  } catch {}
+}
+
+function sendDbError(res, err) {
+  const status = isDbConnectivityError(err) ? 503 : 500;
+  const error = status === 503 ? "DB_CONNECTION_FAILED" : "DB_QUERY_FAILED";
+  return res.status(status).json({ ok: false, error, message: String(err?.message || err) });
+}
 
 /* --------- Helpers --------- */
 const isObj = (x) => x && typeof x === "object" && !Array.isArray(x);
@@ -1002,8 +1041,9 @@ app.get("/api/supplier-links/:token", async (req, res) => {
 
 /* ✅ UPDATED: supports recordDate + fieldAttachments */
 app.post("/api/supplier-links/:token/submit", async (req, res) => {
-  const client = await pool.connect();
+  let client;
   try {
+    client = await pool.connect();
     const token = normText(req.params.token);
     if (!token) return res.status(400).json({ ok: false, error: "token required" });
 
@@ -1103,13 +1143,11 @@ app.post("/api/supplier-links/:token/submit", async (req, res) => {
 
     return res.json({ ok: true, reportId: link.report_id, token, submittedAt });
   } catch (e) {
-    try {
-      await client.query("ROLLBACK");
-    } catch {}
+    await rollbackQuietly(client);
     console.error("POST /api/supplier-links/:token/submit ERROR =", e);
-    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+    return sendDbError(res, e);
   } finally {
-    client.release();
+    if (client) client.release();
   }
 });
 
@@ -1117,8 +1155,9 @@ app.post("/api/supplier-links/:token/submit", async (req, res) => {
    ✅ SUPPLIER PUBLIC TOKEN API (AUTO-CREATE if not found)
 ====================================================================== */
 app.get("/api/reports/public/:token", async (req, res) => {
-  const client = await pool.connect();
+  let client;
   try {
+    client = await pool.connect();
     const token = normText(req.params.token || "");
     if (!token) return res.status(400).json({ ok: false, error: "token required" });
 
@@ -1180,20 +1219,19 @@ app.get("/api/reports/public/:token", async (req, res) => {
     await client.query("COMMIT");
     return res.json({ ok: true, report: ins.rows[0], created: true });
   } catch (e) {
-    try {
-      await client.query("ROLLBACK");
-    } catch {}
+    await rollbackQuietly(client);
     console.error("GET /api/reports/public/:token ERROR =", e);
-    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+    return sendDbError(res, e);
   } finally {
-    client.release();
+    if (client) client.release();
   }
 });
 
 /* ✅ UPDATED submit: supports recordDate + fieldAttachments */
 app.post("/api/reports/public/:token/submit", async (req, res) => {
-  const client = await pool.connect();
+  let client;
   try {
+    client = await pool.connect();
     const token = normText(req.params.token || "");
     if (!token) return res.status(400).json({ ok: false, error: "token required" });
 
@@ -1295,13 +1333,11 @@ app.post("/api/reports/public/:token/submit", async (req, res) => {
     await client.query("COMMIT");
     return res.json({ ok: true, reportId, token, submittedAt });
   } catch (e) {
-    try {
-      await client.query("ROLLBACK");
-    } catch {}
+    await rollbackQuietly(client);
     console.error("POST /api/reports/public/:token/submit ERROR =", e);
-    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+    return sendDbError(res, e);
   } finally {
-    client.release();
+    if (client) client.release();
   }
 });
 
@@ -1409,8 +1445,9 @@ app.get("/api/training-session/by-token/:token", async (req, res) => {
 });
 
 app.post("/api/training-session/by-token/:token/submit", async (req, res) => {
-  const client = await pool.connect();
+  let client;
   try {
+    client = await pool.connect();
     const token = normText(req.params.token);
     if (!token) return res.status(400).json({ ok: false, error: "token required" });
 
@@ -1590,13 +1627,11 @@ app.post("/api/training-session/by-token/:token/submit", async (req, res) => {
       submittedAt,
     });
   } catch (e) {
-    try {
-      await client.query("ROLLBACK");
-    } catch {}
+    await rollbackQuietly(client);
     console.error("POST /api/training-session/by-token/:token/submit ERROR =", e);
-    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+    return sendDbError(res, e);
   } finally {
-    client.release();
+    if (client) client.release();
   }
 });
 
@@ -1692,8 +1727,9 @@ async function upsertCatalogProduct(req, res, fallbackScope = "returns_items") {
 }
 
 async function updateCatalogProduct(req, res, fallbackScope = "returns_items") {
-  const client = await pool.connect();
+  let client;
   try {
+    client = await pool.connect();
     const scope = catalogScope(req, fallbackScope);
     const oldCode = normText(req.params?.code || req.body?.oldCode || req.body?.old_code);
     const { code, name } = catalogProductInput(req, oldCode);
@@ -1739,9 +1775,7 @@ async function updateCatalogProduct(req, res, fallbackScope = "returns_items") {
     await client.query("COMMIT");
     return res.json({ ok: true, item: catalogRowToClient(result.rows[0]) });
   } catch (e) {
-    try {
-      await client.query("ROLLBACK");
-    } catch {}
+    await rollbackQuietly(client);
 
     if (e && e.code === "23505") {
       return res.status(409).json({
@@ -1752,9 +1786,9 @@ async function updateCatalogProduct(req, res, fallbackScope = "returns_items") {
     }
 
     console.error("PUT catalog products ERROR =", e);
-    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+    return sendDbError(res, e);
   } finally {
-    client.release();
+    if (client) client.release();
   }
 }
 
@@ -1972,8 +2006,9 @@ app.get("/api/training-links/:token", async (req, res) => {
 });
 
 app.post("/api/training-links/:token/submit", async (req, res) => {
-  const client = await pool.connect();
+  let client;
   try {
+    client = await pool.connect();
     const token = normText(req.params.token);
     if (!token) return res.status(400).json({ ok: false, error: "token required" });
 
@@ -2106,13 +2141,11 @@ app.post("/api/training-links/:token/submit", async (req, res) => {
       saved: { score, result: String(result).toUpperCase(), passMark },
     });
   } catch (e) {
-    try {
-      await client.query("ROLLBACK");
-    } catch {}
+    await rollbackQuietly(client);
     console.error("POST /api/training-links/:token/submit ERROR =", e);
-    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+    return sendDbError(res, e);
   } finally {
-    client.release();
+    if (client) client.release();
   }
 });
 
