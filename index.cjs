@@ -1263,6 +1263,135 @@ app.post("/api/reports/public/:token/submit", async (req, res) => {
     if (q.rowCount) {
       reportId = q.rows[0].id;
       payload = q.rows[0].payload || {};
+      const submissionType = normText(body.submissionType || fields.submissionType || "");
+      const publicMode = normText(payload?.public?.mode || "");
+      const isInspectionEvidence =
+        submissionType === "inspection_closed_evidence" ||
+        publicMode === "INSPECTION_CLOSED_EVIDENCE_ONLY" ||
+        q.rows[0].type === "internal_multi_audit";
+
+      if (isInspectionEvidence) {
+        const payloadToken = normText(payload?.public?.token || "");
+        if (payloadToken !== token) {
+          await client.query("ROLLBACK");
+          return res.status(403).json({ ok: false, error: "TOKEN_MISMATCH" });
+        }
+
+        const uploadedBy = normText(body.uploadedBy || fields.closedEvidenceUploadedBy || "");
+        if (!uploadedBy) {
+          await client.query("ROLLBACK");
+          return res.status(400).json({ ok: false, error: "uploadedBy required" });
+        }
+
+        const imageUrl = (img) => {
+          if (!img) return "";
+          if (typeof img === "string") return normText(img);
+          if (!isObj(img)) return "";
+          return normText(
+            img.url ||
+            img.optimized_url ||
+            img.optimizedUrl ||
+            img.secure_url ||
+            img.secureUrl ||
+            img.originalUrl ||
+            img.original_url ||
+            img.src ||
+            img.href ||
+            ""
+          );
+        };
+        const cleanImages = (images) =>
+          (Array.isArray(images) ? images : [])
+            .map((img) => {
+              const url = imageUrl(img);
+              return url ? { ...(isObj(img) ? img : {}), url } : null;
+            })
+            .filter(Boolean);
+        const cleanUpdates = (updates) =>
+          (Array.isArray(updates) ? updates : [])
+            .map((item) => {
+              const rowIndex = Number(item?.rowIndex);
+              if (!Number.isInteger(rowIndex) || rowIndex < 0) return null;
+              return {
+                rowIndex,
+                images: cleanImages(item?.images),
+                note: normText(item?.note || ""),
+              };
+            })
+            .filter((item) => item && (item.images.length || item.note));
+
+        const incomingUpdates = cleanUpdates(body.closedEvidenceUpdates);
+        if (!incomingUpdates.length) {
+          await client.query("ROLLBACK");
+          return res.status(400).json({ ok: false, error: "closedEvidenceUpdates required" });
+        }
+
+        const submittedAt = new Date().toISOString();
+        const existingFields = isObj(payload.fields) ? payload.fields : {};
+        const previousUpdates = cleanUpdates(existingFields.closedEvidenceUpdates);
+        const updatesByRow = new Map();
+        [...previousUpdates, ...incomingUpdates].forEach((item) => {
+          const previous = updatesByRow.get(item.rowIndex) || { rowIndex: item.rowIndex, images: [], note: "" };
+          const seen = new Set(previous.images.map((img) => imageUrl(img)).filter(Boolean));
+          item.images.forEach((img) => {
+            const url = imageUrl(img);
+            if (url && !seen.has(url)) {
+              previous.images.push(img);
+              seen.add(url);
+            }
+          });
+          if (item.note) previous.note = item.note;
+          updatesByRow.set(item.rowIndex, previous);
+        });
+        const closedEvidenceUpdates = Array.from(updatesByRow.values()).sort((a, b) => a.rowIndex - b.rowIndex);
+        const updateForRow = new Map(closedEvidenceUpdates.map((item) => [item.rowIndex, item]));
+
+        const table = Array.isArray(payload.table) ? payload.table : [];
+        const nextTable = table.map((row, idx) => {
+          const update = updateForRow.get(idx);
+          if (!update) return row;
+          const existingImgs = (Array.isArray(row?.closedEvidenceImgs) ? row.closedEvidenceImgs : [])
+            .map(imageUrl)
+            .filter(Boolean);
+          const incomingImgs = update.images.map(imageUrl).filter(Boolean);
+          return {
+            ...(isObj(row) ? row : {}),
+            closedEvidenceImgs: Array.from(new Set([...existingImgs, ...incomingImgs])),
+            ...(update.note ? { closedEvidenceNote: update.note } : {}),
+          };
+        });
+
+        const final = body.final === true;
+        const newPayload = {
+          ...payload,
+          table: nextTable,
+          fields: {
+            ...existingFields,
+            closedEvidenceUpdates,
+            closedEvidenceProgressSavedAt: submittedAt,
+            closedEvidenceSubmittedAt: final ? submittedAt : existingFields.closedEvidenceSubmittedAt || null,
+            closedEvidenceUploadedBy: uploadedBy,
+            submittedBy: normText(payload?.header?.location || payload?.branch || "branch"),
+            submissionType: "inspection_closed_evidence",
+          },
+          public: {
+            ...(isObj(payload.public) ? payload.public : {}),
+            token,
+            mode: publicMode || "INSPECTION_CLOSED_EVIDENCE_ONLY",
+            submittedAt: final ? submittedAt : payload?.public?.submittedAt || null,
+            status: final ? "evidence_submitted" : "evidence_in_progress",
+          },
+        };
+
+        const upd = await client.query(
+          `UPDATE reports SET payload=$1::jsonb, updated_at=now() WHERE id=$2 RETURNING *`,
+          [JSON.stringify(newPayload), reportId]
+        );
+
+        await client.query("COMMIT");
+        return res.json({ ok: true, reportId, token, submittedAt, report: upd.rows[0] });
+      }
+
       if (payload?.meta?.submitted === true || payload?.meta?.submittedAt) {
         await client.query("ROLLBACK");
         return res.status(409).json({ ok: false, error: "ALREADY_SUBMITTED" });
