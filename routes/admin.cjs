@@ -1,5 +1,6 @@
 module.exports = function registerAdminRoutes(app, deps = {}) {
   const { pool, clampInt, normText, rlCheck, rlReset, genSalt, hashPw, verifyPw } = deps;
+  const SCRYPT_PFX = "scrypt:";
 
 /* --------- Auth: verify role password --------- */
 app.post("/api/auth/verify-role", (req, res) => {
