@@ -5,6 +5,36 @@ module.exports = function registerSupplierPublicRoutes(app, deps = {}) {
    Supplier Links API (UUID token system)
 ====================================================================== */
 const SUPPLIER_TYPE = "supplier_self_assessment_form";
+const MAX_JSON_ARRAY_ITEMS = 500;
+const MAX_JSON_OBJECT_KEYS = 1000;
+
+function cleanJsonbValue(value, depth = 0) {
+  if (depth > 20) return null;
+  if (value == null) return value;
+  if (typeof value === "string") return value.replace(/\u0000/g, "");
+  if (typeof value === "number") return Number.isFinite(value) ? value : null;
+  if (typeof value === "boolean") return value;
+  if (Array.isArray(value)) return value.slice(0, MAX_JSON_ARRAY_ITEMS).map((item) => cleanJsonbValue(item, depth + 1));
+  if (!isObj(value)) return null;
+
+  const out = {};
+  Object.keys(value).slice(0, MAX_JSON_OBJECT_KEYS).forEach((key) => {
+    const cleanKey = String(key || "").replace(/\u0000/g, "");
+    if (!cleanKey) return;
+    out[cleanKey] = cleanJsonbValue(value[key], depth + 1);
+  });
+  return out;
+}
+
+function cleanJsonbObject(value) {
+  const cleaned = cleanJsonbValue(value);
+  return isObj(cleaned) ? cleaned : {};
+}
+
+function cleanJsonbArray(value) {
+  const cleaned = cleanJsonbValue(value);
+  return Array.isArray(cleaned) ? cleaned : [];
+}
 
 app.post("/api/supplier-links", async (req, res) => {
   try {
@@ -117,11 +147,14 @@ app.post("/api/supplier-links/:token/submit", async (req, res) => {
 
     const body = isObj(req.body) ? req.body : {};
     const recordDate = normText(body.recordDate || "");
-    const fields = isObj(body.fields) ? body.fields : {};
-    const answers = isObj(body.answers) ? body.answers : {};
-    const attachments = Array.isArray(body.attachments) ? body.attachments : [];
+    const fields = cleanJsonbObject(body.fields);
+    const answers = cleanJsonbObject(body.answers);
+    const attachments = cleanJsonbArray(body.attachments);
     const fieldAttachments =
-      isObj(body.fieldAttachments) && !Array.isArray(body.fieldAttachments) ? body.fieldAttachments : {};
+      isObj(body.fieldAttachments) && !Array.isArray(body.fieldAttachments) ? cleanJsonbObject(body.fieldAttachments) : {};
+    const productsList = cleanJsonbArray(body.productsList);
+    const declaration = cleanJsonbObject(body.declaration);
+    const supplierType = normText(body.supplierType || fields.supplier_type || "");
 
     await client.query("BEGIN");
 
@@ -171,19 +204,22 @@ app.post("/api/supplier-links/:token/submit", async (req, res) => {
 
     const submittedAt = new Date().toISOString();
 
-    const mergedFields = { ...(isObj(payload.fields) ? payload.fields : {}), ...(fields || {}) };
-    const mergedAnswers = { ...(isObj(payload.answers) ? payload.answers : {}), ...(answers || {}) };
+    const mergedFields = cleanJsonbObject({ ...(isObj(payload.fields) ? payload.fields : {}), ...(fields || {}) });
+    const mergedAnswers = cleanJsonbObject({ ...(isObj(payload.answers) ? payload.answers : {}), ...(answers || {}) });
 
     const existingFieldAtt = isObj(payload.fieldAttachments) ? payload.fieldAttachments : {};
-    const mergedFieldAtt = { ...existingFieldAtt, ...safeObj(fieldAttachments) };
+    const mergedFieldAtt = cleanJsonbObject({ ...existingFieldAtt, ...safeObj(fieldAttachments) });
 
-    const newPayload = {
+    const newPayload = cleanJsonbObject({
       ...payload,
       recordDate: recordDate || normText(payload.recordDate) || todayISO(),
       fields: mergedFields,
       answers: mergedAnswers,
-      attachments: attachments.length ? attachments : Array.isArray(payload.attachments) ? payload.attachments : [],
+      attachments: attachments.length ? attachments : Array.isArray(payload.attachments) ? cleanJsonbArray(payload.attachments) : [],
       fieldAttachments: Object.keys(mergedFieldAtt).length ? mergedFieldAtt : existingFieldAtt,
+      productsList: productsList.length ? productsList : Array.isArray(payload.productsList) ? cleanJsonbArray(payload.productsList) : [],
+      declaration: Object.keys(declaration).length ? declaration : cleanJsonbObject(payload.declaration),
+      supplierType: supplierType || normText(payload.supplierType || payload?.public?.supplierType || ""),
       meta: {
         ...(isObj(payload.meta) ? payload.meta : {}),
         submitted: true,
@@ -194,8 +230,9 @@ app.post("/api/supplier-links/:token/submit", async (req, res) => {
         mode: "SUPPLIER_LINK",
         token,
         submittedAt,
+        supplierType: supplierType || normText(payload?.public?.supplierType || ""),
       },
-    };
+    });
 
     await client.query(
       `UPDATE reports
@@ -305,11 +342,14 @@ app.post("/api/reports/public/:token/submit", async (req, res) => {
 
     const body = isObj(req.body) ? req.body : {};
     const recordDate = normText(body.recordDate || "");
-    const fields = isObj(body.fields) ? body.fields : {};
-    const answers = isObj(body.answers) ? body.answers : {};
-    const attachments = Array.isArray(body.attachments) ? body.attachments : [];
+    const fields = cleanJsonbObject(body.fields);
+    const answers = cleanJsonbObject(body.answers);
+    const attachments = cleanJsonbArray(body.attachments);
     const fieldAttachments =
-      isObj(body.fieldAttachments) && !Array.isArray(body.fieldAttachments) ? body.fieldAttachments : {};
+      isObj(body.fieldAttachments) && !Array.isArray(body.fieldAttachments) ? cleanJsonbObject(body.fieldAttachments) : {};
+    const productsList = cleanJsonbArray(body.productsList);
+    const declaration = cleanJsonbObject(body.declaration);
+    const supplierType = normText(body.supplierType || fields.supplier_type || "");
 
     await client.query("BEGIN");
 
@@ -495,19 +535,22 @@ app.post("/api/reports/public/:token/submit", async (req, res) => {
 
     const submittedAt = new Date().toISOString();
 
-    const mergedFields = { ...(isObj(payload.fields) ? payload.fields : {}), ...(fields || {}) };
-    const mergedAnswers = { ...(isObj(payload.answers) ? payload.answers : {}), ...(answers || {}) };
+    const mergedFields = cleanJsonbObject({ ...(isObj(payload.fields) ? payload.fields : {}), ...(fields || {}) });
+    const mergedAnswers = cleanJsonbObject({ ...(isObj(payload.answers) ? payload.answers : {}), ...(answers || {}) });
 
     const existingFieldAtt = isObj(payload.fieldAttachments) ? payload.fieldAttachments : {};
-    const mergedFieldAtt = { ...existingFieldAtt, ...safeObj(fieldAttachments) };
+    const mergedFieldAtt = cleanJsonbObject({ ...existingFieldAtt, ...safeObj(fieldAttachments) });
 
-    const newPayload = {
+    const newPayload = cleanJsonbObject({
       ...payload,
       recordDate: recordDate || normText(payload.recordDate) || todayISO(),
       fields: mergedFields,
       answers: mergedAnswers,
-      attachments: attachments.length ? attachments : Array.isArray(payload.attachments) ? payload.attachments : [],
+      attachments: attachments.length ? attachments : Array.isArray(payload.attachments) ? cleanJsonbArray(payload.attachments) : [],
       fieldAttachments: Object.keys(mergedFieldAtt).length ? mergedFieldAtt : existingFieldAtt,
+      productsList: productsList.length ? productsList : Array.isArray(payload.productsList) ? cleanJsonbArray(payload.productsList) : [],
+      declaration: Object.keys(declaration).length ? declaration : cleanJsonbObject(payload.declaration),
+      supplierType: supplierType || normText(payload.supplierType || payload?.public?.supplierType || ""),
       meta: {
         ...(isObj(payload.meta) ? payload.meta : {}),
         submitted: true,
@@ -519,8 +562,9 @@ app.post("/api/reports/public/:token/submit", async (req, res) => {
         token,
         mode: "PUBLIC",
         submittedAt,
+        supplierType: supplierType || normText(payload?.public?.supplierType || ""),
       },
-    };
+    });
 
     await client.query(`UPDATE reports SET payload=$1::jsonb, updated_at=now() WHERE id=$2`, [
       JSON.stringify(newPayload),
