@@ -1,5 +1,5 @@
 module.exports = function registerReportsRoutes(app, deps = {}) {
-  const { pool, clampInt, normText } = deps;
+  const { pool, clampInt, normText, isObj } = deps;
 
 /* ============================================================
    Reports API

@@ -1,5 +1,5 @@
 module.exports = function registerTrainingSessionRoutes(app, deps = {}) {
-  const { pool, normText, safeArr, normKey, todayISO, rollbackQuietly, sendDbError } = deps;
+  const { pool, normText, safeArr, normKey, todayISO, isObj, rollbackQuietly, sendDbError } = deps;
 
 /* ============================================================
    Training Session Token API (TEXT token stored in reports.payload.quizToken)

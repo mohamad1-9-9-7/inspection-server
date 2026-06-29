@@ -1,5 +1,5 @@
 module.exports = function registerSupplierPublicRoutes(app, deps = {}) {
-  const { pool, clampInt, normText, todayISO, safeObj, rollbackQuietly, sendDbError } = deps;
+  const { pool, clampInt, normText, todayISO, safeObj, isObj, rollbackQuietly, sendDbError } = deps;
 
 /* ======================================================================
    Supplier Links API (UUID token system)
