@@ -8,6 +8,7 @@ const ensureSchema = require("./db/schema.cjs");
 const common = require("./utils/common.cjs");
 const password = require("./utils/password.cjs");
 const rateLimit = require("./utils/rateLimit.cjs");
+const auth = require("./utils/auth.cjs");
 
 const registerReportsRoutes = require("./routes/reports.cjs");
 const registerSupplierPublicRoutes = require("./routes/supplierPublic.cjs");
@@ -50,6 +51,10 @@ const deps = {
   ...common,
   ...password,
   ...rateLimit,
+  requireAuth: auth.requireAuth(pool),
+  requireAdmin: auth.requireAdmin(pool),
+  createSession: (userId) => auth.createSession(pool, userId),
+  destroySession: (token) => auth.destroySession(pool, token),
 };
 
 registerReportsRoutes(app, deps);
@@ -65,7 +70,7 @@ registerEmailHistoryRoutes(app, deps);
 ensureSchema({ pool, genSalt: password.genSalt, hashPw: password.hashPw })
   .then(() =>
     app.listen(PORT, () => {
-      console.log(`API running on :${PORT} (FULL public access: read/write/delete enabled)`);
+      console.log(`API running on :${PORT} (auth required on non-public routes)`);
       console.log("STARTED AT:", new Date().toISOString());
     })
   )

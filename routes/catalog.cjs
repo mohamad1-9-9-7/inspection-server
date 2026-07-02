@@ -1,5 +1,5 @@
 module.exports = function registerCatalogRoutes(app, deps = {}) {
-  const { pool, clampInt, normText, safeObj, rollbackQuietly, sendDbError } = deps;
+  const { pool, clampInt, normText, safeObj, rollbackQuietly, sendDbError, requireAuth } = deps;
 
 /* ============================================================
    Product Catalog API
@@ -185,23 +185,23 @@ async function deleteCatalogProduct(req, res, fallbackScope = "returns_items") {
   }
 }
 
-app.get(["/api/catalog/products", "/api/catalog/items", "/api/items"], (req, res) =>
+app.get(["/api/catalog/products", "/api/catalog/items", "/api/items"], requireAuth, (req, res) =>
   listCatalogProducts(req, res, "returns_items")
 );
-app.post(["/api/catalog/products", "/api/catalog/items", "/api/items"], (req, res) =>
+app.post(["/api/catalog/products", "/api/catalog/items", "/api/items"], requireAuth, (req, res) =>
   upsertCatalogProduct(req, res, "returns_items")
 );
-app.put(["/api/catalog/products/:code", "/api/catalog/items/:code", "/api/items/:code"], (req, res) =>
+app.put(["/api/catalog/products/:code", "/api/catalog/items/:code", "/api/items/:code"], requireAuth, (req, res) =>
   updateCatalogProduct(req, res, "returns_items")
 );
-app.delete(["/api/catalog/products/:code", "/api/catalog/items/:code", "/api/items/:code"], (req, res) =>
+app.delete(["/api/catalog/products/:code", "/api/catalog/items/:code", "/api/items/:code"], requireAuth, (req, res) =>
   deleteCatalogProduct(req, res, "returns_items")
 );
 
-app.put("/api/product-catalog/:code", (req, res) => updateCatalogProduct(req, res, "default"));
-app.delete("/api/product-catalog/:code", (req, res) => deleteCatalogProduct(req, res, "default"));
+app.put("/api/product-catalog/:code", requireAuth, (req, res) => updateCatalogProduct(req, res, "default"));
+app.delete("/api/product-catalog/:code", requireAuth, (req, res) => deleteCatalogProduct(req, res, "default"));
 
-app.get("/api/product-catalog", async (req, res) => {
+app.get("/api/product-catalog", requireAuth, async (req, res) => {
   try {
     const scope = normText(req.query?.scope || "default");
     const limit = clampInt(req.query?.limit, 2000, 1, 5000);
@@ -225,7 +225,7 @@ app.get("/api/product-catalog", async (req, res) => {
   }
 });
 
-app.post("/api/product-catalog", async (req, res) => {
+app.post("/api/product-catalog", requireAuth, async (req, res) => {
   try {
     const scope = normText(req.body?.scope || "default");
     const code = normText(req.body?.code);

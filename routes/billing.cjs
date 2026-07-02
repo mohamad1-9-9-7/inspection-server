@@ -1,11 +1,11 @@
 module.exports = function registerBillingRoutes(app, deps = {}) {
-  const { pool } = deps;
+  const { pool, requireAuth, requireAdmin } = deps;
 
 /* ============================================================
    PLANS — CRUD
 ============================================================ */
 
-app.get("/api/plans", async (req, res) => {
+app.get("/api/plans", requireAuth, async (req, res) => {
   try {
     const q = await pool.query(`SELECT * FROM plans ORDER BY price ASC`);
     res.json({ ok: true, plans: q.rows });
@@ -15,7 +15,7 @@ app.get("/api/plans", async (req, res) => {
   }
 });
 
-app.post("/api/plans", async (req, res) => {
+app.post("/api/plans", requireAdmin, async (req, res) => {
   try {
     const { name, price, currency, max_branches, max_users, description } = req.body;
     if (!name) return res.status(400).json({ ok: false, error: "name required" });
@@ -32,7 +32,7 @@ app.post("/api/plans", async (req, res) => {
   }
 });
 
-app.put("/api/plans/:id", async (req, res) => {
+app.put("/api/plans/:id", requireAdmin, async (req, res) => {
   try {
     const { name, price, currency, max_branches, max_users, description, is_active } = req.body;
     const q = await pool.query(
@@ -50,7 +50,7 @@ app.put("/api/plans/:id", async (req, res) => {
   }
 });
 
-app.delete("/api/plans/:id", async (req, res) => {
+app.delete("/api/plans/:id", requireAdmin, async (req, res) => {
   try {
     await pool.query(`UPDATE companies SET plan_id=NULL WHERE plan_id=$1`, [req.params.id]);
     await pool.query(`DELETE FROM plans WHERE id=$1`, [req.params.id]);
@@ -65,7 +65,7 @@ app.delete("/api/plans/:id", async (req, res) => {
    COMPANIES — CRUD
 ============================================================ */
 
-app.get("/api/companies", async (req, res) => {
+app.get("/api/companies", requireAuth, async (req, res) => {
   try {
     const q = await pool.query(`
       SELECT c.*, p.name AS plan_name, p.price AS plan_price, p.currency AS plan_currency
@@ -80,7 +80,7 @@ app.get("/api/companies", async (req, res) => {
   }
 });
 
-app.post("/api/companies", async (req, res) => {
+app.post("/api/companies", requireAdmin, async (req, res) => {
   try {
     const { name, contact_name, contact_email, contact_phone, plan_id, status, start_date, end_date, notes } = req.body;
     if (!name) return res.status(400).json({ ok: false, error: "name required" });
@@ -97,7 +97,7 @@ app.post("/api/companies", async (req, res) => {
   }
 });
 
-app.put("/api/companies/:id", async (req, res) => {
+app.put("/api/companies/:id", requireAdmin, async (req, res) => {
   try {
     const { name, contact_name, contact_email, contact_phone, plan_id, status, start_date, end_date, notes } = req.body;
     const q = await pool.query(
@@ -115,7 +115,7 @@ app.put("/api/companies/:id", async (req, res) => {
   }
 });
 
-app.delete("/api/companies/:id", async (req, res) => {
+app.delete("/api/companies/:id", requireAdmin, async (req, res) => {
   try {
     await pool.query(`DELETE FROM companies WHERE id=$1`, [req.params.id]);
     res.json({ ok: true });
@@ -130,7 +130,7 @@ app.delete("/api/companies/:id", async (req, res) => {
 ============================================================ */
 
 /* GET /api/subscription */
-app.get("/api/subscription", async (req, res) => {
+app.get("/api/subscription", requireAuth, async (req, res) => {
   try {
     const q = await pool.query(`SELECT * FROM subscription ORDER BY id DESC LIMIT 1`);
     res.json({ ok: true, subscription: q.rows[0] || null });
@@ -141,7 +141,7 @@ app.get("/api/subscription", async (req, res) => {
 });
 
 /* PUT /api/subscription  { plan, status, start_date, end_date, price, currency, notes, updated_by } */
-app.put("/api/subscription", async (req, res) => {
+app.put("/api/subscription", requireAdmin, async (req, res) => {
   try {
     const { plan, status, start_date, end_date, price, currency, notes, updated_by } = req.body;
     /* Ensure a row exists */
@@ -170,7 +170,7 @@ app.put("/api/subscription", async (req, res) => {
    BILLING PROFILE — single-row buyer info (Get / Update)
 ============================================================ */
 
-app.get("/api/billing-profile", async (req, res) => {
+app.get("/api/billing-profile", requireAuth, async (req, res) => {
   try {
     const q = await pool.query(`SELECT * FROM billing_profile ORDER BY id ASC LIMIT 1`);
     res.json({ ok: true, profile: q.rows[0] || null });
@@ -180,7 +180,7 @@ app.get("/api/billing-profile", async (req, res) => {
   }
 });
 
-app.put("/api/billing-profile", async (req, res) => {
+app.put("/api/billing-profile", requireAdmin, async (req, res) => {
   try {
     const { company_name, company_address, tax_id, contact_email, contact_phone, notes } = req.body;
     /* Ensure a row exists */
@@ -208,7 +208,7 @@ app.put("/api/billing-profile", async (req, res) => {
    INVOICES — list / get / create (immutable snapshots)
 ============================================================ */
 
-app.get("/api/invoices", async (req, res) => {
+app.get("/api/invoices", requireAuth, async (req, res) => {
   try {
     const q = await pool.query(`SELECT * FROM invoices ORDER BY id DESC LIMIT 500`);
     res.json({ ok: true, invoices: q.rows });
@@ -218,7 +218,7 @@ app.get("/api/invoices", async (req, res) => {
   }
 });
 
-app.get("/api/invoices/:id", async (req, res) => {
+app.get("/api/invoices/:id", requireAuth, async (req, res) => {
   try {
     const q = await pool.query(`SELECT * FROM invoices WHERE id=$1`, [req.params.id]);
     if (!q.rowCount) return res.status(404).json({ ok: false, error: "not_found" });
@@ -229,7 +229,7 @@ app.get("/api/invoices/:id", async (req, res) => {
   }
 });
 
-app.post("/api/invoices", async (req, res) => {
+app.post("/api/invoices", requireAdmin, async (req, res) => {
   try {
     const {
       issue_date, period_start, period_end,
