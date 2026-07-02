@@ -1,10 +1,10 @@
 module.exports = function registerTrainingLinkRoutes(app, deps = {}) {
-  const { pool, clampInt, normText, safeArr, normKey, todayISO, rollbackQuietly, sendDbError, requireAuth } = deps;
+  const { pool, clampInt, normText, safeArr, normKey, todayISO, rollbackQuietly, sendDbError } = deps;
 
 /* ============================================================
    Training Links API (UUID token system - still kept)
 ============================================================ */
-app.post("/api/training-links", requireAuth, async (req, res) => {
+app.post("/api/training-links", async (req, res) => {
   try {
     const reportId = Number(req.body?.reportId);
     const module = normText(req.body?.module || "");

@@ -2,7 +2,7 @@ const multer = require("multer");
 const cloudinary = require("cloudinary").v2;
 
 module.exports = function registerMediaRoutes(app, deps = {}) {
-  const { pool, requireAuth } = deps;
+  const { pool } = deps;
 
 /* --------- Cloudinary config (robust) --------- */
 (function configureCloudinary() {
@@ -132,9 +132,6 @@ function uploadBufferToCloudinary(buffer, opts = {}) {
   });
 }
 
-// Stays public: reached both by logged-in staff AND by external supplier/
-// training-link users submitting evidence with no session (InspectionEvidencePublic.jsx,
-// SupplierEvaluationPublic.jsx upload here directly).
 app.post("/api/images", uploadAny.any(), async (req, res) => {
   try {
     const cfg = cloudinary.config();
@@ -230,7 +227,7 @@ async function destroyOneByUrl(url) {
   });
 }
 
-app.delete("/api/images", requireAuth, async (req, res) => {
+app.delete("/api/images", async (req, res) => {
   try {
     const cfg = cloudinary.config();
     const missing = ["cloud_name", "api_key", "api_secret"].filter((k) => !cfg[k]);

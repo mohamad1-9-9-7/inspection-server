@@ -1,36 +1,22 @@
 module.exports = function registerReportsRoutes(app, deps = {}) {
-  const { pool, clampInt, normText, isObj, requireAuth, requireAdmin } = deps;
-
-/* Multi-tenant scoping: appends req.user.companyId to `params` and returns
-   a bare "company_id = $N" condition to AND into a WHERE clause. Super-admins
-   (companyId === null) get "" — unscoped, platform-wide visibility. */
-function companyScope(req, params) {
-  if (req.user?.isSuperAdmin && req.user.companyId == null) return "";
-  params.push(req.user.companyId);
-  return `company_id = $${params.length}`;
-}
+  const { pool, clampInt, normText, isObj } = deps;
 
 /* ============================================================
    Reports API
 ============================================================ */
-app.get("/api/reports", requireAuth, async (req, res) => {
+app.get("/api/reports", async (req, res) => {
   try {
     const { type } = req.query;
     const lite = String(req.query?.lite || "").toLowerCase();
     const isLite = lite === "1" || lite === "true" || lite === "yes";
     const limit = clampInt(req.query?.limit, 200, 1, 5000);
 
-    const params = [];
-    const conds = [];
-    if (type) { params.push(type); conds.push(`type = $${params.length}`); }
-    const cs = companyScope(req, params);
-    if (cs) conds.push(cs);
-    const where = conds.length ? `WHERE ${conds.join(" AND ")}` : "";
-    params.push(limit);
-    const limitPh = `$${params.length}`;
+    let q = "";
+    let params = [];
 
-    const q = isLite
-      ? `
+    if (isLite) {
+      if (type) {
+        q = `
           SELECT
             id,
             reporter,
@@ -40,11 +26,36 @@ app.get("/api/reports", requireAuth, async (req, res) => {
             payload->>'reportDate' AS "reportDate",
             payload->>'invoiceNo'  AS "invoiceNo"
           FROM reports
-          ${where}
+          WHERE type = $1
           ORDER BY created_at DESC
-          LIMIT ${limitPh}
-        `
-      : `SELECT * FROM reports ${where} ORDER BY created_at DESC LIMIT ${limitPh}`;
+          LIMIT $2
+        `;
+        params = [type, limit];
+      } else {
+        q = `
+          SELECT
+            id,
+            reporter,
+            type,
+            created_at,
+            updated_at,
+            payload->>'reportDate' AS "reportDate",
+            payload->>'invoiceNo'  AS "invoiceNo"
+          FROM reports
+          ORDER BY created_at DESC
+          LIMIT $1
+        `;
+        params = [limit];
+      }
+    } else {
+      if (type) {
+        q = `SELECT * FROM reports WHERE type=$1 ORDER BY created_at DESC LIMIT $2`;
+        params = [type, limit];
+      } else {
+        q = `SELECT * FROM reports ORDER BY created_at DESC LIMIT $1`;
+        params = [limit];
+      }
+    }
 
     const { rows } = await pool.query(q, params);
     res.json({ ok: true, data: rows });
@@ -54,7 +65,7 @@ app.get("/api/reports", requireAuth, async (req, res) => {
   }
 });
 
-app.post("/api/reports", requireAuth, async (req, res) => {
+app.post("/api/reports", async (req, res) => {
   try {
     const reporter = normText(req.body?.reporter || "anonymous");
     const type = normText(req.body?.type);
@@ -66,10 +77,10 @@ app.post("/api/reports", requireAuth, async (req, res) => {
     }
 
     const ins = await pool.query(
-      `INSERT INTO reports (reporter, type, payload, company_id)
-       VALUES ($1, $2, $3::jsonb, $4)
+      `INSERT INTO reports (reporter, type, payload)
+       VALUES ($1, $2, $3::jsonb)
        RETURNING *`,
-      [reporter, type, JSON.stringify(payload), req.user.companyId]
+      [reporter, type, JSON.stringify(payload)]
     );
 
     return res.status(201).json({ ok: true, report: ins.rows[0] });
@@ -86,7 +97,7 @@ app.post("/api/reports", requireAuth, async (req, res) => {
   }
 });
 
-app.put("/api/reports", requireAuth, async (req, res) => {
+app.put("/api/reports", async (req, res) => {
   try {
     const reporter = normText(req.body?.reporter || "anonymous");
     const type = normText(req.body?.type);
@@ -104,18 +115,14 @@ app.put("/api/reports", requireAuth, async (req, res) => {
 
     const payload = { ...payload0, reportDate };
 
-    const updParams = [reporter || null, JSON.stringify(payload), type, reportDate];
-    const cs = companyScope(req, updParams);
-    const whereCompany = cs ? ` AND ${cs}` : "";
-
     const upd = await pool.query(
       `UPDATE reports
           SET reporter = COALESCE($1, reporter),
               payload=$2::jsonb,
               updated_at=now()
-        WHERE type=$3 AND payload->>'reportDate'=$4${whereCompany}
+        WHERE type=$3 AND payload->>'reportDate'=$4
         RETURNING *`,
-      updParams
+      [reporter || null, JSON.stringify(payload), type, reportDate]
     );
 
     if (upd.rowCount > 0) {
@@ -123,10 +130,10 @@ app.put("/api/reports", requireAuth, async (req, res) => {
     }
 
     const ins = await pool.query(
-      `INSERT INTO reports (reporter, type, payload, company_id)
-       VALUES ($1, $2, $3::jsonb, $4)
+      `INSERT INTO reports (reporter, type, payload)
+       VALUES ($1, $2, $3::jsonb)
        RETURNING *`,
-      [reporter, type, JSON.stringify(payload), req.user.companyId]
+      [reporter, type, JSON.stringify(payload)]
     );
 
     return res.status(201).json({ ok: true, report: ins.rows[0], method: "insert" });
@@ -143,7 +150,7 @@ app.put("/api/reports", requireAuth, async (req, res) => {
   }
 });
 
-app.put("/api/reports/returns", requireAuth, async (req, res) => {
+app.put("/api/reports/returns", async (req, res) => {
   try {
     const reportDate = String(req.query.reportDate || "");
     const { items = [], _clientSavedAt } = req.body || {};
@@ -156,27 +163,23 @@ app.put("/api/reports/returns", requireAuth, async (req, res) => {
       _clientSavedAt: _clientSavedAt || Date.now(),
     };
 
-    const updParams = [payload, reportDate];
-    const cs = companyScope(req, updParams);
-    const whereCompany = cs ? ` AND ${cs}` : "";
-
     const upd = await pool.query(
       `UPDATE reports
           SET reporter = COALESCE(reporter,'anonymous'),
               payload=$1::jsonb,
               updated_at=now()
-        WHERE type='returns' AND payload->>'reportDate'=$2${whereCompany}
+        WHERE type='returns' AND payload->>'reportDate'=$2
         RETURNING *`,
-      updParams
+      [payload, reportDate]
     );
 
     if (upd.rowCount > 0) return res.json({ ok: true, report: upd.rows[0], method: "update" });
 
     const ins = await pool.query(
-      `INSERT INTO reports (reporter,type,payload,company_id)
-       VALUES ('anonymous','returns',$1::jsonb,$2)
+      `INSERT INTO reports (reporter,type,payload)
+       VALUES ('anonymous','returns',$1::jsonb)
        RETURNING *`,
-      [payload, req.user.companyId]
+      [payload]
     );
 
     return res.status(201).json({ ok: true, report: ins.rows[0], method: "insert" });
@@ -186,7 +189,7 @@ app.put("/api/reports/returns", requireAuth, async (req, res) => {
   }
 });
 
-app.put("/api/reports/qcs", requireAuth, async (req, res) => {
+app.put("/api/reports/qcs", async (req, res) => {
   try {
     const reportDate = String(req.query.reportDate || "");
     const { details = {}, _clientSavedAt } = req.body || {};
@@ -198,26 +201,22 @@ app.put("/api/reports/qcs", requireAuth, async (req, res) => {
       _clientSavedAt: _clientSavedAt || Date.now(),
     };
 
-    const updParams = [payload, reportDate];
-    const cs = companyScope(req, updParams);
-    const whereCompany = cs ? ` AND ${cs}` : "";
-
     const upd = await pool.query(
       `UPDATE reports
           SET reporter = COALESCE(reporter,'anonymous'),
               payload=$1::jsonb,
               updated_at=now()
-        WHERE type='qcs' AND payload->>'reportDate'=$2${whereCompany}
+        WHERE type='qcs' AND payload->>'reportDate'=$2
         RETURNING *`,
-      updParams
+      [payload, reportDate]
     );
     if (upd.rowCount > 0) return res.json({ ok: true, report: upd.rows[0], method: "update" });
 
     const ins = await pool.query(
-      `INSERT INTO reports (reporter,type,payload,company_id)
-       VALUES ('anonymous','qcs',$1::jsonb,$2)
+      `INSERT INTO reports (reporter,type,payload)
+       VALUES ('anonymous','qcs',$1::jsonb)
        RETURNING *`,
-      [payload, req.user.companyId]
+      [payload]
     );
     return res.status(201).json({ ok: true, report: ins.rows[0], method: "insert" });
   } catch (e) {
@@ -226,7 +225,7 @@ app.put("/api/reports/qcs", requireAuth, async (req, res) => {
   }
 });
 
-app.put("/api/reports/:type([A-Za-z_][A-Za-z0-9_-]*)", requireAuth, async (req, res) => {
+app.put("/api/reports/:type([A-Za-z_][A-Za-z0-9_-]*)", async (req, res) => {
   try {
     const type = normText(req.params.type);
     if (!type) return res.status(400).json({ ok: false, error: "type param required" });
@@ -250,18 +249,14 @@ app.put("/api/reports/:type([A-Za-z_][A-Za-z0-9_-]*)", requireAuth, async (req, 
     payload.reportDate = reportDate;
     const reporter = normText(req.body?.reporter || "anonymous");
 
-    const updParams = [reporter || null, JSON.stringify(payload), type, reportDate];
-    const cs = companyScope(req, updParams);
-    const whereCompany = cs ? ` AND ${cs}` : "";
-
     const upd = await pool.query(
       `UPDATE reports
           SET reporter = COALESCE($1, reporter),
               payload=$2::jsonb,
               updated_at=now()
-        WHERE type=$3 AND payload->>'reportDate'=$4${whereCompany}
+        WHERE type=$3 AND payload->>'reportDate'=$4
         RETURNING *`,
-      updParams
+      [reporter || null, JSON.stringify(payload), type, reportDate]
     );
 
     if (upd.rowCount > 0) {
@@ -269,10 +264,10 @@ app.put("/api/reports/:type([A-Za-z_][A-Za-z0-9_-]*)", requireAuth, async (req, 
     }
 
     const ins = await pool.query(
-      `INSERT INTO reports (reporter, type, payload, company_id)
-       VALUES ($1, $2, $3::jsonb, $4)
+      `INSERT INTO reports (reporter, type, payload)
+       VALUES ($1, $2, $3::jsonb)
        RETURNING *`,
-      [reporter, type, JSON.stringify(payload), req.user.companyId]
+      [reporter, type, JSON.stringify(payload)]
     );
 
     return res.status(201).json({ ok: true, report: ins.rows[0], method: "insert" });
@@ -282,18 +277,14 @@ app.put("/api/reports/:type([A-Za-z_][A-Za-z0-9_-]*)", requireAuth, async (req, 
   }
 });
 
-app.get("/api/reports/:id(\\d+)", requireAuth, async (req, res) => {
+app.get("/api/reports/:id(\\d+)", async (req, res) => {
   try {
     const id = Number(req.params.id);
     if (!Number.isFinite(id) || id <= 0) {
       return res.status(400).json({ ok: false, error: "bad id" });
     }
 
-    const params = [id];
-    const cs = companyScope(req, params);
-    const whereCompany = cs ? ` AND ${cs}` : "";
-
-    const q = await pool.query(`SELECT * FROM reports WHERE id=$1${whereCompany}`, params);
+    const q = await pool.query(`SELECT * FROM reports WHERE id=$1`, [id]);
     if (!q.rowCount) return res.status(404).json({ ok: false, error: "not found" });
 
     return res.json({ ok: true, report: q.rows[0] });
@@ -303,7 +294,7 @@ app.get("/api/reports/:id(\\d+)", requireAuth, async (req, res) => {
   }
 });
 
-app.patch("/api/reports/:id(\\d+)", requireAuth, async (req, res) => {
+app.patch("/api/reports/:id(\\d+)", async (req, res) => {
   try {
     const id = Number(req.params.id);
     if (!Number.isFinite(id) || id <= 0) return res.status(400).json({ ok: false, error: "bad id" });
@@ -315,18 +306,14 @@ app.patch("/api/reports/:id(\\d+)", requireAuth, async (req, res) => {
       return res.status(400).json({ ok: false, error: "payload object required" });
     }
 
-    const updParams = [JSON.stringify(payload), reporter ? String(reporter) : null, id];
-    const cs = companyScope(req, updParams);
-    const whereCompany = cs ? ` AND ${cs}` : "";
-
     const upd = await pool.query(
       `UPDATE reports
           SET payload=$1::jsonb,
               reporter=COALESCE($2, reporter),
               updated_at=now()
-        WHERE id=$3${whereCompany}
+        WHERE id=$3
         RETURNING *`,
-      updParams
+      [JSON.stringify(payload), reporter ? String(reporter) : null, id]
     );
 
     if (!upd.rowCount) return res.status(404).json({ ok: false, error: "not found" });
@@ -337,7 +324,7 @@ app.patch("/api/reports/:id(\\d+)", requireAuth, async (req, res) => {
   }
 });
 
-app.put("/api/reports/:id(\\d+)", requireAuth, async (req, res) => {
+app.put("/api/reports/:id(\\d+)", async (req, res) => {
   try {
     const id = Number(req.params.id);
     if (!Number.isFinite(id) || id <= 0) {
@@ -351,18 +338,14 @@ app.put("/api/reports/:id(\\d+)", requireAuth, async (req, res) => {
       return res.status(400).json({ ok: false, error: "payload object required" });
     }
 
-    const updParams = [type || null, JSON.stringify(payload), id];
-    const cs = companyScope(req, updParams);
-    const whereCompany = cs ? ` AND ${cs}` : "";
-
     const upd = await pool.query(
       `UPDATE reports
           SET type = COALESCE(NULLIF($1,''), type),
               payload=$2::jsonb,
               updated_at=now()
-        WHERE id=$3${whereCompany}
+        WHERE id=$3
         RETURNING *`,
-      updParams
+      [type || null, JSON.stringify(payload), id]
     );
 
     if (!upd.rowCount) return res.status(404).json({ ok: false, error: "not found" });
@@ -380,19 +363,15 @@ app.put("/api/reports/:id(\\d+)", requireAuth, async (req, res) => {
   }
 });
 
-app.delete("/api/reports", requireAdmin, async (req, res) => {
+app.delete("/api/reports", async (req, res) => {
   try {
     const { type, reportDate } = req.query;
     if (!type || !reportDate) return res.status(400).json({ ok: false, error: "type & reportDate required" });
 
-    const params = [type, reportDate];
-    const cs = companyScope(req, params);
-    const whereCompany = cs ? ` AND ${cs}` : "";
-
-    const { rowCount } = await pool.query(
-      `DELETE FROM reports WHERE type=$1 AND payload->>'reportDate'=$2${whereCompany}`,
-      params
-    );
+    const { rowCount } = await pool.query(`DELETE FROM reports WHERE type=$1 AND payload->>'reportDate'=$2`, [
+      type,
+      reportDate,
+    ]);
     res.json({ ok: true, deleted: rowCount });
   } catch (e) {
     console.error(e);
@@ -400,13 +379,9 @@ app.delete("/api/reports", requireAdmin, async (req, res) => {
   }
 });
 
-app.delete("/api/reports/:id(\\d+)", requireAdmin, async (req, res) => {
+app.delete("/api/reports/:id(\\d+)", async (req, res) => {
   try {
-    const params = [Number(req.params.id)];
-    const cs = companyScope(req, params);
-    const whereCompany = cs ? ` AND ${cs}` : "";
-
-    const { rowCount } = await pool.query(`DELETE FROM reports WHERE id=$1${whereCompany}`, params);
+    const { rowCount } = await pool.query(`DELETE FROM reports WHERE id=$1`, [Number(req.params.id)]);
     if (!rowCount) return res.status(404).json({ ok: false, error: "not found" });
     res.json({ ok: true, deleted: rowCount });
   } catch (e) {

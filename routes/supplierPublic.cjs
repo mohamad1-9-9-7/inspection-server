@@ -1,5 +1,5 @@
 module.exports = function registerSupplierPublicRoutes(app, deps = {}) {
-  const { pool, clampInt, normText, todayISO, safeObj, isObj, rollbackQuietly, sendDbError, requireAuth } = deps;
+  const { pool, clampInt, normText, todayISO, safeObj, isObj, rollbackQuietly, sendDbError } = deps;
 
 /* ======================================================================
    Supplier Links API (UUID token system)
@@ -36,7 +36,7 @@ function cleanJsonbArray(value) {
   return Array.isArray(cleaned) ? cleaned : [];
 }
 
-app.post("/api/supplier-links", requireAuth, async (req, res) => {
+app.post("/api/supplier-links", async (req, res) => {
   try {
     const reportId = Number(req.body?.reportId);
     const expiresInDays = clampInt(req.body?.expiresInDays, 14, 1, 120);

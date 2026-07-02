@@ -26,8 +26,33 @@ module.exports = async function ensureSchema({ pool, genSalt, hashPw }) {
 
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_reports_type ON reports(type);`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_reports_created_at ON reports(created_at);`);
-  // NOTE: the unique (company_id, type, reportDate) index is created further down,
-  // after the `companies` table and `reports.company_id` column exist.
+
+  // One report per (type, reportDate) — EXCEPT 'maintenance', which has many
+  // requests per day (each identified by its own requestNo). Migrate any old
+  // non-partial index to the partial form. Idempotent / safe to run every boot.
+  await pool.query(`
+    DO $$
+    DECLARE
+      def text;
+    BEGIN
+      SELECT indexdef INTO def FROM pg_indexes
+        WHERE schemaname='public' AND indexname='ux_reports_type_reportdate';
+
+      IF def IS NOT NULL AND position('WHERE' IN upper(def)) = 0 THEN
+        -- existing index is the old GLOBAL one → drop so we can make it partial
+        EXECUTE 'DROP INDEX ux_reports_type_reportdate';
+      END IF;
+
+      IF NOT EXISTS (
+        SELECT 1 FROM pg_indexes
+         WHERE schemaname='public' AND indexname='ux_reports_type_reportdate'
+      ) THEN
+        EXECUTE 'CREATE UNIQUE INDEX ux_reports_type_reportdate '
+             || 'ON reports (type, ((payload->>''reportDate''))) '
+             || 'WHERE type <> ''maintenance''';
+      END IF;
+    END $$;
+  `);
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS product_catalog (
@@ -218,48 +243,6 @@ module.exports = async function ensureSchema({ pool, genSalt, hashPw }) {
        AND is_super_admin = false
   `);
 
-  /* ── Multi-tenant: link reports → companies ──
-     Every report belongs to exactly one company; NULL only exists transiently
-     for legacy rows before the backfill below runs. */
-  await pool.query(`
-    ALTER TABLE reports
-      ADD COLUMN IF NOT EXISTS company_id INT REFERENCES companies(id) ON DELETE SET NULL
-  `);
-  await pool.query(`CREATE INDEX IF NOT EXISTS idx_reports_company_id ON reports(company_id)`);
-  await pool.query(`
-    UPDATE reports
-       SET company_id = (SELECT id FROM companies ORDER BY id ASC LIMIT 1)
-     WHERE company_id IS NULL
-  `);
-
-  // One report per (company_id, type, reportDate) — EXCEPT 'maintenance', which has
-  // many requests per day (each identified by its own requestNo). Migrate any old
-  // index (global, or pre-multi-tenant without company_id) to this form.
-  // Idempotent / safe to run every boot.
-  await pool.query(`
-    DO $$
-    DECLARE
-      def text;
-    BEGIN
-      SELECT indexdef INTO def FROM pg_indexes
-        WHERE schemaname='public' AND indexname='ux_reports_type_reportdate';
-
-      IF def IS NOT NULL AND (position('WHERE' IN upper(def)) = 0 OR position('COMPANY_ID' IN upper(def)) = 0) THEN
-        -- existing index is the old GLOBAL one, or predates company_id → drop so we can rebuild it
-        EXECUTE 'DROP INDEX ux_reports_type_reportdate';
-      END IF;
-
-      IF NOT EXISTS (
-        SELECT 1 FROM pg_indexes
-         WHERE schemaname='public' AND indexname='ux_reports_type_reportdate'
-      ) THEN
-        EXECUTE 'CREATE UNIQUE INDEX ux_reports_type_reportdate '
-             || 'ON reports (company_id, type, ((payload->>''reportDate''))) '
-             || 'WHERE type <> ''maintenance''';
-      END IF;
-    END $$;
-  `);
-
   /* ── Seed default admin if table is empty ── */
   const existsAdmin = await pool.query(`SELECT 1 FROM app_users WHERE username='admin' LIMIT 1`);
   if (!existsAdmin.rowCount) {
@@ -369,17 +352,4 @@ module.exports = async function ensureSchema({ pool, genSalt, hashPw }) {
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_email_hist_sent_at     ON email_history(sent_at DESC);`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_email_hist_report_type ON email_history(report_type);`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_email_hist_sent_by     ON email_history(sent_by);`);
-
-  /* ── Sessions — server-issued bearer tokens for logged-in app users ── */
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS sessions (
-      id         UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
-      user_id    UUID        NOT NULL REFERENCES app_users(id) ON DELETE CASCADE,
-      token      TEXT        NOT NULL UNIQUE,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-      expires_at TIMESTAMPTZ NOT NULL
-    );
-  `);
-  await pool.query(`CREATE INDEX IF NOT EXISTS idx_sessions_token ON sessions(token);`);
-  await pool.query(`CREATE INDEX IF NOT EXISTS idx_sessions_user_id ON sessions(user_id);`);
 }

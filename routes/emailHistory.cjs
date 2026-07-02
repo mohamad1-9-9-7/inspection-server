@@ -1,12 +1,12 @@
 module.exports = function registerEmailHistoryRoutes(app, deps = {}) {
-  const { pool, requireAuth, requireAdmin } = deps;
+  const { pool } = deps;
 
 /* ════════════════════════════════════════════════════════════
    EMAIL HISTORY — log + list + stats + cleanup
 ═════════════════════════════════════════════════════════════ */
 
 /* Log a single email send. Called by the frontend after each successful send. */
-app.post("/api/email-history", requireAuth, async (req, res) => {
+app.post("/api/email-history", async (req, res) => {
   try {
     const f = req.body || {};
     const toEmails  = Array.isArray(f.to_emails)  ? f.to_emails  : [];
@@ -49,7 +49,7 @@ app.post("/api/email-history", requireAuth, async (req, res) => {
 });
 
 /* List with filters. All filters optional. Pagination via limit + before_id cursor. */
-app.get("/api/email-history", requireAuth, async (req, res) => {
+app.get("/api/email-history", async (req, res) => {
   try {
     const limit = Math.min(Math.max(parseInt(req.query.limit) || 100, 1), 500);
     const where = [];
@@ -92,7 +92,7 @@ app.get("/api/email-history", requireAuth, async (req, res) => {
 });
 
 /* Aggregated stats for the Analytics dashboard. Returns last `days` (default 30). */
-app.get("/api/email-history/stats", requireAuth, async (req, res) => {
+app.get("/api/email-history/stats", async (req, res) => {
   try {
     const days = Math.min(Math.max(parseInt(req.query.days) || 30, 1), 365);
 
@@ -173,7 +173,7 @@ app.get("/api/email-history/stats", requireAuth, async (req, res) => {
 });
 
 /* Delete a single log entry (admin housekeeping). */
-app.delete("/api/email-history/:id", requireAdmin, async (req, res) => {
+app.delete("/api/email-history/:id", async (req, res) => {
   try {
     await pool.query(`DELETE FROM email_history WHERE id=$1`, [req.params.id]);
     res.json({ ok: true });
@@ -184,7 +184,7 @@ app.delete("/api/email-history/:id", requireAdmin, async (req, res) => {
 });
 
 /* Bulk cleanup: delete entries older than `before` (YYYY-MM-DD). Manual only. */
-app.delete("/api/email-history", requireAdmin, async (req, res) => {
+app.delete("/api/email-history", async (req, res) => {
   try {
     const before = req.query.before;
     if (!before) return res.status(400).json({ ok: false, error: "before_required" });
