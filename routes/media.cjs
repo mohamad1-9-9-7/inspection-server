@@ -95,6 +95,12 @@ app.get("/api/files/proxy", async (req, res) => {
 });
 
 /* --------- Health routes --------- */
+/* Lightweight liveness check for uptime monitors — does NOT touch the DB,
+   so it never wakes Neon out of autosuspend. Point UptimeRobot here. */
+app.get("/healthz", (_req, res) => {
+  res.json({ ok: true, uptime: Math.round(process.uptime()) });
+});
+
 app.get("/health/db", async (_req, res) => {
   try {
     await pool.query("SELECT 1");

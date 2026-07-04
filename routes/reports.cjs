@@ -7,6 +7,14 @@ module.exports = function registerReportsRoutes(app, deps = {}) {
 app.get("/api/reports", async (req, res) => {
   try {
     const { type } = req.query;
+
+    // Liveness probes (server wake-up banner + ServerHealth tool) only care
+    // whether the process responds — they must NOT query the DB, otherwise
+    // they wake Neon out of autosuspend and run up compute cost.
+    if (type === "__ping__" || type === "__health_probe__") {
+      return res.json([]);
+    }
+
     const lite = String(req.query?.lite || "").toLowerCase();
     const isLite = lite === "1" || lite === "true" || lite === "yes";
     const limit = clampInt(req.query?.limit, 200, 1, 5000);
