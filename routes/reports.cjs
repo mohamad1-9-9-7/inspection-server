@@ -1,23 +1,65 @@
 module.exports = function registerReportsRoutes(app, deps = {}) {
-  const { pool, clampInt, normText, isObj } = deps;
+  const { pool, clampInt, normText, isObj, requireAuth } = deps;
+
+  // Fallback no-op if the middleware wasn't wired in (keeps routes working
+  // on an older deps shape); real enforcement comes from utils/requireAuth.
+  const auth = typeof requireAuth === "function" ? requireAuth : (_req, _res, next) => next();
+
+  // Liveness probes (server wake-up banner + ServerHealth tool) only care
+  // whether the process responds — they must NOT query the DB (would wake
+  // Neon out of autosuspend) AND must skip auth (they carry no token).
+  const pingBypass = (req, res, next) => {
+    const t = req.query?.type;
+    if (t === "__ping__" || t === "__health_probe__") return res.json([]);
+    next();
+  };
 
 /* ============================================================
-   Reports API
+   Reports API  (all routes gated by `auth` — audit or enforce
+   depending on REQUIRE_AUTH; ping probes bypass via pingBypass)
 ============================================================ */
-app.get("/api/reports", async (req, res) => {
+app.get("/api/reports", pingBypass, auth, async (req, res) => {
   try {
     const { type } = req.query;
-
-    // Liveness probes (server wake-up banner + ServerHealth tool) only care
-    // whether the process responds — they must NOT query the DB, otherwise
-    // they wake Neon out of autosuspend and run up compute cost.
-    if (type === "__ping__" || type === "__health_probe__") {
-      return res.json([]);
-    }
 
     const lite = String(req.query?.lite || "").toLowerCase();
     const isLite = lite === "1" || lite === "true" || lite === "yes";
     const limit = clampInt(req.query?.limit, 200, 1, 5000);
+
+    const truthy = (v) => ["1", "true", "yes"].includes(String(v || "").toLowerCase());
+
+    // `?type=X&dates=1` — the calendar of a report type: one { id, reportDate }
+    // per record, no payload and no LIMIT. A few hundred date strings weigh
+    // nothing, while `SELECT *` on the same rows drags every JSON payload across
+    // the wire. Backs the Date Tree; the id lets the client then fetch exactly
+    // the record the user clicked via GET /api/reports/:id.
+    //
+    // Callers send `&lite=1&limit=5000` alongside, so a server that predates
+    // this branch still answers with the same { id, reportDate } shape.
+    if (truthy(req.query?.dates) && type) {
+      const { rows } = await pool.query(
+        `SELECT id, payload->>'reportDate' AS "reportDate"
+           FROM reports
+          WHERE type = $1 AND payload->>'reportDate' IS NOT NULL
+          ORDER BY payload->>'reportDate' DESC, created_at DESC`,
+        [type]
+      );
+      return res.json({ ok: true, data: rows });
+    }
+
+    // `?type=X&reportDate=YYYY-MM-DD` — the one record the user opened.
+    // Hits ux_reports_type_reportdate directly.
+    const reportDate = normText(req.query?.reportDate || "");
+    if (type && reportDate) {
+      const { rows } = await pool.query(
+        `SELECT * FROM reports
+          WHERE type = $1 AND payload->>'reportDate' = $2
+          ORDER BY created_at DESC
+          LIMIT 1`,
+        [type, reportDate]
+      );
+      return res.json({ ok: true, data: rows });
+    }
 
     let q = "";
     let params = [];
@@ -73,7 +115,7 @@ app.get("/api/reports", async (req, res) => {
   }
 });
 
-app.post("/api/reports", async (req, res) => {
+app.post("/api/reports", auth, async (req, res) => {
   try {
     const reporter = normText(req.body?.reporter || "anonymous");
     const type = normText(req.body?.type);
@@ -105,7 +147,7 @@ app.post("/api/reports", async (req, res) => {
   }
 });
 
-app.put("/api/reports", async (req, res) => {
+app.put("/api/reports", auth, async (req, res) => {
   try {
     const reporter = normText(req.body?.reporter || "anonymous");
     const type = normText(req.body?.type);
@@ -158,7 +200,7 @@ app.put("/api/reports", async (req, res) => {
   }
 });
 
-app.put("/api/reports/returns", async (req, res) => {
+app.put("/api/reports/returns", auth, async (req, res) => {
   try {
     const reportDate = String(req.query.reportDate || "");
     const { items = [], _clientSavedAt } = req.body || {};
@@ -197,7 +239,7 @@ app.put("/api/reports/returns", async (req, res) => {
   }
 });
 
-app.put("/api/reports/qcs", async (req, res) => {
+app.put("/api/reports/qcs", auth, async (req, res) => {
   try {
     const reportDate = String(req.query.reportDate || "");
     const { details = {}, _clientSavedAt } = req.body || {};
@@ -233,7 +275,7 @@ app.put("/api/reports/qcs", async (req, res) => {
   }
 });
 
-app.put("/api/reports/:type([A-Za-z_][A-Za-z0-9_-]*)", async (req, res) => {
+app.put("/api/reports/:type([A-Za-z_][A-Za-z0-9_-]*)", auth, async (req, res) => {
   try {
     const type = normText(req.params.type);
     if (!type) return res.status(400).json({ ok: false, error: "type param required" });
@@ -285,7 +327,7 @@ app.put("/api/reports/:type([A-Za-z_][A-Za-z0-9_-]*)", async (req, res) => {
   }
 });
 
-app.get("/api/reports/:id(\\d+)", async (req, res) => {
+app.get("/api/reports/:id(\\d+)", auth, async (req, res) => {
   try {
     const id = Number(req.params.id);
     if (!Number.isFinite(id) || id <= 0) {
@@ -302,7 +344,7 @@ app.get("/api/reports/:id(\\d+)", async (req, res) => {
   }
 });
 
-app.patch("/api/reports/:id(\\d+)", async (req, res) => {
+app.patch("/api/reports/:id(\\d+)", auth, async (req, res) => {
   try {
     const id = Number(req.params.id);
     if (!Number.isFinite(id) || id <= 0) return res.status(400).json({ ok: false, error: "bad id" });
@@ -332,7 +374,7 @@ app.patch("/api/reports/:id(\\d+)", async (req, res) => {
   }
 });
 
-app.put("/api/reports/:id(\\d+)", async (req, res) => {
+app.put("/api/reports/:id(\\d+)", auth, async (req, res) => {
   try {
     const id = Number(req.params.id);
     if (!Number.isFinite(id) || id <= 0) {
@@ -371,7 +413,7 @@ app.put("/api/reports/:id(\\d+)", async (req, res) => {
   }
 });
 
-app.delete("/api/reports", async (req, res) => {
+app.delete("/api/reports", auth, async (req, res) => {
   try {
     const { type, reportDate } = req.query;
     if (!type || !reportDate) return res.status(400).json({ ok: false, error: "type & reportDate required" });
@@ -387,7 +429,7 @@ app.delete("/api/reports", async (req, res) => {
   }
 });
 
-app.delete("/api/reports/:id(\\d+)", async (req, res) => {
+app.delete("/api/reports/:id(\\d+)", auth, async (req, res) => {
   try {
     const { rowCount } = await pool.query(`DELETE FROM reports WHERE id=$1`, [Number(req.params.id)]);
     if (!rowCount) return res.status(404).json({ ok: false, error: "not found" });

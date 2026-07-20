@@ -332,6 +332,32 @@ app.get("/api/reports/public/:token", async (req, res) => {
   }
 });
 
+/* Best-effort: record the first time a supplier opened the link.
+   Public (no auth) but strictly scoped — it ONLY ever writes
+   payload.public.openedAt on the report that owns this token, and only
+   once (WHERE openedAt IS NULL). No client-supplied payload is trusted,
+   so the generic PUT /api/reports/:id can stay behind requireAuth. */
+app.post("/api/reports/public/:token/opened", async (req, res) => {
+  try {
+    const token = normText(req.params.token || "");
+    if (!token) return res.status(400).json({ ok: false, error: "token required" });
+
+    const upd = await pool.query(
+      `UPDATE reports
+          SET payload = jsonb_set(payload, '{public,openedAt}', to_jsonb($2::text), true),
+              updated_at = now()
+        WHERE (payload->'public'->>'token') = $1
+          AND (payload->'public'->>'openedAt') IS NULL`,
+      [token, new Date().toISOString()]
+    );
+    return res.json({ ok: true, updated: upd.rowCount });
+  } catch (e) {
+    console.error("POST /api/reports/public/:token/opened ERROR =", e);
+    // never fail the supplier's page open over a tracking write
+    return res.json({ ok: true, updated: 0 });
+  }
+});
+
 /* ✅ UPDATED submit: supports recordDate + fieldAttachments */
 app.post("/api/reports/public/:token/submit", async (req, res) => {
   let client;

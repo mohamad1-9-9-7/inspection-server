@@ -8,6 +8,8 @@ const ensureSchema = require("./db/schema.cjs");
 const common = require("./utils/common.cjs");
 const password = require("./utils/password.cjs");
 const rateLimit = require("./utils/rateLimit.cjs");
+const token = require("./utils/token.cjs");
+const { requireAuth } = require("./utils/requireAuth.cjs");
 
 const registerReportsRoutes = require("./routes/reports.cjs");
 const registerSupplierPublicRoutes = require("./routes/supplierPublic.cjs");
@@ -18,6 +20,7 @@ const registerMediaRoutes = require("./routes/media.cjs");
 const registerAdminRoutes = require("./routes/admin.cjs");
 const registerBillingRoutes = require("./routes/billing.cjs");
 const registerEmailHistoryRoutes = require("./routes/emailHistory.cjs");
+const registerMailerRoutes = require("./routes/mailer.cjs");
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -50,6 +53,8 @@ const deps = {
   ...common,
   ...password,
   ...rateLimit,
+  ...token,
+  requireAuth,
 };
 
 registerReportsRoutes(app, deps);
@@ -61,6 +66,7 @@ registerMediaRoutes(app, deps);
 registerAdminRoutes(app, deps);
 registerBillingRoutes(app, deps);
 registerEmailHistoryRoutes(app, deps);
+registerMailerRoutes(app, deps);
 
 ensureSchema({ pool, genSalt: password.genSalt, hashPw: password.hashPw })
   .then(() =>

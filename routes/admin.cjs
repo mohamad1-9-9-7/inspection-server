@@ -1,5 +1,5 @@
 module.exports = function registerAdminRoutes(app, deps = {}) {
-  const { pool, clampInt, normText, rlCheck, rlReset, genSalt, hashPw, verifyPw } = deps;
+  const { pool, clampInt, normText, rlCheck, rlReset, genSalt, hashPw, verifyPw, signToken } = deps;
   const SCRYPT_PFX = "scrypt:";
 
 /* --------- Auth: verify role password --------- */
@@ -239,8 +239,22 @@ app.post("/api/auth/login", async (req, res) => {
       [user.id, user.username, JSON.stringify({ displayName: user.display_name }), ip]
     );
 
+    /* ── Issue a stateless session token (empty string if AUTH_SECRET unset) ──
+       The client (authFetch) attaches it as `Authorization: Bearer <token>`
+       on every API call; the reports routes verify it. */
+    const authToken = typeof signToken === "function"
+      ? signToken({
+          uid:          user.id,
+          username:     user.username,
+          isAdmin:      !!user.is_admin,
+          isSuperAdmin: !!user.is_super_admin,
+          companyId:    user.company_id || null,
+        })
+      : "";
+
     res.json({
       ok: true,
+      token: authToken,
       user: {
         id:              user.id,
         username:        user.username,
