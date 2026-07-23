@@ -22,6 +22,24 @@ try {
   console.warn("[mailer] nodemailer not installed — /api/email/send will report not_configured");
 }
 
+/* MailComposer ships inside nodemailer — lets us build the raw MIME of an
+   outgoing message so we can drop an identical copy into the IMAP Sent folder. */
+let MailComposer = null;
+try {
+  MailComposer = require("nodemailer/lib/mail-composer");
+} catch {
+  /* nodemailer missing — already warned above. */
+}
+
+/* imapflow is optional. When present (and IMAP_* configured) every successful
+   send also gets appended to the Sent folder so it shows up in Outlook. */
+let ImapFlow = null;
+try {
+  ({ ImapFlow } = require("imapflow"));
+} catch {
+  console.warn("[mailer] imapflow not installed — sent copies won't be saved to the Sent folder");
+}
+
 /* Kept below express's 20 MB JSON limit (20 MB of base64 ≈ 15 MB binary) so
    oversized payloads get this friendly JSON error rather than the body-parser
    HTML 413 the client can't parse. */
@@ -72,6 +90,91 @@ function smtpConfig() {
     fromName: String(envVar("FROM_NAME") || "").trim(),
     configured: Boolean(host && user && pass && nodemailer),
   };
+}
+
+/* IMAP settings for saving a copy in Sent. Falls back to the SMTP mailbox so a
+   single set of credentials works: IMAP_HOST defaults to MAIL_HOST, the user and
+   password default to MAIL_USER / MAIL_PASS, port defaults to 993 (implicit TLS).
+   Set IMAP_SAVE_SENT=false to turn the whole feature off. */
+function imapConfig() {
+  const smtp = smtpConfig();
+  const host = String(process.env.IMAP_HOST || smtp.host || "").trim();
+  const user = String(process.env.IMAP_USER || smtp.user || "").trim();
+  const pass = process.env.IMAP_PASS != null && process.env.IMAP_PASS !== ""
+    ? String(process.env.IMAP_PASS)
+    : smtp.pass;
+  const port = Number(process.env.IMAP_PORT) || 993;
+  const rawSecure = process.env.IMAP_SECURE;
+  const secure = rawSecure != null
+    ? String(rawSecure).toLowerCase() === "true"
+    : port === 993;
+  /* Explicit override of the Sent mailbox name, if auto-detection ever misses. */
+  const sentBox = String(process.env.IMAP_SENT_MAILBOX || "").trim();
+  const enabled = String(process.env.IMAP_SAVE_SENT || "true").toLowerCase() !== "false";
+  return {
+    host, port, secure, user, pass, sentBox, enabled,
+    configured: Boolean(host && user && pass && ImapFlow),
+  };
+}
+
+/* Build the raw MIME bytes of the message we just sent. */
+function buildRaw(mailOptions) {
+  return new Promise((resolve, reject) => {
+    if (!MailComposer) return reject(new Error("MailComposer unavailable"));
+    new MailComposer(mailOptions).compile().build((err, message) =>
+      err ? reject(err) : resolve(message)
+    );
+  });
+}
+
+/* Best-effort: append a copy of the sent message to the IMAP Sent folder so it
+   appears in Outlook. Never throws — a failure here must not fail the send. */
+async function saveToSent(mailOptions) {
+  const cfg = imapConfig();
+  if (!cfg.enabled) return { saved: false, reason: "disabled" };
+  if (!cfg.configured) return { saved: false, reason: "not_configured" };
+
+  let client;
+  try {
+    const raw = await buildRaw(mailOptions);
+    client = new ImapFlow({
+      host: cfg.host,
+      port: cfg.port,
+      secure: cfg.secure,
+      auth: { user: cfg.user, pass: cfg.pass },
+      logger: false,
+      connectTimeout: 20_000,
+      greetingTimeout: 20_000,
+      socketTimeout: 60_000,
+    });
+    await client.connect();
+
+    /* Find the Sent folder: prefer the one flagged \Sent, then fall back to the
+       usual names across Outlook / cPanel / Dovecot servers. */
+    let mailbox = cfg.sentBox;
+    if (!mailbox) {
+      const boxes = await client.list();
+      const flagged = boxes.find(
+        (b) => Array.isArray(b.flags) && b.flags.includes("\\Sent")
+      ) || boxes.find((b) => b.specialUse === "\\Sent");
+      if (flagged) {
+        mailbox = flagged.path;
+      } else {
+        const names = new Set(boxes.map((b) => b.path));
+        mailbox = ["Sent", "Sent Items", "INBOX.Sent", "INBOX.Sent Items"]
+          .find((n) => names.has(n)) || "Sent";
+      }
+    }
+
+    /* \Seen so the copy isn't shown as unread; internal date = now. */
+    await client.append(mailbox, raw, ["\\Seen"], new Date());
+    return { saved: true, mailbox };
+  } catch (e) {
+    console.error("[mailer] saveToSent failed:", e?.message || e);
+    return { saved: false, reason: String(e?.message || e).slice(0, 200) };
+  } finally {
+    try { if (client) await client.logout(); } catch { /* ignore */ }
+  }
 }
 
 let _transporter = null;
@@ -196,22 +299,32 @@ module.exports = function registerMailerRoutes(app, deps = {}) {
     if (b.priority === "high") { headers["X-Priority"] = "1"; headers.Importance = "High"; }
     else if (b.priority === "low") { headers["X-Priority"] = "5"; headers.Importance = "Low"; }
 
+    const mailOptions = {
+      from: cfg.fromName ? `"${cfg.fromName}" <${cfg.user}>` : cfg.user,
+      to, cc, bcc,
+      subject,
+      html: b.html ? String(b.html) : undefined,
+      text: b.text ? String(b.text) : undefined,
+      attachments,
+      headers,
+    };
+
     try {
-      const info = await getTransporter(cfg).sendMail({
-        from: cfg.fromName ? `"${cfg.fromName}" <${cfg.user}>` : cfg.user,
-        to, cc, bcc,
-        subject,
-        html: b.html ? String(b.html) : undefined,
-        text: b.text ? String(b.text) : undefined,
-        attachments,
-        headers,
-      });
+      const info = await getTransporter(cfg).sendMail(mailOptions);
       console.log(`[mailer] sent "${subject}" → ${to.length + cc.length + bcc.length} recipient(s), ${attachments.length} attachment(s)`);
+
+      /* Save a copy in the Sent folder so it shows up in Outlook. Best-effort:
+         the send already succeeded, so we never let this turn it into a failure. */
+      const sent = await saveToSent(mailOptions);
+      if (sent.saved) console.log(`[mailer] copy saved to "${sent.mailbox}"`);
+      else console.warn(`[mailer] sent copy NOT saved (${sent.reason})`);
+
       res.json({
         ok: true,
         messageId: info.messageId,
         accepted: info.accepted || [],
         rejected: info.rejected || [],
+        savedToSent: sent.saved,
       });
     } catch (e) {
       console.error("POST /api/email/send ERROR:", e?.message || e);
