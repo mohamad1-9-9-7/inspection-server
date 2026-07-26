@@ -1,3 +1,4 @@
+
 module.exports = function registerSupplierPublicRoutes(app, deps = {}) {
   const { pool, clampInt, normText, todayISO, safeObj, isObj, rollbackQuietly, sendDbError } = deps;
 
@@ -34,6 +35,123 @@ function cleanJsonbObject(value) {
 function cleanJsonbArray(value) {
   const cleaned = cleanJsonbValue(value);
   return Array.isArray(cleaned) ? cleaned : [];
+}
+
+/* ======================================================================
+   Inspection "closed evidence" links (internal audit / CAPA)
+   ----------------------------------------------------------------------
+   These share the /api/reports/public/:token endpoints with the supplier
+   self-assessment form, but they are a different animal: the token points
+   at an EXISTING internal audit report, the recipient is a branch (not a
+   supplier), and most of the report is none of their business.
+====================================================================== */
+const INSPECTION_TYPE = "internal_multi_audit";
+const INSPECTION_MODE = "INSPECTION_CLOSED_EVIDENCE_ONLY";
+/* Tokens minted by src/utils/inspectionPublicLink.js all start with iev_. */
+const INSPECTION_TOKEN_RE = /^iev_/i;
+
+function isInspectionRow(row) {
+  if (!row) return false;
+  const payload = isObj(row.payload) ? row.payload : {};
+  const mode = normText(payload?.public?.mode || "");
+  return String(row.type) === INSPECTION_TYPE || mode === INSPECTION_MODE;
+}
+
+function isRowClosed(row) {
+  return /^\s*closed\s*$/i.test(String(row?.status ?? ""));
+}
+
+/* Status a finding carries between "branch sent evidence" and "QA ruled on it".
+   Deliberately not "Closed" — closure rate must not count unverified work. */
+const PENDING_VERIFICATION_STATUS = "Pending QA Verification";
+
+/* null when the link is usable, otherwise {status, error} to send back. */
+function inspectionLinkProblem(payload) {
+  const pub = isObj(payload?.public) ? payload.public : {};
+  if (pub.revokedAt) return { status: 410, error: "LINK_REVOKED", revokedAt: pub.revokedAt };
+  const exp = pub.expiresAt ? Date.parse(pub.expiresAt) : NaN;
+  if (Number.isFinite(exp) && exp < Date.now()) {
+    return { status: 410, error: "LINK_EXPIRED", expiresAt: pub.expiresAt };
+  }
+  return null;
+}
+
+/* What the branch is allowed to see: open findings only, and only the
+   columns they need in order to act. Closed findings, QA-only footer notes,
+   risk commentary, KPIs and internal metadata never leave the server.
+
+   Each surviving row carries its ORIGINAL index as `rowIndex` so evidence
+   posted back still lands on the right finding even though the visible list
+   is shorter and renumbered. */
+function sanitizeInspectionReport(row) {
+  const payload = isObj(row.payload) ? row.payload : {};
+  const header = isObj(payload.header) ? payload.header : {};
+  const fields = isObj(payload.fields) ? payload.fields : {};
+  const pub = isObj(payload.public) ? payload.public : {};
+  const table = Array.isArray(payload.table) ? payload.table : [];
+
+  const visible = [];
+  let closedCount = 0;
+  table.forEach((r, idx) => {
+    if (isRowClosed(r)) { closedCount += 1; return; }
+    const src = isObj(r) ? r : {};
+    visible.push({
+      rowIndex: idx,
+      nonConformance: src.nonConformance ?? "",
+      rootCause: src.rootCause ?? "",
+      corrective: src.corrective ?? "",
+      risk: src.risk ?? "",
+      status: src.status ?? "",
+      evidenceImgs: Array.isArray(src.evidenceImgs) ? src.evidenceImgs : [],
+      closedEvidenceImgs: Array.isArray(src.closedEvidenceImgs) ? src.closedEvidenceImgs : [],
+      closedEvidenceNote: src.closedEvidenceNote ?? "",
+      /* The verdict is meant for the branch to read — a rejection is useless
+         if they can't see why it was rejected. */
+      verification: isObj(src.verification) ? src.verification : null,
+    });
+  });
+
+  const visibleIdx = new Set(visible.map((r) => r.rowIndex));
+  const updates = (Array.isArray(fields.closedEvidenceUpdates) ? fields.closedEvidenceUpdates : [])
+    .filter((u) => visibleIdx.has(Number(u?.rowIndex)));
+
+  return {
+    id: row.id,
+    type: row.type,
+    branch: row.branch || header.branch || header.location || "",
+    created_at: row.created_at,
+    payload: {
+      title: payload.title || "Internal Audit Report",
+      header: {
+        date: header.date ?? "",
+        reportNo: header.reportNo ?? "",
+        auditConductedBy: header.auditConductedBy ?? "",
+        branch: header.branch ?? "",
+        location: header.location ?? "",
+      },
+      table: visible,
+      fields: {
+        closedEvidenceUpdates: updates,
+        closedEvidenceUploadedBy: fields.closedEvidenceUploadedBy ?? "",
+        closedEvidenceProgressSavedAt: fields.closedEvidenceProgressSavedAt ?? null,
+        closedEvidenceSubmittedAt: fields.closedEvidenceSubmittedAt ?? null,
+      },
+      public: {
+        token: pub.token ?? "",
+        mode: pub.mode || INSPECTION_MODE,
+        status: pub.status ?? "pending_evidence",
+        createdAt: pub.createdAt ?? null,
+        expiresAt: pub.expiresAt ?? null,
+        submittedAt: pub.submittedAt ?? null,
+        openedAt: pub.openedAt ?? null,
+      },
+      summary: {
+        totalFindings: table.length,
+        openFindings: visible.length,
+        closedFindings: closedCount,
+      },
+    },
+  };
 }
 
 app.post("/api/supplier-links", async (req, res) => {
@@ -279,7 +397,22 @@ app.get("/api/reports/public/:token", async (req, res) => {
     );
 
     if (q.rowCount) {
-      return res.json({ ok: true, report: q.rows[0], created: false });
+      const row = q.rows[0];
+      if (isInspectionRow(row)) {
+        const problem = inspectionLinkProblem(row.payload);
+        if (problem) return res.status(problem.status).json({ ok: false, ...problem });
+        /* Branches get the filtered projection — never the raw row. */
+        return res.json({ ok: true, report: sanitizeInspectionReport(row), created: false });
+      }
+      return res.json({ ok: true, report: row, created: false });
+    }
+
+    /* An inspection token that resolves to nothing is a dead link (report
+       deleted, token rotated, or a typo). Auto-creating a blank supplier form
+       for it would both mislead the branch and litter the reports table with
+       junk rows from an unauthenticated endpoint. */
+    if (INSPECTION_TOKEN_RE.test(token)) {
+      return res.status(404).json({ ok: false, error: "LINK_NOT_FOUND" });
     }
 
     // 2) not found → auto-create placeholder report
@@ -411,6 +544,14 @@ app.post("/api/reports/public/:token/submit", async (req, res) => {
           return res.status(403).json({ ok: false, error: "TOKEN_MISMATCH" });
         }
 
+        /* Same gate as the GET — an expired or revoked link must not accept
+           uploads either, otherwise revoking it means nothing. */
+        const problem = inspectionLinkProblem(payload);
+        if (problem) {
+          await client.query("ROLLBACK");
+          return res.status(problem.status).json({ ok: false, ...problem });
+        }
+
         const uploadedBy = normText(body.uploadedBy || fields.closedEvidenceUploadedBy || "");
         if (!uploadedBy) {
           await client.query("ROLLBACK");
@@ -454,7 +595,12 @@ app.post("/api/reports/public/:token/submit", async (req, res) => {
             })
             .filter((item) => item && (item.images.length || item.note));
 
-        const incomingUpdates = cleanUpdates(body.closedEvidenceUpdates);
+        const auditTable = Array.isArray(payload.table) ? payload.table : [];
+        /* The portal only ever shows open findings, so anything aimed at a
+           closed row (or at an index that no longer exists after a QA edit)
+           is dropped rather than silently written to the wrong finding. */
+        const incomingUpdates = cleanUpdates(body.closedEvidenceUpdates)
+          .filter((item) => item.rowIndex < auditTable.length && !isRowClosed(auditTable[item.rowIndex]));
         if (!incomingUpdates.length) {
           await client.query("ROLLBACK");
           return res.status(400).json({ ok: false, error: "closedEvidenceUpdates required" });
@@ -480,22 +626,33 @@ app.post("/api/reports/public/:token/submit", async (req, res) => {
         const closedEvidenceUpdates = Array.from(updatesByRow.values()).sort((a, b) => a.rowIndex - b.rowIndex);
         const updateForRow = new Map(closedEvidenceUpdates.map((item) => [item.rowIndex, item]));
 
+        const final = body.final === true;
         const table = Array.isArray(payload.table) ? payload.table : [];
         const nextTable = table.map((row, idx) => {
           const update = updateForRow.get(idx);
           if (!update) return row;
-          const existingImgs = (Array.isArray(row?.closedEvidenceImgs) ? row.closedEvidenceImgs : [])
+          const base = isObj(row) ? row : {};
+          const existingImgs = (Array.isArray(base.closedEvidenceImgs) ? base.closedEvidenceImgs : [])
             .map(imageUrl)
             .filter(Boolean);
           const incomingImgs = update.images.map(imageUrl).filter(Boolean);
-          return {
-            ...(isObj(row) ? row : {}),
-            closedEvidenceImgs: Array.from(new Set([...existingImgs, ...incomingImgs])),
+          const mergedImgs = Array.from(new Set([...existingImgs, ...incomingImgs]));
+          const next = {
+            ...base,
+            closedEvidenceImgs: mergedImgs,
             ...(update.note ? { closedEvidenceNote: update.note } : {}),
           };
+          /* A final submission hands the finding over to QA. Without this the
+             row stayed "Open" until somebody remembered to edit it by hand,
+             which is exactly how findings went stale. Saving progress does
+             NOT trigger it — the branch is still working. */
+          if (final && mergedImgs.length && !isRowClosed(base)) {
+            next.status = PENDING_VERIFICATION_STATUS;
+            next.verification = { state: "pending", at: submittedAt, by: uploadedBy };
+          }
+          return next;
         });
 
-        const final = body.final === true;
         const newPayload = {
           ...payload,
           table: nextTable,
@@ -523,7 +680,14 @@ app.post("/api/reports/public/:token/submit", async (req, res) => {
         );
 
         await client.query("COMMIT");
-        return res.json({ ok: true, reportId, token, submittedAt, report: upd.rows[0] });
+        /* Filtered again on the way out — the client re-renders from this. */
+        return res.json({
+          ok: true,
+          reportId,
+          token,
+          submittedAt,
+          report: sanitizeInspectionReport(upd.rows[0]),
+        });
       }
 
       if (payload?.meta?.submitted === true || payload?.meta?.submittedAt) {
