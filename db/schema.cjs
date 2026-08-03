@@ -27,6 +27,34 @@ module.exports = async function ensureSchema({ pool, genSalt, hashPw }) {
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_reports_type ON reports(type);`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_reports_created_at ON reports(created_at);`);
 
+  // Human-readable reference numbers (AM-CND-000142). One continuous counter
+  // per report type — never reset, so a reference is unique for all time.
+  // Bumped atomically inside the INSERT transaction in routes/reports.cjs, so
+  // two concurrent saves can never be handed the same number.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS report_counters (
+      type TEXT PRIMARY KEY,
+      last BIGINT NOT NULL DEFAULT 0,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+  `);
+
+  // Lookups by reference (the "ref:" search token) and a guard against a
+  // backfill or a bad import handing out the same number twice.
+  // Wrapped: if legacy data already holds a duplicate refNo the index cannot be
+  // built, and that must not take the whole server down on boot — log and move
+  // on, then fix the duplicates with the backfill tool.
+  await pool.query(`
+    DO $$
+    BEGIN
+      CREATE UNIQUE INDEX IF NOT EXISTS ux_reports_ref_no
+        ON reports ((payload->>'refNo'))
+        WHERE payload->>'refNo' IS NOT NULL;
+    EXCEPTION WHEN OTHERS THEN
+      RAISE WARNING 'ux_reports_ref_no not created: %', SQLERRM;
+    END $$;
+  `);
+
   // One report per (type, reportDate) — EXCEPT 'maintenance', which has many
   // requests per day (each identified by its own requestNo). Migrate any old
   // non-partial index to the partial form. Idempotent / safe to run every boot.
@@ -152,6 +180,30 @@ module.exports = async function ensureSchema({ pool, genSalt, hashPw }) {
 
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_activity_log_username ON activity_log(username);`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_activity_log_created_at ON activity_log(created_at);`);
+
+  /* ── Report audit trail (ISO 22000 §7.5 / FDA 21 CFR Part 11) ──
+     Every UPDATE/DELETE on the reports table is recorded here with the
+     full before/after payloads, so an admin can always answer: who
+     changed what, when, and what the old value was. Rows are written
+     fire-and-forget from routes/reports.cjs — never blocks the save. */
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS report_audit (
+      id          BIGSERIAL PRIMARY KEY,
+      report_id   BIGINT,
+      report_type TEXT NOT NULL,
+      action      TEXT NOT NULL,              -- 'update' | 'delete'
+      username    TEXT NOT NULL DEFAULT 'unknown',
+      old_payload JSONB,
+      new_payload JSONB,
+      route       TEXT,
+      ip_addr     TEXT,
+      created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_report_audit_created_at ON report_audit(created_at DESC);`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_report_audit_type ON report_audit(report_type);`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_report_audit_username ON report_audit(username);`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_report_audit_report_id ON report_audit(report_id);`);
 
   /* ── is_super_admin column ── */
   await pool.query(`ALTER TABLE app_users ADD COLUMN IF NOT EXISTS is_super_admin BOOLEAN NOT NULL DEFAULT false`);

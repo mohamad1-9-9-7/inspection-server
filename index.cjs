@@ -21,6 +21,7 @@ const registerAdminRoutes = require("./routes/admin.cjs");
 const registerBillingRoutes = require("./routes/billing.cjs");
 const registerEmailHistoryRoutes = require("./routes/emailHistory.cjs");
 const registerMailerRoutes = require("./routes/mailer.cjs");
+const registerAuditRoutes = require("./routes/audit.cjs");
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -67,6 +68,7 @@ registerAdminRoutes(app, deps);
 registerBillingRoutes(app, deps);
 registerEmailHistoryRoutes(app, deps);
 registerMailerRoutes(app, deps);
+registerAuditRoutes(app, deps);
 
 ensureSchema({ pool, genSalt: password.genSalt, hashPw: password.hashPw })
   .then(() =>
