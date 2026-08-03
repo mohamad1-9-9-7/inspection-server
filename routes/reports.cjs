@@ -143,6 +143,29 @@ function auditWrite(req, { action, reportId, reportType, oldPayload, newPayload 
     .catch((e) => console.warn("[audit] insert failed:", e?.message || e));
 }
 
+/* Types that are pure lookup/dictionary rows (vehicle numbers, driver names…)
+   or internal probes: high volume, zero compliance value. Their CREATEs are
+   not logged. Edits/deletes on them still are. */
+const AUDIT_SKIP_CREATE = /(^__)|lookup/i;
+
+/** Log a record creation.
+ *  Metadata only — the created payload still lives in `reports`, so storing a
+ *  second full copy would roughly double the database for no extra evidence.
+ *  If the record is later edited or deleted, THOSE entries carry the full
+ *  before-state, so nothing is lost. We keep just enough here (reportDate,
+ *  refNo) to make the audit row readable on its own. */
+function auditCreate(req, row) {
+  if (!row || AUDIT_SKIP_CREATE.test(String(row.type || ""))) return;
+  const p = row.payload || {};
+  auditWrite(req, {
+    action: "create",
+    reportId: row.id,
+    reportType: row.type,
+    oldPayload: null,
+    newPayload: { reportDate: p.reportDate ?? null, refNo: p.refNo ?? null },
+  });
+}
+
 /** Fetch the current row for a (type, reportDate) pair — used to capture
  *  the "old" payload before an upsert-style UPDATE overwrites it. */
 async function fetchOldByTypeDate(type, reportDate) {
@@ -288,6 +311,7 @@ app.post("/api/reports", auth, async (req, res) => {
       [reporter, type, JSON.stringify(stamped)]
     );
 
+    auditCreate(req, ins.rows[0]);
     return res.status(201).json({ ok: true, report: ins.rows[0] });
   } catch (e) {
     if (e && e.code === "23505") {
@@ -352,6 +376,7 @@ app.put("/api/reports", auth, async (req, res) => {
       [reporter, type, JSON.stringify(stamped)]
     );
 
+    auditCreate(req, ins.rows[0]);
     return res.status(201).json({ ok: true, report: ins.rows[0], method: "insert" });
   } catch (e) {
     if (e && e.code === "23505") {
@@ -409,6 +434,7 @@ app.put("/api/reports/returns", auth, async (req, res) => {
       [await stampRef(pool, "returns", payload)]
     );
 
+    auditCreate(req, ins.rows[0]);
     return res.status(201).json({ ok: true, report: ins.rows[0], method: "insert" });
   } catch (e) {
     console.error("PUT /api/reports/returns ERROR =", e);
@@ -456,6 +482,7 @@ app.put("/api/reports/qcs", auth, async (req, res) => {
        RETURNING *`,
       [await stampRef(pool, "qcs", payload)]
     );
+    auditCreate(req, ins.rows[0]);
     return res.status(201).json({ ok: true, report: ins.rows[0], method: "insert" });
   } catch (e) {
     console.error("PUT /api/reports/qcs ERROR =", e);
@@ -519,6 +546,7 @@ app.put("/api/reports/:type([A-Za-z_][A-Za-z0-9_-]*)", auth, async (req, res) =>
       [reporter, type, JSON.stringify(stamped)]
     );
 
+    auditCreate(req, ins.rows[0]);
     return res.status(201).json({ ok: true, report: ins.rows[0], method: "insert" });
   } catch (e) {
     console.error("PUT /api/reports/:type ERROR =", e);
