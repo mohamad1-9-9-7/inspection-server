@@ -118,10 +118,13 @@ function sanitizeInspectionReport(row) {
   return {
     id: row.id,
     type: row.type,
-    branch: row.branch || header.branch || header.location || "",
+    /* header.location is legacy-only — reports saved before the Location field
+       was removed kept the branch there and nowhere else. */
+    branch: row.branch || payload.branch || header.branch || header.location || "",
     created_at: row.created_at,
     payload: {
       title: payload.title || "Internal Audit Report",
+      branch: payload.branch ?? "",
       header: {
         date: header.date ?? "",
         reportNo: header.reportNo ?? "",
@@ -662,7 +665,12 @@ app.post("/api/reports/public/:token/submit", async (req, res) => {
             closedEvidenceProgressSavedAt: submittedAt,
             closedEvidenceSubmittedAt: final ? submittedAt : existingFields.closedEvidenceSubmittedAt || null,
             closedEvidenceUploadedBy: uploadedBy,
-            submittedBy: normText(payload?.header?.location || payload?.branch || "branch"),
+            /* The entry form retired the free-text Location field; the branch
+               now lives in payload.branch / header.branch. Legacy reports only
+               have header.location, so it stays last in the chain. */
+            submittedBy: normText(
+              payload?.branch || payload?.header?.branch || payload?.header?.location || "branch"
+            ),
             submissionType: "inspection_closed_evidence",
           },
           public: {
