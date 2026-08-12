@@ -76,13 +76,16 @@ function inspectionLinkProblem(payload) {
   return null;
 }
 
-/* What the branch is allowed to see: open findings only, and only the
-   columns they need in order to act. Closed findings, QA-only footer notes,
-   risk commentary, KPIs and internal metadata never leave the server.
+/* What the branch is allowed to see: every finding of the audit — closed ones
+   included, so they can re-read what was already accepted — but only the
+   columns they need. QA-only footer notes, KPIs and internal metadata never
+   leave the server.
 
-   Each surviving row carries its ORIGINAL index as `rowIndex` so evidence
-   posted back still lands on the right finding even though the visible list
-   is shorter and renumbered. */
+   Closed rows are reference material: the POST handler below refuses any
+   evidence aimed at one, so sending them is safe.
+
+   Each row carries its ORIGINAL index as `rowIndex` so evidence posted back
+   still lands on the right finding no matter how the portal orders them. */
 function sanitizeInspectionReport(row) {
   const payload = isObj(row.payload) ? row.payload : {};
   const header = isObj(payload.header) ? payload.header : {};
@@ -90,12 +93,11 @@ function sanitizeInspectionReport(row) {
   const pub = isObj(payload.public) ? payload.public : {};
   const table = Array.isArray(payload.table) ? payload.table : [];
 
-  const visible = [];
   let closedCount = 0;
-  table.forEach((r, idx) => {
-    if (isRowClosed(r)) { closedCount += 1; return; }
+  const visible = table.map((r, idx) => {
+    if (isRowClosed(r)) closedCount += 1;
     const src = isObj(r) ? r : {};
-    visible.push({
+    return {
       rowIndex: idx,
       nonConformance: src.nonConformance ?? "",
       rootCause: src.rootCause ?? "",
@@ -108,7 +110,7 @@ function sanitizeInspectionReport(row) {
       /* The verdict is meant for the branch to read — a rejection is useless
          if they can't see why it was rejected. */
       verification: isObj(src.verification) ? src.verification : null,
-    });
+    };
   });
 
   const visibleIdx = new Set(visible.map((r) => r.rowIndex));
@@ -150,7 +152,7 @@ function sanitizeInspectionReport(row) {
       },
       summary: {
         totalFindings: table.length,
-        openFindings: visible.length,
+        openFindings: visible.length - closedCount,
         closedFindings: closedCount,
       },
     },
@@ -599,9 +601,10 @@ app.post("/api/reports/public/:token/submit", async (req, res) => {
             .filter((item) => item && (item.images.length || item.note));
 
         const auditTable = Array.isArray(payload.table) ? payload.table : [];
-        /* The portal only ever shows open findings, so anything aimed at a
-           closed row (or at an index that no longer exists after a QA edit)
-           is dropped rather than silently written to the wrong finding. */
+        /* The portal lists closed findings as read-only reference, so this is
+           the gate that makes "read-only" real: anything aimed at a closed row
+           (or at an index that no longer exists after a QA edit) is dropped
+           rather than silently written to the wrong finding. */
         const incomingUpdates = cleanUpdates(body.closedEvidenceUpdates)
           .filter((item) => item.rowIndex < auditTable.length && !isRowClosed(auditTable[item.rowIndex]));
         if (!incomingUpdates.length) {
