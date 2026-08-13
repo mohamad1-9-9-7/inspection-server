@@ -2,7 +2,17 @@ const multer = require("multer");
 const cloudinary = require("cloudinary").v2;
 
 module.exports = function registerMediaRoutes(app, deps = {}) {
-  const { pool } = deps;
+  const { pool, makeLimiter, requireAuthStrict } = deps;
+
+  const noLimit = (_req, _res, next) => next();
+  const mk = typeof makeLimiter === "function" ? makeLimiter : () => noLimit;
+  const strict = typeof requireAuthStrict === "function" ? requireAuthStrict : noLimit;
+
+  /* Uploads stay open — branch supervisors and trainees attach evidence
+     photos from public token pages with no login. A cap keeps that from
+     being turned into free Cloudinary storage: 30 files/minute is far
+     above any real form and far below a script. */
+  const uploadLimiter = mk({ max: 30, windowMs: 60_000, name: "upload" });
 
 /* --------- Cloudinary config (robust) --------- */
 (function configureCloudinary() {
@@ -65,34 +75,14 @@ app.get("/api/files/cloudinary/:publicId", async (req, res) => {
   }
 });
 
-/** Proxy any public URL (useful when url is full https but cross-site / headers issues) */
-app.get("/api/files/proxy", async (req, res) => {
-  try {
-    const fetchFn = globalThis.fetch;
-    if (typeof fetchFn !== "function") {
-      return res.status(500).json({ ok: false, error: "FETCH_NOT_AVAILABLE", hint: "Use Node 18+ on server" });
-    }
-
-    const url = String(req.query.url || "").trim();
-    if (!url) return res.status(400).json({ ok: false, error: "Missing url" });
-
-    const r = await fetchFn(url);
-    if (!r.ok) {
-      const txt = await r.text().catch(() => "");
-      return res.status(r.status).send(txt || `Upstream error ${r.status}`);
-    }
-
-    const contentType = r.headers.get("content-type") || "application/octet-stream";
-    res.setHeader("Content-Type", contentType);
-    res.setHeader("Content-Disposition", "inline");
-
-    const buf = Buffer.from(await r.arrayBuffer());
-    res.send(buf);
-  } catch (e) {
-    console.error("GET /api/files/proxy ERROR =", e);
-    res.status(500).json({ ok: false, error: String(e?.message || e) });
-  }
-});
+/* REMOVED: GET /api/files/proxy
+   It fetched ANY url= the caller passed and streamed the body back, with no
+   auth, no host allow-list and no size cap — an open relay (every proxied
+   byte billed twice: inbound as Service-Initiated, outbound as an HTTP
+   response) and an SSRF hole into anything the server can reach.
+   Nothing in the app ever called it. Assets are served straight from
+   Cloudinary's own CDN, which is what /api/files/cloudinary/:publicId
+   redirects to. Do not reintroduce this without an explicit allow-list. */
 
 /* --------- Health routes --------- */
 /* Lightweight liveness check for uptime monitors — does NOT touch the DB,
@@ -138,7 +128,7 @@ function uploadBufferToCloudinary(buffer, opts = {}) {
   });
 }
 
-app.post("/api/images", uploadAny.any(), async (req, res) => {
+app.post("/api/images", uploadLimiter, uploadAny.any(), async (req, res) => {
   try {
     const cfg = cloudinary.config();
     const missing = ["cloud_name", "api_key", "api_secret"].filter((k) => !cfg[k]);
@@ -233,7 +223,9 @@ async function destroyOneByUrl(url) {
   });
 }
 
-app.delete("/api/images", async (req, res) => {
+/* Destructive and reached only from the logged-in admin view
+   (QCSRawMaterialView/viewUtils.js) — never from a public token page. */
+app.delete("/api/images", strict, async (req, res) => {
   try {
     const cfg = cloudinary.config();
     const missing = ["cloud_name", "api_key", "api_secret"].filter((k) => !cfg[k]);
@@ -313,17 +305,9 @@ app.delete("/api/images", async (req, res) => {
   }
 });
 
-app.get("/api/images/:id", async (req, res) => {
-  try {
-    const r = await pool.query("SELECT filename,mimetype,data FROM images WHERE id=$1", [req.params.id]);
-    const row = r.rows[0];
-    if (!row) return res.status(404).json({ ok: false, error: "not found" });
-    res.setHeader("Content-Type", row.mimetype || "image/jpeg");
-    res.setHeader("Content-Disposition", `inline; filename="${row.filename || "image.jpg"}"`);
-    res.send(row.data);
-  } catch (e) {
-    console.error(e);
-    res.status(500).json({ ok: false, error: String(e?.message || e) });
-  }
-});
+/* REMOVED: GET /api/images/:id
+   Served raw blobs out of an `images` table by sequential id, unauthenticated
+   — trivially enumerable. The table no longer exists (the route answered 500
+   in production) and no call site references it: every image has lived on
+   Cloudinary since the base64 migration. */
 };

@@ -1,10 +1,20 @@
 module.exports = function registerTrainingLinkRoutes(app, deps = {}) {
-  const { pool, clampInt, normText, safeArr, normKey, todayISO, rollbackQuietly, sendDbError } = deps;
+  const { pool, clampInt, normText, safeArr, normKey, todayISO, rollbackQuietly, sendDbError,
+          makeLimiter, requireAuthStrict } = deps;
+  const noGate = (_req, _res, next) => next();
+  const mk = typeof makeLimiter === "function" ? makeLimiter : () => noGate;
+  const strict = typeof requireAuthStrict === "function" ? requireAuthStrict : noGate;
+
+  /* Token endpoints are reachable by anyone holding the link, so they are the
+     part of the API most exposed to scanning. A real recipient opens a link
+     once and submits once; 40 hits a minute leaves enormous headroom while
+     making enumeration of the token space pointless. */
+  const publicLimiter = mk({ max: 40, windowMs: 60_000, name: "training-link" });
 
 /* ============================================================
    Training Links API (UUID token system - still kept)
 ============================================================ */
-app.post("/api/training-links", async (req, res) => {
+app.post("/api/training-links", strict, async (req, res) => {
   try {
     const reportId = Number(req.body?.reportId);
     const module = normText(req.body?.module || "");
@@ -49,7 +59,7 @@ app.post("/api/training-links", async (req, res) => {
   }
 });
 
-app.get("/api/training-links/:token", async (req, res) => {
+app.get("/api/training-links/:token", publicLimiter, async (req, res) => {
   try {
     const token = normText(req.params.token);
     if (!token) return res.status(400).json({ ok: false, error: "token required" });
@@ -114,7 +124,7 @@ app.get("/api/training-links/:token", async (req, res) => {
   }
 });
 
-app.post("/api/training-links/:token/submit", async (req, res) => {
+app.post("/api/training-links/:token/submit", publicLimiter, async (req, res) => {
   let client;
   try {
     client = await pool.connect();

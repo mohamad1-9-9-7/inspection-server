@@ -9,7 +9,7 @@ const common = require("./utils/common.cjs");
 const password = require("./utils/password.cjs");
 const rateLimit = require("./utils/rateLimit.cjs");
 const token = require("./utils/token.cjs");
-const { requireAuth } = require("./utils/requireAuth.cjs");
+const { requireAuth, requireAuthStrict } = require("./utils/requireAuth.cjs");
 
 const registerReportsRoutes = require("./routes/reports.cjs");
 const registerSupplierPublicRoutes = require("./routes/supplierPublic.cjs");
@@ -29,16 +29,49 @@ const PORT = process.env.PORT || 5000;
 console.log("DEPLOY VERSION:", new Date().toISOString());
 console.log("NODE_ENV:", process.env.NODE_ENV || "undefined");
 
+/* CORS allow-list.
+
+   ALLOWED_ORIGINS = comma-separated list of site origins, e.g.
+     https://almawashi-qms.netlify.app,http://localhost:3000
+   Unset (the default) keeps the previous wide-open "*" behaviour so this
+   deploy cannot break anything on its own — set the variable in Render to
+   actually close it. Requests with no Origin (server-to-server, the Netlify
+   /api/* proxy, curl, health checks) are always allowed: CORS is a browser
+   control and blocking them would only break monitoring. */
+const ALLOWED_ORIGINS = String(process.env.ALLOWED_ORIGINS || "")
+  .split(",")
+  .map((s) => s.trim().replace(/\/$/, ""))
+  .filter(Boolean);
+
+if (!ALLOWED_ORIGINS.length) {
+  console.warn(
+    "[cors] ALLOWED_ORIGINS is not set — every origin is accepted. " +
+      "Set it to your site origin(s) to restrict browser access."
+  );
+}
+
+function originAllowed(origin) {
+  if (!origin) return true;
+  if (!ALLOWED_ORIGINS.length) return true;
+  return ALLOWED_ORIGINS.includes(String(origin).replace(/\/$/, ""));
+}
+
 app.use(
   cors({
-    origin: "*",
+    origin: (origin, cb) => cb(null, originAllowed(origin)),
     methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Accept", "Authorization"],
   })
 );
 
 app.use((req, res, next) => {
-  res.header("Access-Control-Allow-Origin", "*");
+  const origin = req.headers.origin;
+  if (originAllowed(origin)) {
+    // Echo the caller's origin rather than "*" so the header stays correct
+    // once the allow-list is narrowed.
+    res.header("Access-Control-Allow-Origin", origin || "*");
+    if (origin) res.header("Vary", "Origin");
+  }
   res.header("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS");
   res.header("Access-Control-Allow-Headers", "Content-Type, Accept, Authorization");
   if (req.method === "OPTIONS") return res.sendStatus(204);
@@ -56,6 +89,7 @@ const deps = {
   ...rateLimit,
   ...token,
   requireAuth,
+  requireAuthStrict,
 };
 
 registerReportsRoutes(app, deps);

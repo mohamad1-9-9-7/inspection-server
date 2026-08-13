@@ -1,6 +1,13 @@
 module.exports = function registerAdminRoutes(app, deps = {}) {
-  const { pool, clampInt, normText, rlCheck, rlReset, genSalt, hashPw, verifyPw, signToken } = deps;
+  const { pool, clampInt, normText, rlCheck, rlReset, genSalt, hashPw, verifyPw, signToken,
+          requireAuthStrict } = deps;
   const SCRYPT_PFX = "scrypt:";
+
+  const noLimit = (_req, _res, next) => next();
+  /* Account/audit surfaces are admin-only. They were previously guarded by
+     nothing but the client-side isAdmin flag, which anyone can skip by
+     calling the URL directly. */
+  const strict = typeof requireAuthStrict === "function" ? requireAuthStrict : noLimit;
 
 /* --------- Auth: verify role password --------- */
 app.post("/api/auth/verify-role", (req, res) => {
@@ -311,7 +318,7 @@ app.post("/api/auth/logout", async (req, res) => {
 ============================================================ */
 
 /* GET /api/app-users */
-app.get("/api/app-users", async (req, res) => {
+app.get("/api/app-users", strict, async (req, res) => {
   try {
     /* Multi-tenant scoping: ?company_id=N restricts to that company.
        Super-admin UI omits it to see everyone. */
@@ -338,7 +345,7 @@ app.get("/api/app-users", async (req, res) => {
 });
 
 /* POST /api/app-users  { username, displayName, password, permissions, crudPerms, employees, isAdmin } */
-app.post("/api/app-users", async (req, res) => {
+app.post("/api/app-users", strict, async (req, res) => {
   try {
     const username       = normText(req.body?.username);
     const displayName    = normText(req.body?.displayName || req.body?.display_name || username);
@@ -378,7 +385,7 @@ app.post("/api/app-users", async (req, res) => {
 });
 
 /* PUT /api/app-users/:id  { displayName?, password?, permissions?, isAdmin?, isActive? } */
-app.put("/api/app-users/:id", async (req, res) => {
+app.put("/api/app-users/:id", strict, async (req, res) => {
   try {
     const { id } = req.params;
     const sets = [];
@@ -448,7 +455,7 @@ app.put("/api/app-users/:id", async (req, res) => {
 });
 
 /* DELETE /api/app-users/:id */
-app.delete("/api/app-users/:id", async (req, res) => {
+app.delete("/api/app-users/:id", strict, async (req, res) => {
   try {
     const { id } = req.params;
     const q = await pool.query(`DELETE FROM app_users WHERE id=$1 RETURNING username`, [id]);
@@ -462,7 +469,7 @@ app.delete("/api/app-users/:id", async (req, res) => {
 });
 
 /* GET /api/activity-log?limit=50&username=xxx */
-app.get("/api/activity-log", async (req, res) => {
+app.get("/api/activity-log", strict, async (req, res) => {
   try {
     const limit = clampInt(req.query?.limit, 100, 1, 500);
     const usernameFilter = normText(req.query?.username || "");
@@ -491,7 +498,7 @@ app.get("/api/activity-log", async (req, res) => {
 
 /* ─── Failed Logins Monitor — security audit ─── */
 /* Returns the last N failed login attempts + per-IP aggregation for the past hour. */
-app.get("/api/security/failed-logins", async (req, res) => {
+app.get("/api/security/failed-logins", strict, async (req, res) => {
   try {
     const limit = clampInt(req.query?.limit, 50, 1, 200);
     const recent = await pool.query(

@@ -215,8 +215,18 @@ function cleanList(v, cap = MAX_RECIPIENTS) {
 }
 
 module.exports = function registerMailerRoutes(app, deps = {}) {
-  const { requireAuth } = deps;
+  const { requireAuth, requireAuthStrict } = deps;
   const auth = typeof requireAuth === "function" ? requireAuth : (req, res, next) => next();
+
+  /* Sending goes through the company mailbox at mail.almawashi.ae, so an
+     unauthenticated caller here is an open spam relay in our own name — at
+     SEND_MAX × MAX_RECIPIENTS that is 1000 messages a minute, and the
+     reputation damage to the domain outlives any bandwidth bill. `auth`
+     above is the soft audit-mode gate, which rejects nothing until
+     REQUIRE_AUTH is flipped; sending cannot wait for that. Both call sites
+     (EmailSendModal, BrowseReturns) are logged-in screens whose requests
+     already carry the bearer token. */
+  const strict = typeof requireAuthStrict === "function" ? requireAuthStrict : auth;
 
   /* Is direct sending available? Never exposes the password. */
   app.get("/api/email/status", (req, res) => {
@@ -234,7 +244,7 @@ module.exports = function registerMailerRoutes(app, deps = {}) {
   });
 
   /* Handshake check — proves host/port/credentials before anyone sends. */
-  app.post("/api/email/verify", auth, async (req, res) => {
+  app.post("/api/email/verify", strict, async (req, res) => {
     const cfg = smtpConfig();
     if (!cfg.configured) {
       return res.status(503).json({ ok: false, error: "not_configured" });
@@ -250,7 +260,7 @@ module.exports = function registerMailerRoutes(app, deps = {}) {
 
   /* Send. Attachments arrive as base64 so the same payload the .eml builder
      already produces on the client can be reused unchanged. */
-  app.post("/api/email/send", auth, async (req, res) => {
+  app.post("/api/email/send", strict, async (req, res) => {
     const cfg = smtpConfig();
     if (!cfg.configured) {
       return res.status(503).json({ ok: false, error: "not_configured" });

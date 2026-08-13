@@ -1,9 +1,20 @@
 module.exports = function registerReportsRoutes(app, deps = {}) {
-  const { pool, clampInt, normText, isObj, requireAuth } = deps;
+  const { pool, clampInt, normText, isObj, requireAuth, makeLimiter } = deps;
 
   // Fallback no-op if the middleware wasn't wired in (keeps routes working
   // on an older deps shape); real enforcement comes from utils/requireAuth.
   const auth = typeof requireAuth === "function" ? requireAuth : (_req, _res, next) => next();
+
+  /* A single `?type=X&limit=5000` read can return several MB, so this is by
+     far the most expensive route to leave unmetered — one scraper looping it
+     is enough to blow through a month of bandwidth. The cap is per IP and
+     generous enough that a whole branch office behind one NAT address never
+     reaches it during normal use. Note this bounds the damage but does not
+     close the hole: until REQUIRE_AUTH=on, these reads are still anonymous. */
+  const readLimiter =
+    typeof makeLimiter === "function"
+      ? makeLimiter({ max: 120, windowMs: 60_000, name: "reports-read" })
+      : (_req, _res, next) => next();
 
   // Liveness probes (server wake-up banner + ServerHealth tool) only care
   // whether the process responds — they must NOT query the DB (would wake
@@ -194,7 +205,7 @@ async function fetchOldById(id) {
    Reports API  (all routes gated by `auth` — audit or enforce
    depending on REQUIRE_AUTH; ping probes bypass via pingBypass)
 ============================================================ */
-app.get("/api/reports", pingBypass, auth, async (req, res) => {
+app.get("/api/reports", pingBypass, readLimiter, auth, async (req, res) => {
   try {
     const { type } = req.query;
 

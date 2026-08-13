@@ -1,5 +1,15 @@
 module.exports = function registerTrainingSessionRoutes(app, deps = {}) {
-  const { pool, normText, safeArr, normKey, todayISO, isObj, rollbackQuietly, sendDbError } = deps;
+  const { pool, normText, safeArr, normKey, todayISO, isObj, rollbackQuietly, sendDbError,
+          makeLimiter, requireAuthStrict } = deps;
+  const noGate = (_req, _res, next) => next();
+  const mk = typeof makeLimiter === "function" ? makeLimiter : () => noGate;
+  const strict = typeof requireAuthStrict === "function" ? requireAuthStrict : noGate;
+
+  /* Token endpoints are reachable by anyone holding the link, so they are the
+     part of the API most exposed to scanning. A real recipient opens a link
+     once and submits once; 40 hits a minute leaves enormous headroom while
+     making enumeration of the token space pointless. */
+  const publicLimiter = mk({ max: 40, windowMs: 60_000, name: "training-session" });
 
 /* ============================================================
    Training Session Token API (TEXT token stored in reports.payload.quizToken)
@@ -50,7 +60,7 @@ function getSubmission(payload, token, participantKey) {
   return null;
 }
 
-app.get("/api/training-session/by-token/:token", async (req, res) => {
+app.get("/api/training-session/by-token/:token", publicLimiter, async (req, res) => {
   try {
     const token = normText(req.params.token);
     const pKey = normText(req.query?.p || "");
@@ -104,7 +114,7 @@ app.get("/api/training-session/by-token/:token", async (req, res) => {
   }
 });
 
-app.post("/api/training-session/by-token/:token/submit", async (req, res) => {
+app.post("/api/training-session/by-token/:token/submit", publicLimiter, async (req, res) => {
   let client;
   try {
     client = await pool.connect();

@@ -1,5 +1,12 @@
 module.exports = function registerCatalogRoutes(app, deps = {}) {
-  const { pool, clampInt, normText, safeObj, rollbackQuietly, sendDbError } = deps;
+  const { pool, clampInt, normText, safeObj, rollbackQuietly, sendDbError,
+          requireAuthStrict } = deps;
+
+  const noGate = (_req, _res, next) => next();
+  /* Reads stay open — product names and codes are not sensitive and the
+     pickers fetch them everywhere. Writes are gated: an anonymous DELETE
+     could empty the catalogue every branch form depends on. */
+  const strict = typeof requireAuthStrict === "function" ? requireAuthStrict : noGate;
 
 /* ============================================================
    Product Catalog API
@@ -188,18 +195,18 @@ async function deleteCatalogProduct(req, res, fallbackScope = "returns_items") {
 app.get(["/api/catalog/products", "/api/catalog/items", "/api/items"], (req, res) =>
   listCatalogProducts(req, res, "returns_items")
 );
-app.post(["/api/catalog/products", "/api/catalog/items", "/api/items"], (req, res) =>
+app.post(["/api/catalog/products", "/api/catalog/items", "/api/items"], strict, (req, res) =>
   upsertCatalogProduct(req, res, "returns_items")
 );
-app.put(["/api/catalog/products/:code", "/api/catalog/items/:code", "/api/items/:code"], (req, res) =>
+app.put(["/api/catalog/products/:code", "/api/catalog/items/:code", "/api/items/:code"], strict, (req, res) =>
   updateCatalogProduct(req, res, "returns_items")
 );
-app.delete(["/api/catalog/products/:code", "/api/catalog/items/:code", "/api/items/:code"], (req, res) =>
+app.delete(["/api/catalog/products/:code", "/api/catalog/items/:code", "/api/items/:code"], strict, (req, res) =>
   deleteCatalogProduct(req, res, "returns_items")
 );
 
-app.put("/api/product-catalog/:code", (req, res) => updateCatalogProduct(req, res, "default"));
-app.delete("/api/product-catalog/:code", (req, res) => deleteCatalogProduct(req, res, "default"));
+app.put("/api/product-catalog/:code", strict, (req, res) => updateCatalogProduct(req, res, "default"));
+app.delete("/api/product-catalog/:code", strict, (req, res) => deleteCatalogProduct(req, res, "default"));
 
 app.get("/api/product-catalog", async (req, res) => {
   try {
@@ -225,7 +232,7 @@ app.get("/api/product-catalog", async (req, res) => {
   }
 });
 
-app.post("/api/product-catalog", async (req, res) => {
+app.post("/api/product-catalog", strict, async (req, res) => {
   try {
     const scope = normText(req.body?.scope || "default");
     const code = normText(req.body?.code);

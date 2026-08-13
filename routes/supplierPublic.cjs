@@ -1,6 +1,16 @@
 
 module.exports = function registerSupplierPublicRoutes(app, deps = {}) {
-  const { pool, clampInt, normText, todayISO, safeObj, isObj, rollbackQuietly, sendDbError } = deps;
+  const { pool, clampInt, normText, todayISO, safeObj, isObj, rollbackQuietly, sendDbError,
+          makeLimiter, requireAuthStrict } = deps;
+  const noGate = (_req, _res, next) => next();
+  const mk = typeof makeLimiter === "function" ? makeLimiter : () => noGate;
+  const strict = typeof requireAuthStrict === "function" ? requireAuthStrict : noGate;
+
+  /* Token endpoints are reachable by anyone holding the link, so they are the
+     part of the API most exposed to scanning. A real recipient opens a link
+     once and submits once; 40 hits a minute leaves enormous headroom while
+     making enumeration of the token space pointless. */
+  const publicLimiter = mk({ max: 40, windowMs: 60_000, name: "public-token" });
 
 /* ======================================================================
    Supplier Links API (UUID token system)
@@ -159,7 +169,7 @@ function sanitizeInspectionReport(row) {
   };
 }
 
-app.post("/api/supplier-links", async (req, res) => {
+app.post("/api/supplier-links", strict, async (req, res) => {
   try {
     const reportId = Number(req.body?.reportId);
     const expiresInDays = clampInt(req.body?.expiresInDays, 14, 1, 120);
@@ -196,7 +206,7 @@ app.post("/api/supplier-links", async (req, res) => {
   }
 });
 
-app.get("/api/supplier-links/:token", async (req, res) => {
+app.get("/api/supplier-links/:token", publicLimiter, async (req, res) => {
   try {
     const token = normText(req.params.token);
     if (!token) return res.status(400).json({ ok: false, error: "token required" });
@@ -261,7 +271,7 @@ app.get("/api/supplier-links/:token", async (req, res) => {
 });
 
 /* ✅ UPDATED: supports recordDate + fieldAttachments */
-app.post("/api/supplier-links/:token/submit", async (req, res) => {
+app.post("/api/supplier-links/:token/submit", publicLimiter, async (req, res) => {
   let client;
   try {
     client = await pool.connect();
@@ -382,7 +392,7 @@ app.post("/api/supplier-links/:token/submit", async (req, res) => {
 /* ======================================================================
    ✅ SUPPLIER PUBLIC TOKEN API (AUTO-CREATE if not found)
 ====================================================================== */
-app.get("/api/reports/public/:token", async (req, res) => {
+app.get("/api/reports/public/:token", publicLimiter, async (req, res) => {
   let client;
   try {
     client = await pool.connect();
@@ -475,7 +485,7 @@ app.get("/api/reports/public/:token", async (req, res) => {
    payload.public.openedAt on the report that owns this token, and only
    once (WHERE openedAt IS NULL). No client-supplied payload is trusted,
    so the generic PUT /api/reports/:id can stay behind requireAuth. */
-app.post("/api/reports/public/:token/opened", async (req, res) => {
+app.post("/api/reports/public/:token/opened", publicLimiter, async (req, res) => {
   try {
     const token = normText(req.params.token || "");
     if (!token) return res.status(400).json({ ok: false, error: "token required" });
@@ -497,7 +507,7 @@ app.post("/api/reports/public/:token/opened", async (req, res) => {
 });
 
 /* ✅ UPDATED submit: supports recordDate + fieldAttachments */
-app.post("/api/reports/public/:token/submit", async (req, res) => {
+app.post("/api/reports/public/:token/submit", publicLimiter, async (req, res) => {
   let client;
   try {
     client = await pool.connect();

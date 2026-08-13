@@ -52,4 +52,51 @@ function requireAuth(req, res, next) {
   return next();
 }
 
-module.exports = { requireAuth, isEnforcing };
+/* ============================================================
+   requireAuthStrict — for routes that were never meant to be public
+
+   `requireAuth` above is deliberately soft: it guards /api/reports,
+   which every one of 250+ call sites already hits, so it waits for
+   REQUIRE_AUTH before rejecting anything.
+
+   Admin surfaces (user accounts, billing, activity log, link minting)
+   have no such migration problem — the browser app sends the bearer
+   token on every API call via the global fetch wrapper, and nothing
+   else is supposed to reach them. So they enforce immediately.
+
+   The one thing that MUST NOT happen is locking everybody out: with
+   no AUTH_SECRET the server cannot issue a token at all (signToken
+   returns ""), so no caller could ever pass. In that state we fall
+   back to open + a loud warning rather than bricking the dashboard.
+============================================================ */
+function hasSecret() {
+  return !!process.env.AUTH_SECRET;
+}
+
+let warnedNoSecret = 0;
+
+function requireAuthStrict(req, res, next) {
+  const raw = tokenFromReq(req);
+  const payload = raw ? verifyToken(raw) : null;
+
+  if (payload) {
+    req.user = payload;
+    return next();
+  }
+
+  if (!hasSecret()) {
+    const now = Date.now();
+    if (now - warnedNoSecret > 60_000) {
+      warnedNoSecret = now;
+      console.warn(
+        `[auth-strict] AUTH_SECRET is NOT set — admin routes are still OPEN ` +
+          `(latest: ${req.method} ${req.originalUrl}). Set AUTH_SECRET to close them.`
+      );
+    }
+    return next();
+  }
+
+  return res.status(401).json({ ok: false, error: "auth_required" });
+}
+
+module.exports = { requireAuth, requireAuthStrict, isEnforcing };
