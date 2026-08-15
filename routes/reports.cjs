@@ -1,9 +1,15 @@
+const cloudinary = require("cloudinary").v2;
+
 module.exports = function registerReportsRoutes(app, deps = {}) {
-  const { pool, clampInt, normText, isObj, requireAuth, makeLimiter } = deps;
+  const { pool, clampInt, normText, isObj, requireAuth, requireAuthStrict, makeLimiter } = deps;
 
   // Fallback no-op if the middleware wasn't wired in (keeps routes working
   // on an older deps shape); real enforcement comes from utils/requireAuth.
   const auth = typeof requireAuth === "function" ? requireAuth : (_req, _res, next) => next();
+
+  // Maintenance routes are admin-only regardless of REQUIRE_AUTH.
+  const authStrict =
+    typeof requireAuthStrict === "function" ? requireAuthStrict : auth;
 
   /* A single `?type=X&limit=5000` read can return several MB, so this is by
      far the most expensive route to leave unmetered — one scraper looping it
@@ -244,6 +250,48 @@ app.get("/api/reports", pingBypass, readLimiter, auth, async (req, res) => {
           ORDER BY created_at DESC
           LIMIT 1`,
         [type, reportDate]
+      );
+      return res.json({ ok: true, data: rows });
+    }
+
+    /* `?type=X&from=YYYY-MM-DD&to=YYYY-MM-DD` — only the window the screen
+       actually shows. Report pages used to pull every record ever written and
+       filter in the browser, which grows without bound; this keeps the payload
+       proportional to the period on screen.
+
+       The date compared is the **business** date, not created_at: entries can
+       be backdated (a carcass cut yesterday, keyed in today), so filtering on
+       the row timestamp would silently drop them. We take the first of
+       cutDate / date / the leading YYYY-MM-DD of reportDate.
+
+       Payload-only, with no created_at fallback: the matching index expression
+       must be IMMUTABLE and created_at needs to_char/::date, which are merely
+       STABLE. A row carrying none of the three keys has no business date to
+       range over, so it stays out of a dated query by design.
+       `idx_reports_business_date` backs this — keep the two in sync. */
+    const BUSINESS_DATE = `
+      COALESCE(
+        NULLIF(payload->>'cutDate', ''),
+        NULLIF(payload->>'date', ''),
+        NULLIF(LEFT(payload->>'reportDate', 10), '')
+      )`;
+
+    const isDay = (v) => /^\d{4}-\d{2}-\d{2}$/.test(v);
+    const from = normText(req.query?.from || "");
+    const to = normText(req.query?.to || "");
+
+    if (type && (isDay(from) || isDay(to))) {
+      const where = ["type = $1"];
+      const p = [type];
+      if (isDay(from)) { p.push(from); where.push(`${BUSINESS_DATE} >= $${p.length}`); }
+      if (isDay(to)) { p.push(to); where.push(`${BUSINESS_DATE} <= $${p.length}`); }
+      p.push(limit);
+      const { rows } = await pool.query(
+        `SELECT * FROM reports
+          WHERE ${where.join(" AND ")}
+          ORDER BY created_at DESC
+          LIMIT $${p.length}`,
+        p
       );
       return res.json({ ok: true, data: rows });
     }
@@ -649,6 +697,174 @@ app.post("/api/reports/backfill-refs", auth, async (req, res) => {
     return res.status(500).json({ ok: false, error: String(e?.message || e) });
   } finally {
     client.release();
+  }
+});
+
+/* ============================================================
+   POST /api/reports/migrate-base64
+   ------------------------------------------------------------
+   Gets the embedded files out of stored payloads. Runs
+   server-side on purpose: doing this from the browser would mean
+   downloading the 125 MB it is trying to remove.
+
+   mode=migrate (default) uploads each blob to Cloudinary and puts
+   the URL in its place, so the photo survives and the payload
+   shrinks from ~90 KB to ~90 bytes.
+   mode=strip throws the blob away instead.
+
+   Works in batches — the caller repeats until `more` is false.
+
+   Deliberately does NOT write to report_audit: that trail keeps
+   old and new payloads, so logging this would copy every blob
+   straight back into another table.
+============================================================ */
+app.post("/api/reports/migrate-base64", authStrict, async (req, res) => {
+  const truthy = (v) => ["1", "true", "yes"].includes(String(v || "").toLowerCase());
+  const dryRun = truthy(req.query?.dryRun ?? req.body?.dryRun);
+  const type = normText(req.query?.type || req.body?.type || "");
+  const strip = String(req.query?.mode || req.body?.mode || "migrate").toLowerCase() === "strip";
+  // Uploads dominate the runtime, so batches are small by default — a
+  // request that tries to move 200 files at once will hit a proxy timeout.
+  const batch = clampInt(req.query?.limit ?? req.body?.limit, 10, 1, 100);
+
+  const DATA_URI = /^data:([a-z0-9.+-]+\/[a-z0-9.+-]+)?;base64,/i;
+  const isBlob = (v) => typeof v === "string" && v.length >= 2048 && DATA_URI.test(v);
+
+  /* Rewrites a payload, replacing each blob with whatever `swap` returns.
+     Async because migrating means awaiting an upload per blob. */
+  async function transform(value, swap, depth = 0) {
+    if (depth > 12) return value;
+    if (isBlob(value)) return swap(value);
+    if (Array.isArray(value)) {
+      const out = [];
+      for (const v of value) out.push(await transform(v, swap, depth + 1));
+      return out;
+    }
+    if (value && typeof value === "object") {
+      const out = {};
+      for (const [k, v] of Object.entries(value)) out[k] = await transform(v, swap, depth + 1);
+      return out;
+    }
+    return value;
+  }
+
+  try {
+    if (!strip) {
+      const cfg = cloudinary.config();
+      const missing = ["cloud_name", "api_key", "api_secret"].filter((k) => !cfg[k]);
+      if (missing.length) {
+        return res.status(500).json({ ok: false, error: "CLOUDINARY_CONFIG_MISSING", missing });
+      }
+    }
+
+    // LIKE on the cast text is a sequential scan, but Postgres stops as soon
+    // as it has filled the LIMIT, so a run with work left to do is cheap.
+    // Asking for one extra row is how we learn whether to come back.
+    const where = type
+      ? `type = $1 AND payload::text LIKE '%;base64,%'`
+      : `payload::text LIKE '%;base64,%'`;
+    const params = type ? [type, batch + 1] : [batch + 1];
+
+    const { rows } = await pool.query(
+      `SELECT id, type, payload FROM reports
+        WHERE ${where}
+        ORDER BY id ASC
+        LIMIT $${params.length}`,
+      params
+    );
+
+    const more = rows.length > batch;
+    const work = rows.slice(0, batch);
+
+    const byType = {};
+    const failures = [];
+    let handled = 0;
+    let bytes = 0;
+    let skipped = 0;
+
+    const bucket = (t) =>
+      (byType[t] = byType[t] || { rows: 0, blobs: 0, bytes: 0, failed: 0 });
+
+    for (const row of work) {
+      let count = 0;
+      let size = 0;
+      let failed = null;
+
+      const cleaned = await transform(row.payload, async (blob) => {
+        if (failed) return blob; // already giving up on this row
+        size += blob.length;
+        count++;
+        if (strip) return "";
+        try {
+          const up = await cloudinary.uploader.upload(blob, {
+            folder: `${process.env.CLOUDINARY_FOLDER || "qcs"}/migrated/${row.type}`,
+            transformation: [{ width: 1280, height: 1280, crop: "limit", quality: "80" }],
+          });
+          return up.secure_url;
+        } catch (e) {
+          failed = e?.message || String(e);
+          return blob;
+        }
+      });
+
+      // A row is all-or-nothing: a half-migrated payload would leave the
+      // record pointing at some photos and still carrying others, and a
+      // retry could not tell the two apart.
+      if (failed) {
+        bucket(row.type).failed++;
+        failures.push({ id: row.id, type: row.type, error: failed });
+        continue;
+      }
+
+      // The LIKE matched somewhere the walker did not — a data: URI under
+      // the 2 KB floor, or text that merely contains the marker. Leave it
+      // alone, but report it, otherwise the caller loops on it forever.
+      if (!count) {
+        skipped++;
+        continue;
+      }
+
+      handled += count;
+      bytes += size;
+      const b = bucket(row.type);
+      b.rows++;
+      b.blobs += count;
+      b.bytes += size;
+
+      if (!dryRun) {
+        await pool.query(
+          `UPDATE reports SET payload = $1::jsonb, updated_at = now() WHERE id = $2`,
+          [JSON.stringify(cleaned), row.id]
+        );
+      }
+    }
+
+    console.log(
+      `[migrate-base64] ${dryRun ? "DRY RUN " : ""}${strip ? "strip" : "migrate"}: ` +
+        `${work.length} rows, ${handled} blobs, ${bytes} bytes, ` +
+        `${failures.length} failed, ${skipped} skipped, more=${more}`
+    );
+
+    return res.json({
+      ok: true,
+      mode: strip ? "strip" : "migrate",
+      dryRun,
+      type: type || null,
+      scanned: work.length,
+      rowsChanged: work.length - failures.length - skipped,
+      blobsHandled: handled,
+      bytesFreed: bytes,
+      skipped,
+      failures,
+      byType,
+      // A dry run changes nothing, so the same rows match again next call —
+      // reporting `more` would send the caller into an endless loop. Rows that
+      // failed also still match, so stop rather than spin on them.
+      more: dryRun ? false : more && failures.length === 0,
+    });
+  } catch (e) {
+    console.error("POST /api/reports/migrate-base64 ERROR =", e);
+    return res.status(500).json({ ok: false, error: String(e?.message || e) });
   }
 });
 

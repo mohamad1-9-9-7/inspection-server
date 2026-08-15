@@ -27,6 +27,31 @@ module.exports = async function ensureSchema({ pool, genSalt, hashPw }) {
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_reports_type ON reports(type);`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_reports_created_at ON reports(created_at);`);
 
+  // Backs `GET /api/reports?type=&from=&to=` — the business-date window the
+  // report screens ask for. The expression must stay identical to
+  // BUSINESS_DATE in routes/reports.cjs, or the planner drops to a seq scan.
+  //
+  // Payload-only on purpose: an index expression has to be IMMUTABLE, and
+  // created_at needs to_char/::date, both of which are only STABLE. Every
+  // report type writes one of these three keys anyway.
+  //
+  // Wrapped like ux_reports_ref_no below: a failure here must not stop boot.
+  await pool.query(`
+    DO $$
+    BEGIN
+      CREATE INDEX IF NOT EXISTS idx_reports_business_date ON reports (
+        type,
+        (COALESCE(
+          NULLIF(payload->>'cutDate', ''),
+          NULLIF(payload->>'date', ''),
+          NULLIF(LEFT(payload->>'reportDate', 10), '')
+        ))
+      );
+    EXCEPTION WHEN OTHERS THEN
+      RAISE WARNING 'idx_reports_business_date not created: %', SQLERRM;
+    END $$;
+  `);
+
   // Human-readable reference numbers (AM-CND-000142). One continuous counter
   // per report type — never reset, so a reference is unique for all time.
   // Bumped atomically inside the INSERT transaction in routes/reports.cjs, so
