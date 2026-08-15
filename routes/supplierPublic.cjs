@@ -430,6 +430,27 @@ app.get("/api/reports/public/:token", publicLimiter, async (req, res) => {
       return res.status(404).json({ ok: false, error: "LINK_NOT_FOUND" });
     }
 
+    /* Beyond this point we are about to INSERT from an unauthenticated GET,
+       so the token has to be one we actually issued. Without this check any
+       stranger could grow the reports table one junk row per made-up URL —
+       /api/reports/public/anything did exactly that.
+
+       A token minted through POST /api/supplier-links is the only case that
+       legitimately reaches here: the supplier opens their link before a form
+       row exists. The normal admin flow (SupplierEvaluationCreate) writes the
+       report first with payload.public.token already set, so it is answered
+       by the lookup above and never falls through.
+
+       token is UUID in supplier_links; compare as text so an arbitrary
+       string is a clean miss instead of an invalid-input error. */
+    const minted = await client.query(
+      `SELECT 1 FROM supplier_links WHERE token::text = $1 LIMIT 1`,
+      [token]
+    );
+    if (!minted.rowCount) {
+      return res.status(404).json({ ok: false, error: "LINK_NOT_FOUND" });
+    }
+
     // 2) not found → auto-create placeholder report
     await client.query("BEGIN");
 

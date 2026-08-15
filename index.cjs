@@ -10,6 +10,7 @@ const password = require("./utils/password.cjs");
 const rateLimit = require("./utils/rateLimit.cjs");
 const token = require("./utils/token.cjs");
 const { requireAuth, requireAuthStrict } = require("./utils/requireAuth.cjs");
+const { rejectBase64 } = require("./utils/noBase64.cjs");
 
 const registerReportsRoutes = require("./routes/reports.cjs");
 const registerSupplierPublicRoutes = require("./routes/supplierPublic.cjs");
@@ -79,6 +80,18 @@ app.use((req, res, next) => {
 });
 
 app.use(express.json({ limit: "20mb" }));
+
+/* No file may be stored inside a report payload — see utils/noBase64.cjs for
+   the measurements behind this. Mounted here rather than on each route so it
+   covers all seven write verbs under /api/reports, and every one added later.
+   Reads and deletes carry no body; e-mail routes are deliberately excluded
+   because attachments legitimately travel as base64 in transit. */
+app.use("/api/reports", (req, res, next) => {
+  if (req.method === "GET" || req.method === "DELETE" || req.method === "OPTIONS") {
+    return next();
+  }
+  return rejectBase64(req, res, next);
+});
 
 const deps = {
   pool,
