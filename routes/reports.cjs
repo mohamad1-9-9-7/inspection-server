@@ -221,6 +221,21 @@ app.get("/api/reports", pingBypass, readLimiter, auth, async (req, res) => {
 
     const truthy = (v) => ["1", "true", "yes"].includes(String(v || "").toLowerCase());
 
+    // One canonical business date for every report shape. Older forms use
+    // payload.date or payload.cutDate, while newer forms use reportDate.
+    // Keeping this expression shared by the date index, selected-record read,
+    // and range read prevents the calendar from disagreeing with the record.
+    const BUSINESS_DATE = `
+      COALESCE(
+        NULLIF(payload->>'cutDate', ''),
+        NULLIF(payload->>'date', ''),
+        NULLIF(LEFT(payload->>'reportDate', 10), ''),
+        NULLIF(payload#>>'{entries,0,date}', ''),
+        NULLIF(payload#>>'{header,reportDate}', ''),
+        NULLIF(payload#>>'{header,month}', ''),
+        NULLIF(payload#>>'{header,issueDate}', '')
+      )`;
+
     // `?type=X&dates=1` — the calendar of a report type: one { id, reportDate }
     // per record, no payload and no LIMIT. A few hundred date strings weigh
     // nothing, while `SELECT *` on the same rows drags every JSON payload across
@@ -231,10 +246,10 @@ app.get("/api/reports", pingBypass, readLimiter, auth, async (req, res) => {
     // this branch still answers with the same { id, reportDate } shape.
     if (truthy(req.query?.dates) && type) {
       const { rows } = await pool.query(
-        `SELECT id, payload->>'reportDate' AS "reportDate"
+        `SELECT id, ${BUSINESS_DATE} AS "reportDate"
            FROM reports
-          WHERE type = $1 AND payload->>'reportDate' IS NOT NULL
-          ORDER BY payload->>'reportDate' DESC, created_at DESC`,
+          WHERE type = $1 AND ${BUSINESS_DATE} IS NOT NULL
+          ORDER BY ${BUSINESS_DATE} DESC, created_at DESC`,
         [type]
       );
       return res.json({ ok: true, data: rows });
@@ -246,7 +261,7 @@ app.get("/api/reports", pingBypass, readLimiter, auth, async (req, res) => {
     if (type && reportDate) {
       const { rows } = await pool.query(
         `SELECT * FROM reports
-          WHERE type = $1 AND payload->>'reportDate' = $2
+          WHERE type = $1 AND ${BUSINESS_DATE} = $2
           ORDER BY created_at DESC
           LIMIT 1`,
         [type, reportDate]
@@ -269,13 +284,6 @@ app.get("/api/reports", pingBypass, readLimiter, auth, async (req, res) => {
        STABLE. A row carrying none of the three keys has no business date to
        range over, so it stays out of a dated query by design.
        `idx_reports_business_date` backs this — keep the two in sync. */
-    const BUSINESS_DATE = `
-      COALESCE(
-        NULLIF(payload->>'cutDate', ''),
-        NULLIF(payload->>'date', ''),
-        NULLIF(LEFT(payload->>'reportDate', 10), '')
-      )`;
-
     const isDay = (v) => /^\d{4}-\d{2}-\d{2}$/.test(v);
     const from = normText(req.query?.from || "");
     const to = normText(req.query?.to || "");
@@ -308,7 +316,7 @@ app.get("/api/reports", pingBypass, readLimiter, auth, async (req, res) => {
             type,
             created_at,
             updated_at,
-            payload->>'reportDate' AS "reportDate",
+            ${BUSINESS_DATE} AS "reportDate",
             payload->>'invoiceNo'  AS "invoiceNo"
           FROM reports
           WHERE type = $1
@@ -324,7 +332,7 @@ app.get("/api/reports", pingBypass, readLimiter, auth, async (req, res) => {
             type,
             created_at,
             updated_at,
-            payload->>'reportDate' AS "reportDate",
+            ${BUSINESS_DATE} AS "reportDate",
             payload->>'invoiceNo'  AS "invoiceNo"
           FROM reports
           ORDER BY created_at DESC
