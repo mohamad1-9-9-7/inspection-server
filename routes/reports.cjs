@@ -232,8 +232,10 @@ app.get("/api/reports", pingBypass, readLimiter, auth, async (req, res) => {
         NULLIF(LEFT(payload->>'reportDate', 10), ''),
         NULLIF(payload#>>'{entries,0,date}', ''),
         NULLIF(payload#>>'{header,reportDate}', ''),
+        NULLIF(payload#>>'{header,dateIssued}', ''),
         NULLIF(payload#>>'{header,month}', ''),
-        NULLIF(payload#>>'{header,issueDate}', '')
+        NULLIF(payload#>>'{header,issueDate}', ''),
+        NULLIF(payload#>>'{headRow,reportDate}', '')
       )`;
 
     // `?type=X&dates=1` — the calendar of a report type: one { id, reportDate }
