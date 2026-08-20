@@ -50,33 +50,62 @@ const REF_PREFIX = {
 
 const REF_PAD = 6;
 
+/* Branch-scoped references: instead of one global counter per type, these keep
+   a separate counter per branch and lead the number with the branch code —
+   e.g. the butcher's cutting log reads "POS 10 — 00001", counting from 1 for
+   every branch on its own. The counter row key is `<type>:<branch>`, so no
+   schema change is needed (report_counters.type is just text).
+
+   scopeOf() pulls the branch out of the payload; a record without a branch is
+   left unnumbered rather than sharing some catch-all counter. */
+const REF_SCOPED = {
+  butcher_cut_log: {
+    pad: 5,
+    scopeOf: (p) => normText(p?.branch || ""),
+    format: (scope, n, pad) => `${scope} — ${String(n).padStart(pad, "0")}`,
+  },
+};
+
 function hasRef(payload) {
   return !!(payload && typeof payload.refNo === "string" && payload.refNo.trim());
 }
 
 /** Bump the counter for `type` and return the next reference, or null if the
  *  type isn't reference-tracked. `q` is a pool or a transaction client. */
-async function allocRef(q, type) {
-  const prefix = REF_PREFIX[type];
-  if (!prefix) return null;
-
+async function bumpCounter(q, key) {
   const { rows } = await q.query(
     `INSERT INTO report_counters (type, last)
      VALUES ($1, 1)
      ON CONFLICT (type) DO UPDATE
        SET last = report_counters.last + 1, updated_at = now()
      RETURNING last`,
-    [type]
+    [key]
   );
+  return rows[0].last;
+}
 
-  return `AM-${prefix}-${String(rows[0].last).padStart(REF_PAD, "0")}`;
+async function allocRef(q, type, payload) {
+  // Branch-scoped types count per branch: "POS 10 — 00001".
+  const scoped = REF_SCOPED[type];
+  if (scoped) {
+    const scope = scoped.scopeOf(payload);
+    if (!scope) return null;                       // no branch → no number
+    const n = await bumpCounter(q, `${type}:${scope}`);
+    return scoped.format(scope, n, scoped.pad);
+  }
+
+  const prefix = REF_PREFIX[type];
+  if (!prefix) return null;
+
+  const n = await bumpCounter(q, type);
+  return `AM-${prefix}-${String(n).padStart(REF_PAD, "0")}`;
 }
 
 /** Stamp a reference onto a payload that is about to be INSERTed.
  *  Never overwrites one the caller already supplied (restore / import). */
 async function stampRef(q, type, payload) {
-  if (!REF_PREFIX[type] || hasRef(payload)) return payload;
-  const refNo = await allocRef(q, type);
+  if ((!REF_PREFIX[type] && !REF_SCOPED[type]) || hasRef(payload)) return payload;
+  const refNo = await allocRef(q, type, payload);
   return refNo ? { ...payload, refNo } : payload;
 }
 
