@@ -264,7 +264,14 @@ app.get("/api/reports", pingBypass, readLimiter, auth, async (req, res) => {
         NULLIF(payload#>>'{header,dateIssued}', ''),
         NULLIF(payload#>>'{header,month}', ''),
         NULLIF(payload#>>'{header,issueDate}', ''),
-        NULLIF(payload#>>'{headRow,reportDate}', '')
+        NULLIF(payload#>>'{headRow,reportDate}', ''),
+        /* The FTR pre-loading sheets keep their date only at header.date, so
+           every one of their records resolved to NULL here: a reportDate=
+           query never matched them, dates=1 filtered them out of the calendar
+           entirely, and the input screen fell back to downloading all 259
+           records on every save. Appended last so it fires only when nothing
+           above resolves - no existing record changes the date it reports. */
+        NULLIF(LEFT(payload#>>'{header,date}', 10), '')
       )`;
 
     // `?type=X&dates=1` — the calendar of a report type: one { id, reportDate }
