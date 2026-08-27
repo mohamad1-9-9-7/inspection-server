@@ -237,6 +237,83 @@ async function fetchOldById(id) {
 }
 
 /* ============================================================
+   نطاق سجلات التقطيع حسب الملحمة (butcher_cut_log)
+
+   المتصفّح عم يحصر لوحة المشرف على ملاحمه، بس حصر الواجهة بيتجاوزه أي حدا
+   بيفتح /api/reports بنفسه. هون منفرضه على السيرفر.
+
+   القاعدة مقصودة ضيّقة، حتى ما تكسر ولا شاشة من مئات الشاشات اللي بتضرب
+   /api/reports:
+
+     • بتنطبق على نوع واحد فقط: butcher_cut_log.
+     • ما بتنطبق إذا ما عرفنا مين المستخدم (توكن غايب أو AUTH_SECRET مش
+       مضبوط) — نفس فلسفة requireAuth بوضع التدقيق: ما منكسر شي هلق،
+       ومنفرض لحظة ما تنضبط البيئة.
+     • ما بتنطبق على الأدمن — هو اللي بيراقب كل الملاحم.
+     • ما بتنطبق على حساب مش مربوط بموظف نشط بالقوى العاملة.
+
+   المصدر: نفس سجل workforce_config اللي بتقرأه الواجهة، مخبّأ دقيقة
+   بالذاكرة — استعلام مع كل طلب بيوقظ Neon من السبات بلا داعٍ.
+============================================================ */
+const WF_TYPE = "workforce_config";
+const WF_TTL_MS = 60_000;
+let wfCache = { at: 0, people: [] };
+
+async function workforcePeople() {
+  if (Date.now() - wfCache.at < WF_TTL_MS) return wfCache.people;
+  try {
+    const { rows } = await pool.query(
+      `SELECT payload FROM reports
+         WHERE type = $1
+         ORDER BY updated_at DESC NULLS LAST, created_at DESC
+         LIMIT 1`,
+      [WF_TYPE]
+    );
+    const people = Array.isArray(rows?.[0]?.payload?.people) ? rows[0].payload.people : [];
+    wfCache = { at: Date.now(), people };
+  } catch (e) {
+    /* السجل مش موجود أو القراءة فشلت → بلا حصر. الفشل هون ما بيجوز يقفل
+       شاشة على حدا؛ الحصر ميزة فوق، مش شرط تشغيل. */
+    console.warn("[cut-scope] workforce_config read failed:", e?.message || e);
+    wfCache = { at: Date.now(), people: [] };
+  }
+  return wfCache.people;
+}
+
+/** أكواد ملاحم صاحب الطلب، أو null = بلا حصر. */
+async function cutScopeSites(req, type) {
+  if (type !== "butcher_cut_log") return null;
+
+  const u = req.user;
+  if (!u || u.isAdmin) return null;
+
+  const key = String(u.username || "").trim().toLowerCase();
+  if (!key) return null;
+
+  const people = await workforcePeople();
+  const me = people.find(
+    (x) => String(x?.username || "").trim().toLowerCase() === key
+  );
+  if (!me || me.status !== "active") return null;
+
+  /* «مسؤول المخزون» صلاحياته داخل المخزون كاملة متل الأدمن — بيشوف كل
+     الملاحم. لازم يضل مطابق للواجهة، وإلا بتوريه اللوحة كل شي والسيرفر
+     بيرجّعله ملحمته وبس. */
+  if (me.role === "inventoryOfficer") return null;
+
+  const sites = Array.isArray(me.sites) && me.sites.length
+    ? me.sites
+    : (me.site ? [me.site] : []);
+  return sites.length ? sites.map(String) : null;
+}
+
+/** فلترة صفوف بتحمل payload على الملاحم المسموحة. */
+const scopeRows = (rows, sites) =>
+  sites
+    ? (rows || []).filter((r) => sites.includes(String(r?.payload?.branch || "")))
+    : rows;
+
+/* ============================================================
    Reports API  (all routes gated by `auth` — audit or enforce
    depending on REQUIRE_AUTH; ping probes bypass via pingBypass)
 ============================================================ */
@@ -249,6 +326,9 @@ app.get("/api/reports", pingBypass, readLimiter, auth, async (req, res) => {
     const limit = clampInt(req.query?.limit, 200, 1, 5000);
 
     const truthy = (v) => ["1", "true", "yes"].includes(String(v || "").toLowerCase());
+
+    // null = بلا حصر (الحالة الغالبة). مصفوفة = ملاحم صاحب التوكن.
+    const scopeSites = await cutScopeSites(req, type);
 
     // One canonical business date for every report shape. Older forms use
     // payload.date or payload.cutDate, while newer forms use reportDate.
@@ -283,12 +363,19 @@ app.get("/api/reports", pingBypass, readLimiter, auth, async (req, res) => {
     // Callers send `&lite=1&limit=5000` alongside, so a server that predates
     // this branch still answers with the same { id, reportDate } shape.
     if (truthy(req.query?.dates) && type) {
+      // هالفرع بيرجّع تواريخ بلا payload، فما فينا نفلتر بعدين — الشرط بالـSQL.
+      const dp = [type];
+      let siteWhere = "";
+      if (scopeSites) {
+        dp.push(scopeSites);
+        siteWhere = ` AND payload->>'branch' = ANY($${dp.length})`;
+      }
       const { rows } = await pool.query(
         `SELECT id, ${BUSINESS_DATE} AS "reportDate"
            FROM reports
-          WHERE type = $1 AND ${BUSINESS_DATE} IS NOT NULL
+          WHERE type = $1 AND ${BUSINESS_DATE} IS NOT NULL${siteWhere}
           ORDER BY ${BUSINESS_DATE} DESC, created_at DESC`,
-        [type]
+        dp
       );
       return res.json({ ok: true, data: rows });
     }
@@ -304,7 +391,7 @@ app.get("/api/reports", pingBypass, readLimiter, auth, async (req, res) => {
           LIMIT 1`,
         [type, reportDate]
       );
-      return res.json({ ok: true, data: rows });
+      return res.json({ ok: true, data: scopeRows(rows, scopeSites) });
     }
 
     /* `?type=X&from=YYYY-MM-DD&to=YYYY-MM-DD` — only the window the screen
@@ -339,7 +426,7 @@ app.get("/api/reports", pingBypass, readLimiter, auth, async (req, res) => {
           LIMIT $${p.length}`,
         p
       );
-      return res.json({ ok: true, data: rows });
+      return res.json({ ok: true, data: scopeRows(rows, scopeSites) });
     }
 
     let q = "";
@@ -357,11 +444,12 @@ app.get("/api/reports", pingBypass, readLimiter, auth, async (req, res) => {
             ${BUSINESS_DATE} AS "reportDate",
             payload->>'invoiceNo'  AS "invoiceNo"
           FROM reports
-          WHERE type = $1
+          WHERE type = $1${scopeSites ? ` AND payload->>'branch' = ANY($3)` : ""}
           ORDER BY created_at DESC
           LIMIT $2
         `;
-        params = [type, limit];
+        // lite ما بيرجّع payload، فما فينا نفلتر بعدين — الشرط لازم يكون بالـSQL.
+        params = scopeSites ? [type, limit, scopeSites] : [type, limit];
       } else {
         q = `
           SELECT
@@ -389,7 +477,10 @@ app.get("/api/reports", pingBypass, readLimiter, auth, async (req, res) => {
     }
 
     const { rows } = await pool.query(q, params);
-    res.json({ ok: true, data: rows });
+    /* الفروع اللي بترجّع payload بتنفلتر هون؛ فرع lite المطبوع فوق انفلتر
+       بالـSQL أصلاً، و`scopeRows` بتمرّق صفوفه كما هي لأنها ما بتلاقي payload
+       — فما منشيل شي بالغلط. */
+    res.json({ ok: true, data: isLite ? rows : scopeRows(rows, scopeSites) });
   } catch (e) {
     console.error(e);
     res.status(500).json({ ok: false, error: "db select failed" });
