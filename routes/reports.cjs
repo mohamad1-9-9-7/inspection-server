@@ -423,11 +423,11 @@ app.get("/api/reports", pingBypass, readLimiter, auth, async (req, res) => {
     if (type && (isDay(from) || isDay(to))) {
       const where = ["type = $1"];
       const p = [type];
-      if (isDay(from)) { p.push(from); where.push(`${BUSINESS_DATE} >= ${p.length}`); }
-      if (isDay(to)) { p.push(to); where.push(`${BUSINESS_DATE} <= ${p.length}`); }
+      if (isDay(from)) { p.push(from); where.push(`${BUSINESS_DATE} >= $${p.length}`); }
+      if (isDay(to)) { p.push(to); where.push(`${BUSINESS_DATE} <= $${p.length}`); }
       if (employeeNo) {
         p.push(employeeNo);
-        where.push(`payload->>'employeeNo' = ${p.length}`);
+        where.push(`payload->>'employeeNo' = $${p.length}`);
       }
       p.push(limit);
       const { rows } = await pool.query(
