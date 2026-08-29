@@ -413,11 +413,22 @@ app.get("/api/reports", pingBypass, readLimiter, auth, async (req, res) => {
     const from = normText(req.query?.from || "");
     const to = normText(req.query?.to || "");
 
+    /* `?employeeNo=875` — سجلات موظّف واحد.
+       شاشة «شغلي» بتعرض شغل جزار واحد؛ بدون هالفلتر كانت تسحب سجلات كل
+       الملاحم للنافذة كلها (بالـpayload كامل) وتفلتر بالمتصفّح — أثقل طلب
+       بالنظام لأقل فائدة، وعلى جهاز كشك بالملحمة. الفلتر نصّي على
+       payload->>'employeeNo' لأن الرقم بينحفظ نصّ (بيحتمل أصفار بادئة). */
+    const employeeNo = normText(req.query?.employeeNo || "");
+
     if (type && (isDay(from) || isDay(to))) {
       const where = ["type = $1"];
       const p = [type];
-      if (isDay(from)) { p.push(from); where.push(`${BUSINESS_DATE} >= $${p.length}`); }
-      if (isDay(to)) { p.push(to); where.push(`${BUSINESS_DATE} <= $${p.length}`); }
+      if (isDay(from)) { p.push(from); where.push(`${BUSINESS_DATE} >= ${p.length}`); }
+      if (isDay(to)) { p.push(to); where.push(`${BUSINESS_DATE} <= ${p.length}`); }
+      if (employeeNo) {
+        p.push(employeeNo);
+        where.push(`payload->>'employeeNo' = ${p.length}`);
+      }
       p.push(limit);
       const { rows } = await pool.query(
         `SELECT * FROM reports
@@ -467,7 +478,13 @@ app.get("/api/reports", pingBypass, readLimiter, auth, async (req, res) => {
         params = [limit];
       }
     } else {
-      if (type) {
+      if (type && employeeNo) {
+        // نفس فلتر الموظّف لما ما في نافذة تاريخ
+        q = `SELECT * FROM reports
+              WHERE type=$1 AND payload->>'employeeNo' = $2
+              ORDER BY created_at DESC LIMIT $3`;
+        params = [type, employeeNo, limit];
+      } else if (type) {
         q = `SELECT * FROM reports WHERE type=$1 ORDER BY created_at DESC LIMIT $2`;
         params = [type, limit];
       } else {
