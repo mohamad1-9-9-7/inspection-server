@@ -188,6 +188,12 @@ function getTransporter(cfg) {
     port: cfg.port,
     secure: cfg.secure,
     auth: { user: cfg.user, pass: cfg.pass },
+    /* On a non-465 port nodemailer will happily fall back to an UNENCRYPTED
+       session when the server does not advertise STARTTLS - which would put the
+       mailbox password on the wire in clear text. requireTLS turns that silent
+       downgrade into a loud failure. No effect when secure:true (465), where
+       the socket is encrypted before the first byte. */
+    requireTLS: !cfg.secure,
     connectionTimeout: 20_000,
     greetingTimeout: 20_000,
     socketTimeout: 60_000,
