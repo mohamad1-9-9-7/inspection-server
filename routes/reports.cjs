@@ -43,9 +43,15 @@ module.exports = function registerReportsRoutes(app, deps = {}) {
    else in the app needs to change.
 ============================================================ */
 const REF_PREFIX = {
-  destruction_record: "CND",
-  returns:            "RET",
-  returns_customers:  "CRT",
+  destruction_record:     "CND",
+  returns:                "RET",
+  returns_customers:      "CRT",
+  // NC numbers used to be typed by hand ("NC-001"), so two people raising a
+  // finding on the same morning wrote the same number. Each NCR type keeps its
+  // own counter: QCS and POS 19 store their reports separately and must not
+  // share a sequence.
+  qcs_non_conformance:    "NCR",
+  pos19_non_conformance:  "NCP",
 };
 
 const REF_PAD = 6;
