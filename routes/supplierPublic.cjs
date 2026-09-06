@@ -345,6 +345,9 @@ app.post("/api/supplier-links/:token/submit", publicLimiter, async (req, res) =>
 
     const newPayload = cleanJsonbObject({
       ...payload,
+      /* The autosaved draft has been superseded by the real submission —
+         keeping it would leave a second, staler copy of every answer behind. */
+      draft: undefined,
       recordDate: recordDate || normText(payload.recordDate) || todayISO(),
       fields: mergedFields,
       answers: mergedAnswers,
@@ -524,6 +527,47 @@ app.post("/api/reports/public/:token/opened", publicLimiter, async (req, res) =>
     console.error("POST /api/reports/public/:token/opened ERROR =", e);
     // never fail the supplier's page open over a tracking write
     return res.json({ ok: true, updated: 0 });
+  }
+});
+
+/* Save an UNSENT draft of the supplier's answers.
+
+   Same shape of trust as /opened: public, but strictly scoped — it only ever
+   writes payload.draft on the report that owns this token, never touches
+   public/meta/fields, and refuses once the form has been submitted so a stale
+   autosave cannot appear to reopen a closed questionnaire. The supplier page
+   also keeps a localStorage copy; this one is what survives a new device. */
+app.post("/api/reports/public/:token/draft", publicLimiter, async (req, res) => {
+  try {
+    const token = normText(req.params.token || "");
+    if (!token) return res.status(400).json({ ok: false, error: "token required" });
+
+    const body = isObj(req.body) ? req.body : {};
+    const draft = cleanJsonbObject(body.draft);
+    if (!draft || !Object.keys(draft).length) {
+      return res.status(400).json({ ok: false, error: "draft required" });
+    }
+    /* A draft is answers and file URLs, never uploads — anything approaching a
+       megabyte is not a form being filled in. */
+    if (JSON.stringify(draft).length > 512 * 1024) {
+      return res.status(413).json({ ok: false, error: "draft_too_large" });
+    }
+    draft.savedAt = new Date().toISOString();
+
+    const upd = await pool.query(
+      `UPDATE reports
+          SET payload = jsonb_set(payload, '{draft}', $2::jsonb, true),
+              updated_at = now()
+        WHERE (payload->'public'->>'token') = $1
+          AND (payload->'public'->>'submittedAt') IS NULL
+          AND COALESCE((payload->'meta'->>'submitted')::boolean, false) = false`,
+      [token, JSON.stringify(draft)]
+    );
+    return res.json({ ok: true, saved: upd.rowCount > 0 });
+  } catch (e) {
+    console.error("POST /api/reports/public/:token/draft ERROR =", e);
+    /* Never fail the supplier's typing over an autosave. */
+    return res.json({ ok: false, saved: false });
   }
 });
 
@@ -775,6 +819,9 @@ app.post("/api/reports/public/:token/submit", publicLimiter, async (req, res) =>
 
     const newPayload = cleanJsonbObject({
       ...payload,
+      /* The autosaved draft has been superseded by the real submission —
+         keeping it would leave a second, staler copy of every answer behind. */
+      draft: undefined,
       recordDate: recordDate || normText(payload.recordDate) || todayISO(),
       fields: mergedFields,
       answers: mergedAnswers,

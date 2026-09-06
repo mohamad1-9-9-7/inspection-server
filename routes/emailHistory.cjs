@@ -20,18 +20,19 @@ app.post("/api/email-history", strict, async (req, res) => {
     const recipient_count = toEmails.length + ccEmails.length + bccEmails.length;
     const q = await pool.query(
       `INSERT INTO email_history (
-         sent_by, report_type, report_title, report_date,
+         sent_by, report_type, report_title, report_date, report_ref,
          subject, to_emails, cc_emails, bcc_emails, recipient_count,
          classification, priority, method, attachment_count, note,
          template_id, status
        ) VALUES (
-         $1,$2,$3,$4,$5,$6::jsonb,$7::jsonb,$8::jsonb,$9,$10,$11,$12,$13,$14,$15,$16
+         $1,$2,$3,$4,$5,$6,$7::jsonb,$8::jsonb,$9::jsonb,$10,$11,$12,$13,$14,$15,$16,$17
        ) RETURNING id, sent_at`,
       [
         String(f.sent_by || "").slice(0, 100),
         String(f.report_type || "").slice(0, 100),
         String(f.report_title || "").slice(0, 200),
         f.report_date || null,
+        f.report_ref ? String(f.report_ref).slice(0, 100) : null,
         String(f.subject || "").slice(0, 500),
         JSON.stringify(toEmails),
         JSON.stringify(ccEmails),
@@ -66,6 +67,17 @@ app.get("/api/email-history", strict, async (req, res) => {
     if (req.query.sent_by) {
       params.push(req.query.sent_by);
       where.push(`sent_by = $${params.length}`);
+    }
+    /* Per-record history: "how many times was THIS report mailed, to whom".
+       report_ref is the record's own reference; report_date is the fallback
+       for report types that have none. */
+    if (req.query.report_ref) {
+      params.push(req.query.report_ref);
+      where.push(`report_ref = $${params.length}`);
+    }
+    if (req.query.report_date) {
+      params.push(req.query.report_date);
+      where.push(`report_date = $${params.length}::date`);
     }
     if (req.query.classification) {
       params.push(req.query.classification);

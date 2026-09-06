@@ -426,6 +426,12 @@ module.exports = async function ensureSchema({ pool, genSalt, hashPw }) {
       created_at       TIMESTAMPTZ   NOT NULL DEFAULT now()
     );
   `);
+  /* The reference of the exact record that was mailed ("AM-NCR-000042").
+     report_date alone can no longer identify a report — several NCRs share a
+     day, one per branch — so a per-report send history needs this. Added as an
+     ALTER so existing installs pick it up on boot; old rows stay NULL. */
+  await pool.query(`ALTER TABLE email_history ADD COLUMN IF NOT EXISTS report_ref TEXT;`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_email_hist_report_ref  ON email_history(report_ref);`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_email_hist_sent_at     ON email_history(sent_at DESC);`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_email_hist_report_type ON email_history(report_type);`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_email_hist_sent_by     ON email_history(sent_by);`);
