@@ -319,6 +319,17 @@ const scopeRows = (rows, sites) =>
     ? (rows || []).filter((r) => sites.includes(String(r?.payload?.branch || "")))
     : rows;
 
+/** payload.draft = شغل نصف مكتوب من نموذج عام (تقييم المورد) — بيهمّ صاحب
+    الرابط لحاله لمّا يفتح صفحته، وما بتقراه ولا شاشة قائمة. لو تركناه بيمشي
+    مع كل صف بكل طلب قائمة، وهيدا بالضبط نوع التضخّم اللي كلّفنا باندويث قبل.
+    الصف المفرد (GET /api/reports/public/:token) بيرجّعه كما هو. */
+const stripDrafts = (rows) =>
+  (rows || []).map((r) =>
+    r && r.payload && r.payload.draft
+      ? { ...r, payload: { ...r.payload, draft: undefined } }
+      : r
+  );
+
 /* ============================================================
    Reports API  (all routes gated by `auth` — audit or enforce
    depending on REQUIRE_AUTH; ping probes bypass via pingBypass)
@@ -397,7 +408,7 @@ app.get("/api/reports", pingBypass, readLimiter, auth, async (req, res) => {
           LIMIT 1`,
         [type, reportDate]
       );
-      return res.json({ ok: true, data: scopeRows(rows, scopeSites) });
+      return res.json({ ok: true, data: stripDrafts(scopeRows(rows, scopeSites)) });
     }
 
     /* `?type=X&from=YYYY-MM-DD&to=YYYY-MM-DD` — only the window the screen
@@ -443,7 +454,7 @@ app.get("/api/reports", pingBypass, readLimiter, auth, async (req, res) => {
           LIMIT $${p.length}`,
         p
       );
-      return res.json({ ok: true, data: scopeRows(rows, scopeSites) });
+      return res.json({ ok: true, data: stripDrafts(scopeRows(rows, scopeSites)) });
     }
 
     let q = "";
@@ -503,7 +514,7 @@ app.get("/api/reports", pingBypass, readLimiter, auth, async (req, res) => {
     /* الفروع اللي بترجّع payload بتنفلتر هون؛ فرع lite المطبوع فوق انفلتر
        بالـSQL أصلاً، و`scopeRows` بتمرّق صفوفه كما هي لأنها ما بتلاقي payload
        — فما منشيل شي بالغلط. */
-    res.json({ ok: true, data: isLite ? rows : scopeRows(rows, scopeSites) });
+    res.json({ ok: true, data: isLite ? rows : stripDrafts(scopeRows(rows, scopeSites)) });
   } catch (e) {
     console.error(e);
     res.status(500).json({ ok: false, error: "db select failed" });

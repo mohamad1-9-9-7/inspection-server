@@ -392,8 +392,47 @@ app.post("/api/supplier-links/:token/submit", publicLimiter, async (req, res) =>
   }
 });
 
+/* Why a token has to be one we issued before anything is INSERTed:
+   /api/reports/public/:token and its /submit twin are unauthenticated, so
+   without this check any stranger (or scanner) grows the reports table one
+   junk row per made-up URL. That is exactly where the blank "Unspecified"
+   assessments with 0 Yes / 0 No / 0 N/A came from.
+
+   A token minted through POST /api/supplier-links is the only case that
+   legitimately reaches an INSERT: the supplier opens their link before a form
+   row exists. The normal admin flow (SupplierEvaluationCreate) writes the
+   report first with payload.public.token already set, so it is answered by
+   the lookup and never falls through.
+
+   token is UUID in supplier_links; compare as text so an arbitrary string is
+   a clean miss instead of an invalid-input error. */
+async function tokenWasMinted(client, token) {
+  if (INSPECTION_TOKEN_RE.test(token)) return false;
+  const minted = await client.query(
+    `SELECT 1 FROM supplier_links WHERE token::text = $1 LIMIT 1`,
+    [token]
+  );
+  return minted.rowCount > 0;
+}
+
+/* Supplier twin of inspectionLinkProblem: null when the link is usable,
+   otherwise {status, error}. Revoking from the tracker writes public.disabled;
+   until now only the client honoured it, so a disabled link could still be
+   opened and answered. */
+function supplierLinkProblem(payload) {
+  const pub = isObj(payload?.public) ? payload.public : {};
+  if (pub.disabled || pub.revokedAt) {
+    return { status: 410, error: "LINK_DISABLED", disabledAt: pub.disabledAt || pub.revokedAt || null };
+  }
+  const exp = pub.expiresAt ? Date.parse(pub.expiresAt) : NaN;
+  if (Number.isFinite(exp) && exp < Date.now()) {
+    return { status: 410, error: "LINK_EXPIRED", expiresAt: pub.expiresAt };
+  }
+  return null;
+}
+
 /* ======================================================================
-   ✅ SUPPLIER PUBLIC TOKEN API (AUTO-CREATE if not found)
+   ✅ SUPPLIER PUBLIC TOKEN API (AUTO-CREATE only for a minted token)
 ====================================================================== */
 app.get("/api/reports/public/:token", publicLimiter, async (req, res) => {
   let client;
@@ -422,35 +461,15 @@ app.get("/api/reports/public/:token", publicLimiter, async (req, res) => {
         /* Branches get the filtered projection — never the raw row. */
         return res.json({ ok: true, report: sanitizeInspectionReport(row), created: false });
       }
+      const problem = supplierLinkProblem(row.payload);
+      if (problem) return res.status(problem.status).json({ ok: false, ...problem });
       return res.json({ ok: true, report: row, created: false });
     }
 
     /* An inspection token that resolves to nothing is a dead link (report
-       deleted, token rotated, or a typo). Auto-creating a blank supplier form
-       for it would both mislead the branch and litter the reports table with
-       junk rows from an unauthenticated endpoint. */
-    if (INSPECTION_TOKEN_RE.test(token)) {
-      return res.status(404).json({ ok: false, error: "LINK_NOT_FOUND" });
-    }
-
-    /* Beyond this point we are about to INSERT from an unauthenticated GET,
-       so the token has to be one we actually issued. Without this check any
-       stranger could grow the reports table one junk row per made-up URL —
-       /api/reports/public/anything did exactly that.
-
-       A token minted through POST /api/supplier-links is the only case that
-       legitimately reaches here: the supplier opens their link before a form
-       row exists. The normal admin flow (SupplierEvaluationCreate) writes the
-       report first with payload.public.token already set, so it is answered
-       by the lookup above and never falls through.
-
-       token is UUID in supplier_links; compare as text so an arbitrary
-       string is a clean miss instead of an invalid-input error. */
-    const minted = await client.query(
-      `SELECT 1 FROM supplier_links WHERE token::text = $1 LIMIT 1`,
-      [token]
-    );
-    if (!minted.rowCount) {
+       deleted, token rotated, or a typo), and any other unminted token is a
+       made-up URL. Either way, nothing gets created. */
+    if (!(await tokenWasMinted(client, token))) {
       return res.status(404).json({ ok: false, error: "LINK_NOT_FOUND" });
     }
 
@@ -589,6 +608,26 @@ app.post("/api/reports/public/:token/submit", publicLimiter, async (req, res) =>
     const productsList = cleanJsonbArray(body.productsList);
     const declaration = cleanJsonbObject(body.declaration);
     const supplierType = normText(body.supplierType || fields.supplier_type || "");
+
+    /* An "assessment" with no answers, no typed fields, no products, no files
+       and no signed declaration is not a reply — it is an empty POST. Letting
+       one through is what filled the results list with blank rows: supplier
+       type "Unspecified", 0 Yes / 0 No / 0 N/A, total 0.
+       Inspection evidence is exempt: it carries closedEvidenceUpdates instead
+       and is validated on its own branch below. */
+    const isEvidencePost =
+      normText(body.submissionType || fields.submissionType || "") === "inspection_closed_evidence" ||
+      Array.isArray(body.closedEvidenceUpdates);
+    const carriesSomething =
+      Object.keys(answers).length > 0 ||
+      Object.values(fields).some((v) => String(v ?? "").trim() !== "") ||
+      attachments.length > 0 ||
+      productsList.length > 0 ||
+      Object.keys(fieldAttachments).length > 0 ||
+      declaration.agreed === true;
+    if (!isEvidencePost && !carriesSomething) {
+      return res.status(400).json({ ok: false, error: "EMPTY_SUBMISSION" });
+    }
 
     await client.query("BEGIN");
 
@@ -776,11 +815,26 @@ app.post("/api/reports/public/:token/submit", publicLimiter, async (req, res) =>
         });
       }
 
+      const problem = supplierLinkProblem(payload);
+      if (problem) {
+        await client.query("ROLLBACK");
+        return res.status(problem.status).json({ ok: false, ...problem });
+      }
+
       if (payload?.meta?.submitted === true || payload?.meta?.submittedAt) {
         await client.query("ROLLBACK");
         return res.status(409).json({ ok: false, error: "ALREADY_SUBMITTED" });
       }
     } else {
+      /* Same gate as the GET — see tokenWasMinted. This branch INSERTs from an
+         unauthenticated POST and then stamps the row submitted, so an unminted
+         token here is how a stranger manufactured a finished-looking, empty
+         supplier evaluation. */
+      if (!(await tokenWasMinted(client, token))) {
+        await client.query("ROLLBACK");
+        return res.status(404).json({ ok: false, error: "LINK_NOT_FOUND" });
+      }
+
       const nowIso = new Date().toISOString();
       const recDate = todayISO();
 
