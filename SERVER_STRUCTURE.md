@@ -30,6 +30,10 @@ D:\inspection-server
     common.cjs
     password.cjs
     rateLimit.cjs
+    requireAuth.cjs
+    token.cjs
+    permissions.cjs
+    planView.cjs
 
   routes
     reports.cjs
@@ -39,8 +43,14 @@ D:\inspection-server
     trainingLinks.cjs
     media.cjs
     admin.cjs
+    accounts.cjs
     billing.cjs
     emailHistory.cjs
+    mailer.cjs
+    audit.cjs
+
+  docs
+    ACCOUNTS_PERMISSIONS_PACKAGES.md
 ```
 
 ## File Responsibilities
@@ -123,6 +133,49 @@ Contains:
 
 Current hashing uses Node `crypto.scryptSync` for newer passwords and keeps
 legacy HMAC verification support.
+
+### `utils/permissions.cjs`
+
+The permission vocabulary shared by the whole app.
+
+Contains:
+
+- `ACTIONS` — the only verbs that mean anything (`view`, `create`, `edit`,
+  `delete`, `export`, `approve`)
+- `CORE_SECTIONS` / `REPORT_SECTIONS` — labelled sections (Arabic + English)
+- `ROLE_TEMPLATES` — ready-made permission sets
+- `buildCatalog` — the catalog the permissions screen renders itself from,
+  with report modules discovered from the data
+- `normalizeCrudPerms` / `normalizePermissions` / `normalizeAllowedBranches`
+  — run by every write route before anything is stored
+
+Before this file existed the permission blob was free-form, so a typo became
+a permission nobody had and no screen could list the sections.
+
+### `utils/planView.cjs`
+
+The package (plan) view model behind the packages card.
+
+Contains:
+
+- `toPlanView` — a `plans` row turned into a card: explicit `unlimited`
+  flags, a headline price with its period, bilingual labels, quota bars
+- `periodView` — days remaining, percent elapsed, expiry severity
+- `buildWarnings` — the card's banners, already phrased in both languages
+- `limitView`, `money`, `PERIODS`
+
+### `utils/requireAuth.cjs`
+
+Auth middleware.
+
+Contains:
+
+- `requireAuth` — soft gate for `/api/reports` (audit or enforce, per `REQUIRE_AUTH`)
+- `requireAuthStrict` — token required
+- `requireAdmin` / `requireSuperAdmin` — role required
+
+All three fall open with a logged warning when `AUTH_SECRET` is unset, since
+the server cannot issue a token in that state.
 
 ### `utils/rateLimit.cjs`
 
@@ -221,7 +274,7 @@ Includes:
 
 ### `routes/admin.cjs`
 
-Authentication, users, activity log, and presence.
+Authentication, activity log, and presence.
 
 Includes:
 
@@ -229,21 +282,45 @@ Includes:
 - summary endpoint
 - presence endpoints
 - login/logout
-- app user CRUD
 - activity log
 - failed login analytics
 
-### `routes/billing.cjs`
+App user CRUD used to live here and now lives in `routes/accounts.cjs`.
 
-Plans, companies, subscription, billing profile, and invoices.
+### `routes/accounts.cjs`
+
+The accounts centre and the permissions centre.
 
 Includes:
 
-- `/api/plans`
+- `/api/app-users` CRUD (moved from `admin.cjs`, same URLs and shapes)
+- `/api/app-users/:id/status`, `/reset-password`, `/permissions`
+- `/api/accounts/overview`, `/api/accounts/policy`
+- `/api/permissions/catalog`, `/api/permissions/templates/:id`,
+  `/api/permissions/bulk`
+
+Every route needs an admin token, is scoped to the caller's company,
+validates its input, enforces the package's seat limit, and writes an
+audit line. See `docs/ACCOUNTS_PERMISSIONS_PACKAGES.md` for the contract.
+
+### `routes/billing.cjs`
+
+Packages (plans), companies, subscription, billing profile, and invoices.
+
+Includes:
+
+- `/api/plans`, `/api/plans/:id`
+- `/api/packages/overview` (alias `/api/subscription/overview`) — the whole
+  packages card in one call: plan, limits, real usage, days remaining,
+  bilingual warnings
 - `/api/companies`
 - `/api/subscription`
 - `/api/billing-profile`
 - `/api/invoices`
+
+Plans are returned through `utils/planView.cjs`, with the raw columns still
+on the object so older screens keep working. `PUT` on plans and companies is
+partial — the previous full-row update blanked any field the caller omitted.
 
 ### `routes/emailHistory.cjs`
 
@@ -301,6 +378,9 @@ registerBranchesRoutes(app, deps);
 - Avoid duplicating database connection logic in route files.
 - Use helpers from `utils` through `deps` instead of redefining them.
 - Bigger future work should focus on subscription enforcement and company data isolation.
+- `reports` still has no `company_id`. Seats are counted per company, but
+  branch and monthly report usage on the packages card are platform-wide
+  totals — `usage.scope` in the response says which is which.
 
 ## Verification Done
 
@@ -320,4 +400,17 @@ All CommonJS files passed syntax check.
 All route modules registered successfully.
 Route count before: 69
 Route count after: 69
+```
+
+## Accounts / Permissions / Packages Update
+
+The accounts centre, the permissions centre and the packages card were
+reworked; `docs/ACCOUNTS_PERMISSIONS_PACKAGES.md` holds the full API
+contract. Verification after that change:
+
+```text
+node --check on every changed file
+route registration diff against origin/main: +12 routes, 0 removed, 0 duplicated
+32 in-process API assertions (fake pg pool, real express + route modules)
+16 unit assertions on utils/permissions.cjs and utils/planView.cjs
 ```

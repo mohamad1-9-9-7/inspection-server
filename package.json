@@ -4,7 +4,8 @@
   "type": "commonjs",
   "main": "index.cjs",
   "scripts": {
-    "start": "node index.cjs"
+    "start": "node index.cjs",
+    "test": "node tests/permissions-packages.test.cjs"
   },
   "engines": {
     "node": "18.x"

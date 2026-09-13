@@ -159,11 +159,13 @@ app.post("/api/auth/login", async (req, res) => {
     if (!username || !password)
       return res.status(400).json({ ok: false, error: "username and password required" });
 
+    /* Case-insensitive on purpose: "Ahmad" and "ahmad" are one account —
+       the unique index on lower(username) guarantees the match is unique. */
     const q = await pool.query(
       `SELECT id, username, display_name, password_hash, salt,
               permissions, crud_perms, employees, allowed_branches, is_active, is_admin, is_super_admin, last_login,
-              company_id
-         FROM app_users WHERE username = $1 LIMIT 1`,
+              company_id, email, job_title, role_template, must_change_password
+         FROM app_users WHERE lower(username) = lower($1) LIMIT 1`,
       [username]
     );
     /* Helper: log a failed login attempt for the security monitor */
@@ -210,7 +212,8 @@ app.post("/api/auth/login", async (req, res) => {
     if (user.company_id) {
       const cq = await pool.query(
         `SELECT c.id, c.name, c.status, c.start_date, c.end_date,
-                p.name AS plan_name, p.max_branches, p.max_users
+                p.id AS plan_id, p.name AS plan_name, p.name_ar AS plan_name_ar,
+                p.max_branches, p.max_users
            FROM companies c
            LEFT JOIN plans p ON p.id = c.plan_id
           WHERE c.id = $1 LIMIT 1`,
@@ -266,6 +269,12 @@ app.post("/api/auth/login", async (req, res) => {
         id:              user.id,
         username:        user.username,
         displayName:     user.display_name,
+        email:           user.email || "",
+        jobTitle:        user.job_title || "",
+        roleTemplate:    user.role_template || null,
+        /* The client must send the user to a change-password screen before
+           anything else when this is true (reset or freshly created account). */
+        mustChangePassword: !!user.must_change_password,
         permissions:     user.permissions,        // array of role IDs or ["*"]
         crudPerms:       user.crud_perms,         // { sectionId: ["view","write","edit","delete"] }
         employees:       user.employees,          // ["Name1", "Name2", ...]
@@ -280,7 +289,9 @@ app.post("/api/auth/login", async (req, res) => {
           status:    company.status,
           startDate: company.start_date,
           endDate:   company.end_date,
+          planId:    company.plan_id || null,
           planName:  company.plan_name || null,
+          planNameAr: company.plan_name_ar || company.plan_name || null,
           maxBranches: company.max_branches ?? -1,
           maxUsers:    company.max_users ?? -1,
         } : null,
@@ -313,160 +324,12 @@ app.post("/api/auth/logout", async (req, res) => {
   }
 });
 
-/* ============================================================
-   APP USERS — CRUD (admin only — validated client-side via isAdmin flag)
-============================================================ */
-
-/* GET /api/app-users */
-app.get("/api/app-users", strict, async (req, res) => {
-  try {
-    /* Multi-tenant scoping: ?company_id=N restricts to that company.
-       Super-admin UI omits it to see everyone. */
-    const companyId = req.query.company_id ? parseInt(req.query.company_id) : null;
-    const params = [];
-    let where = "";
-    if (companyId) { params.push(companyId); where = `WHERE u.company_id = $1`; }
-
-    const q = await pool.query(
-      `SELECT u.id, u.username, u.display_name, u.permissions, u.crud_perms, u.employees, u.allowed_branches,
-              u.is_active, u.is_admin, u.is_super_admin, u.created_at, u.last_login,
-              u.company_id, c.name AS company_name
-         FROM app_users u
-         LEFT JOIN companies c ON c.id = u.company_id
-         ${where}
-         ORDER BY u.created_at ASC`,
-      params
-    );
-    res.json({ ok: true, users: q.rows });
-  } catch (e) {
-    console.error("GET /api/app-users ERROR:", e);
-    res.status(500).json({ ok: false, error: "server_error" });
-  }
-});
-
-/* POST /api/app-users  { username, displayName, password, permissions, crudPerms, employees, isAdmin } */
-app.post("/api/app-users", strict, async (req, res) => {
-  try {
-    const username       = normText(req.body?.username);
-    const displayName    = normText(req.body?.displayName || req.body?.display_name || username);
-    const password       = normText(req.body?.password);
-    const permissions    = Array.isArray(req.body?.permissions) ? req.body.permissions : [];
-    const crudPerms      = (req.body?.crudPerms && typeof req.body.crudPerms === "object") ? req.body.crudPerms : {};
-    const employees      = Array.isArray(req.body?.employees) ? req.body.employees : [];
-    /* Accept either array (legacy) OR object { sectionId: [items...] } (new per-section format) */
-    const _ab = req.body?.allowedBranches;
-    const allowedBranches = (_ab && typeof _ab === "object") ? _ab : [];
-    const isAdmin        = !!req.body?.isAdmin;
-    /* Multi-tenant: which company this account belongs to (NULL = platform-level). */
-    const companyId      = req.body?.companyId != null ? parseInt(req.body.companyId) : null;
-
-    if (!username || !password)
-      return res.status(400).json({ ok: false, error: "username and password required" });
-
-    const salt = genSalt();
-    const hash = hashPw(password, salt);
-
-    const q = await pool.query(
-      `INSERT INTO app_users (username, display_name, password_hash, salt, permissions, crud_perms, employees, allowed_branches, is_admin, company_id)
-       VALUES ($1,$2,$3,$4,$5::jsonb,$6::jsonb,$7::jsonb,$8::jsonb,$9,$10)
-       RETURNING id, username, display_name, permissions, crud_perms, employees, allowed_branches, is_active, is_admin, created_at, company_id`,
-      [username, displayName, hash, salt,
-       JSON.stringify(permissions), JSON.stringify(crudPerms), JSON.stringify(employees),
-       JSON.stringify(allowedBranches), isAdmin, Number.isFinite(companyId) ? companyId : null]
-    );
-
-    res.json({ ok: true, user: q.rows[0] });
-  } catch (e) {
-    if (e.code === "23505")
-      return res.status(409).json({ ok: false, error: "username_taken" });
-    console.error("POST /api/app-users ERROR:", e);
-    res.status(500).json({ ok: false, error: "server_error" });
-  }
-});
-
-/* PUT /api/app-users/:id  { displayName?, password?, permissions?, isAdmin?, isActive? } */
-app.put("/api/app-users/:id", strict, async (req, res) => {
-  try {
-    const { id } = req.params;
-    const sets = [];
-    const vals = [];
-    let idx = 1;
-
-    if (req.body?.displayName !== undefined) {
-      sets.push(`display_name=$${idx++}`);
-      vals.push(normText(req.body.displayName));
-    }
-    if (req.body?.password) {
-      const salt = genSalt();
-      const hash = hashPw(normText(req.body.password), salt);
-      sets.push(`password_hash=$${idx++}`, `salt=$${idx++}`);
-      vals.push(hash, salt);
-    }
-    if (req.body?.permissions !== undefined) {
-      sets.push(`permissions=$${idx++}::jsonb`);
-      vals.push(JSON.stringify(Array.isArray(req.body.permissions) ? req.body.permissions : []));
-    }
-    if (req.body?.crudPerms !== undefined) {
-      sets.push(`crud_perms=$${idx++}::jsonb`);
-      vals.push(JSON.stringify(typeof req.body.crudPerms === "object" ? req.body.crudPerms : {}));
-    }
-    if (req.body?.employees !== undefined) {
-      sets.push(`employees=$${idx++}::jsonb`);
-      vals.push(JSON.stringify(Array.isArray(req.body.employees) ? req.body.employees : []));
-    }
-    if (req.body?.isAdmin !== undefined) {
-      sets.push(`is_admin=$${idx++}`);
-      vals.push(!!req.body.isAdmin);
-    }
-    if (req.body?.isActive !== undefined) {
-      sets.push(`is_active=$${idx++}`);
-      vals.push(!!req.body.isActive);
-    }
-    if (req.body?.allowedBranches !== undefined) {
-      /* Accept either array (legacy) OR object { sectionId: [items...] } */
-      const _ab = req.body.allowedBranches;
-      sets.push(`allowed_branches=$${idx++}::jsonb`);
-      vals.push(JSON.stringify((_ab && typeof _ab === "object") ? _ab : []));
-    }
-    if (req.body?.companyId !== undefined) {
-      /* Multi-tenant: reassign account to a company (null = platform-level). */
-      const cid = req.body.companyId != null ? parseInt(req.body.companyId) : null;
-      sets.push(`company_id=$${idx++}`);
-      vals.push(Number.isFinite(cid) ? cid : null);
-    }
-
-    if (!sets.length)
-      return res.status(400).json({ ok: false, error: "nothing to update" });
-
-    vals.push(id);
-    const q = await pool.query(
-      `UPDATE app_users SET ${sets.join(",")} WHERE id=$${idx}
-       RETURNING id, username, display_name, permissions, crud_perms, employees, allowed_branches, is_active, is_admin, created_at, last_login, company_id`,
-      vals
-    );
-    if (!q.rowCount)
-      return res.status(404).json({ ok: false, error: "user_not_found" });
-
-    res.json({ ok: true, user: q.rows[0] });
-  } catch (e) {
-    console.error("PUT /api/app-users/:id ERROR:", e);
-    res.status(500).json({ ok: false, error: "server_error" });
-  }
-});
-
-/* DELETE /api/app-users/:id */
-app.delete("/api/app-users/:id", strict, async (req, res) => {
-  try {
-    const { id } = req.params;
-    const q = await pool.query(`DELETE FROM app_users WHERE id=$1 RETURNING username`, [id]);
-    if (!q.rowCount)
-      return res.status(404).json({ ok: false, error: "user_not_found" });
-    res.json({ ok: true, deleted: q.rows[0].username });
-  } catch (e) {
-    console.error("DELETE /api/app-users/:id ERROR:", e);
-    res.status(500).json({ ok: false, error: "server_error" });
-  }
-});
+/* ── APP USERS / PERMISSIONS ──
+   Moved to routes/accounts.cjs. The four CRUD handlers that used to sit
+   here only checked that a token existed, which let any logged-in account
+   grant itself `isAdmin`. The accounts centre now owns those URLs, with a
+   role gate, company scoping, validation and an audit line — the paths and
+   response shapes are unchanged. */
 
 /* GET /api/activity-log?limit=50&username=xxx */
 app.get("/api/activity-log", strict, async (req, res) => {

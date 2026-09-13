@@ -99,4 +99,51 @@ function requireAuthStrict(req, res, next) {
   return res.status(401).json({ ok: false, error: "auth_required" });
 }
 
-module.exports = { requireAuth, requireAuthStrict, isEnforcing };
+/* ============================================================
+   requireAdmin / requireSuperAdmin — role gates
+
+   `requireAuthStrict` only proves the caller holds a valid token.
+   Every logged-in account holds one, so on its own it let any user
+   POST /api/app-users and hand themselves `isAdmin: true`. The
+   account and permission surfaces need the role, not just the token.
+
+   The AUTH_SECRET escape hatch is kept deliberately: with no secret
+   the server cannot issue a token at all, so demanding a role would
+   lock the dashboard out of its own admin screens instead of securing
+   them.
+============================================================ */
+function roleGate(needSuper) {
+  return function gate(req, res, next) {
+    const raw = tokenFromReq(req);
+    const payload = raw ? verifyToken(raw) : null;
+
+    if (payload) {
+      req.user = payload;
+      if (payload.isSuperAdmin) return next();
+      if (!needSuper && payload.isAdmin) return next();
+      return res.status(403).json({
+        ok: false,
+        error: needSuper ? "super_admin_only" : "admin_only",
+      });
+    }
+
+    if (!hasSecret()) {
+      const now = Date.now();
+      if (now - warnedNoSecret > 60_000) {
+        warnedNoSecret = now;
+        console.warn(
+          `[auth-role] AUTH_SECRET is NOT set — admin-only routes are still OPEN ` +
+            `(latest: ${req.method} ${req.originalUrl}). Set AUTH_SECRET to close them.`
+        );
+      }
+      return next();
+    }
+
+    return res.status(401).json({ ok: false, error: "auth_required" });
+  };
+}
+
+const requireAdmin = roleGate(false);
+const requireSuperAdmin = roleGate(true);
+
+module.exports = { requireAuth, requireAuthStrict, requireAdmin, requireSuperAdmin, isEnforcing };

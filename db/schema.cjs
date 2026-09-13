@@ -191,6 +191,31 @@ module.exports = async function ensureSchema({ pool, genSalt, hashPw }) {
   await pool.query(`ALTER TABLE app_users ADD COLUMN IF NOT EXISTS employees          JSONB NOT NULL DEFAULT '[]'::jsonb`);
   await pool.query(`ALTER TABLE app_users ADD COLUMN IF NOT EXISTS allowed_branches   JSONB NOT NULL DEFAULT '[]'::jsonb`);
 
+  /* ── Accounts centre: the fields a directory entry needs ──
+     An account used to be a username and a password hash, so the screen
+     could not tell you who the person is, who created them, or when the
+     password was last rotated. All additive, all defaulted. */
+  await pool.query(`ALTER TABLE app_users ADD COLUMN IF NOT EXISTS email               TEXT        NOT NULL DEFAULT ''`);
+  await pool.query(`ALTER TABLE app_users ADD COLUMN IF NOT EXISTS phone               TEXT        NOT NULL DEFAULT ''`);
+  await pool.query(`ALTER TABLE app_users ADD COLUMN IF NOT EXISTS job_title           TEXT        NOT NULL DEFAULT ''`);
+  await pool.query(`ALTER TABLE app_users ADD COLUMN IF NOT EXISTS notes               TEXT        NOT NULL DEFAULT ''`);
+  await pool.query(`ALTER TABLE app_users ADD COLUMN IF NOT EXISTS role_template       TEXT`);
+  await pool.query(`ALTER TABLE app_users ADD COLUMN IF NOT EXISTS must_change_password BOOLEAN    NOT NULL DEFAULT false`);
+  await pool.query(`ALTER TABLE app_users ADD COLUMN IF NOT EXISTS password_changed_at TIMESTAMPTZ`);
+  await pool.query(`ALTER TABLE app_users ADD COLUMN IF NOT EXISTS created_by          TEXT        NOT NULL DEFAULT ''`);
+  await pool.query(`ALTER TABLE app_users ADD COLUMN IF NOT EXISTS updated_at          TIMESTAMPTZ NOT NULL DEFAULT now()`);
+  /* Usernames are matched case-insensitively at login in every product that
+     has ever had a support ticket about it; stop "Ahmad" and "ahmad" from
+     both existing before someone creates the pair. */
+  await pool.query(`
+    DO $$
+    BEGIN
+      CREATE UNIQUE INDEX IF NOT EXISTS ux_app_users_username_lower ON app_users (lower(username));
+    EXCEPTION WHEN OTHERS THEN
+      RAISE WARNING 'ux_app_users_username_lower not created (duplicate usernames differing only by case?): %', SQLERRM;
+    END $$;
+  `);
+
   await pool.query(`
     CREATE TABLE IF NOT EXISTS activity_log (
       id        BIGSERIAL PRIMARY KEY,
@@ -278,6 +303,91 @@ module.exports = async function ensureSchema({ pool, genSalt, hashPw }) {
       ('Enterprise', 199, 'USD', -1, -1,  'Unlimited branches and users')
     ON CONFLICT (name) DO NOTHING
   `);
+
+  /* ── Packages: the columns the card actually needs ──
+     The three original columns (price / max_users / max_branches) could not
+     describe a package: nothing said what the price was per, what the plan
+     includes, or how to order the cards. Every one of these is additive with
+     a default, so an existing row stays valid while it is being filled in. */
+  await pool.query(`ALTER TABLE plans ADD COLUMN IF NOT EXISTS code                  TEXT`);
+  await pool.query(`ALTER TABLE plans ADD COLUMN IF NOT EXISTS name_ar               TEXT           NOT NULL DEFAULT ''`);
+  await pool.query(`ALTER TABLE plans ADD COLUMN IF NOT EXISTS description_ar        TEXT           NOT NULL DEFAULT ''`);
+  await pool.query(`ALTER TABLE plans ADD COLUMN IF NOT EXISTS billing_period        VARCHAR(20)    NOT NULL DEFAULT 'monthly'`);
+  await pool.query(`ALTER TABLE plans ADD COLUMN IF NOT EXISTS features              JSONB          NOT NULL DEFAULT '[]'::jsonb`);
+  await pool.query(`ALTER TABLE plans ADD COLUMN IF NOT EXISTS max_reports_per_month INT            NOT NULL DEFAULT -1`);
+  await pool.query(`ALTER TABLE plans ADD COLUMN IF NOT EXISTS max_storage_mb        INT            NOT NULL DEFAULT -1`);
+  await pool.query(`ALTER TABLE plans ADD COLUMN IF NOT EXISTS sort_order            INT            NOT NULL DEFAULT 0`);
+  await pool.query(`ALTER TABLE plans ADD COLUMN IF NOT EXISTS is_popular            BOOLEAN        NOT NULL DEFAULT false`);
+  await pool.query(`ALTER TABLE plans ADD COLUMN IF NOT EXISTS trial_days            INT            NOT NULL DEFAULT 0`);
+  await pool.query(`ALTER TABLE plans ADD COLUMN IF NOT EXISTS color                 TEXT`);
+
+  /* A stable machine key, so the UI can special-case a tier without
+     matching on a display name somebody will eventually translate. */
+  await pool.query(`
+    UPDATE plans
+       SET code = regexp_replace(lower(trim(name)), '[^a-z0-9]+', '_', 'g')
+     WHERE code IS NULL OR code = ''
+  `);
+  await pool.query(`
+    DO $$
+    BEGIN
+      CREATE UNIQUE INDEX IF NOT EXISTS ux_plans_code ON plans (code) WHERE code IS NOT NULL;
+    EXCEPTION WHEN OTHERS THEN
+      RAISE WARNING 'ux_plans_code not created: %', SQLERRM;
+    END $$;
+  `);
+
+  /* Fill in the three seeded tiers once. Guarded on the Arabic name being
+     empty so an admin who edits a package is never overwritten on reboot. */
+  await pool.query(`
+    UPDATE plans SET
+      name_ar        = 'الباقة الأساسية',
+      description_ar = 'للعمليات الصغيرة حتى 5 فروع',
+      sort_order     = 1,
+      trial_days     = 14,
+      color          = '#0ea5e9',
+      max_reports_per_month = 500,
+      features = '[
+        {"key":"reports","label":{"en":"All inspection reports","ar":"كل تقارير التفتيش"},"included":true},
+        {"key":"email","label":{"en":"Email sending + history","ar":"إرسال البريد وسجل المراسلات"},"included":true},
+        {"key":"audit","label":{"en":"Audit trail","ar":"سجل التدقيق"},"included":false},
+        {"key":"support","label":{"en":"Email support","ar":"دعم عبر البريد"},"included":true}
+      ]'::jsonb
+    WHERE name = 'Starter' AND name_ar = ''
+  `);
+  await pool.query(`
+    UPDATE plans SET
+      name_ar        = 'باقة النمو',
+      description_ar = 'للشركات المتوسعة حتى 15 فرعاً',
+      sort_order     = 2,
+      trial_days     = 14,
+      is_popular     = true,
+      color          = '#6366f1',
+      max_reports_per_month = 2000,
+      features = '[
+        {"key":"reports","label":{"en":"All inspection reports","ar":"كل تقارير التفتيش"},"included":true},
+        {"key":"email","label":{"en":"Email sending + history","ar":"إرسال البريد وسجل المراسلات"},"included":true},
+        {"key":"audit","label":{"en":"Audit trail","ar":"سجل التدقيق"},"included":true},
+        {"key":"support","label":{"en":"Priority support","ar":"دعم بأولوية"},"included":true}
+      ]'::jsonb
+    WHERE name = 'Growth' AND name_ar = ''
+  `);
+  await pool.query(`
+    UPDATE plans SET
+      name_ar        = 'باقة المؤسسات',
+      description_ar = 'فروع ومستخدمون بلا حدود',
+      sort_order     = 3,
+      color          = '#f59e0b',
+      features = '[
+        {"key":"reports","label":{"en":"All inspection reports","ar":"كل تقارير التفتيش"},"included":true},
+        {"key":"email","label":{"en":"Email sending + history","ar":"إرسال البريد وسجل المراسلات"},"included":true},
+        {"key":"audit","label":{"en":"Audit trail","ar":"سجل التدقيق"},"included":true},
+        {"key":"sso","label":{"en":"Dedicated onboarding","ar":"تهيئة مخصّصة"},"included":true},
+        {"key":"support","label":{"en":"24/7 support","ar":"دعم على مدار الساعة"},"included":true}
+      ]'::jsonb
+    WHERE name = 'Enterprise' AND name_ar = ''
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_plans_sort ON plans (sort_order, price)`);
 
   /* ── Companies table ── */
   await pool.query(`

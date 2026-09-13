@@ -9,7 +9,7 @@ const common = require("./utils/common.cjs");
 const password = require("./utils/password.cjs");
 const rateLimit = require("./utils/rateLimit.cjs");
 const token = require("./utils/token.cjs");
-const { requireAuth, requireAuthStrict } = require("./utils/requireAuth.cjs");
+const { requireAuth, requireAuthStrict, requireAdmin, requireSuperAdmin } = require("./utils/requireAuth.cjs");
 const { rejectBase64 } = require("./utils/noBase64.cjs");
 
 const registerReportsRoutes = require("./routes/reports.cjs");
@@ -19,6 +19,7 @@ const registerCatalogRoutes = require("./routes/catalog.cjs");
 const registerTrainingLinkRoutes = require("./routes/trainingLinks.cjs");
 const registerMediaRoutes = require("./routes/media.cjs");
 const registerAdminRoutes = require("./routes/admin.cjs");
+const registerAccountsRoutes = require("./routes/accounts.cjs");
 const registerBillingRoutes = require("./routes/billing.cjs");
 const registerEmailHistoryRoutes = require("./routes/emailHistory.cjs");
 const registerMailerRoutes = require("./routes/mailer.cjs");
@@ -103,6 +104,8 @@ const deps = {
   ...token,
   requireAuth,
   requireAuthStrict,
+  requireAdmin,
+  requireSuperAdmin,
 };
 
 registerReportsRoutes(app, deps);
@@ -112,6 +115,7 @@ registerCatalogRoutes(app, deps);
 registerTrainingLinkRoutes(app, deps);
 registerMediaRoutes(app, deps);
 registerAdminRoutes(app, deps);
+registerAccountsRoutes(app, deps);
 registerBillingRoutes(app, deps);
 registerEmailHistoryRoutes(app, deps);
 registerMailerRoutes(app, deps);
