@@ -303,6 +303,18 @@ module.exports = async function ensureSchema({ pool, genSalt, hashPw }) {
     WHERE NOT EXISTS (SELECT 1 FROM companies LIMIT 1)
   `);
 
+  /* ── Industry / business template per company ──
+     Decides WHICH set of report templates a company runs. 'meat' = the full
+     hardcoded Al Mawashi system (POS branches, QCS, HACCP, …) — the default,
+     so every existing company and Al Mawashi itself keep working untouched.
+     Any other value (e.g. 'sweets') routes the company to the generic,
+     file-defined template engine instead. The report DATA is already isolated
+     by company_id; this only chooses which forms/cards that company sees. */
+  await pool.query(`
+    ALTER TABLE companies
+      ADD COLUMN IF NOT EXISTS industry TEXT NOT NULL DEFAULT 'meat'
+  `);
+
   /* ── Multi-tenant: link app_users → companies ──
      Added AFTER companies table+seed exist so the FK resolves.
      company_id NULL = platform-level account (super-admin: sees all companies). */

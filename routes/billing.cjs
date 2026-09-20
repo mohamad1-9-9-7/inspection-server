@@ -108,13 +108,13 @@ app.get("/api/companies", strict, async (req, res) => {
 
 app.post("/api/companies", strict, superOnly, async (req, res) => {
   try {
-    const { name, contact_name, contact_email, contact_phone, plan_id, status, start_date, end_date, notes } = req.body;
+    const { name, contact_name, contact_email, contact_phone, plan_id, status, start_date, end_date, notes, industry } = req.body;
     if (!name) return res.status(400).json({ ok: false, error: "name required" });
     const q = await pool.query(
-      `INSERT INTO companies (name, contact_name, contact_email, contact_phone, plan_id, status, start_date, end_date, notes)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *`,
+      `INSERT INTO companies (name, contact_name, contact_email, contact_phone, plan_id, status, start_date, end_date, notes, industry)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *`,
       [name, contact_name||"", contact_email||"", contact_phone||"",
-       plan_id||null, status||"active", start_date||null, end_date||null, notes||""]
+       plan_id||null, status||"active", start_date||null, end_date||null, notes||"", industry||"meat"]
     );
     res.json({ ok: true, company: q.rows[0] });
   } catch (e) {
@@ -125,13 +125,17 @@ app.post("/api/companies", strict, superOnly, async (req, res) => {
 
 app.put("/api/companies/:id", strict, superOnly, async (req, res) => {
   try {
-    const { name, contact_name, contact_email, contact_phone, plan_id, status, start_date, end_date, notes } = req.body;
+    const { name, contact_name, contact_email, contact_phone, plan_id, status, start_date, end_date, notes, industry } = req.body;
+    /* industry omitted from the body → keep the stored value (COALESCE), so an
+       older client that doesn't send it can't wipe a company back to 'meat'. */
     const q = await pool.query(
       `UPDATE companies SET name=$1, contact_name=$2, contact_email=$3, contact_phone=$4,
-         plan_id=$5, status=$6, start_date=$7, end_date=$8, notes=$9, updated_at=now()
-       WHERE id=$10 RETURNING *`,
+         plan_id=$5, status=$6, start_date=$7, end_date=$8, notes=$9,
+         industry=COALESCE($10, industry), updated_at=now()
+       WHERE id=$11 RETURNING *`,
       [name, contact_name||"", contact_email||"", contact_phone||"",
-       plan_id||null, status||"active", start_date||null, end_date||null, notes||"", req.params.id]
+       plan_id||null, status||"active", start_date||null, end_date||null, notes||"",
+       industry || null, req.params.id]
     );
     if (!q.rowCount) return res.status(404).json({ ok: false, error: "not_found" });
     res.json({ ok: true, company: q.rows[0] });
