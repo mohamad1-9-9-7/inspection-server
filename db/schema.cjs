@@ -338,76 +338,72 @@ module.exports = async function ensureSchema({ pool, genSalt, hashPw }) {
   `);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_reports_company_id ON reports(company_id)`);
 
-  /* Widen the one-report-per-(type,reportDate) rule to per-company, the same
-     way it was earlier migrated from global to partial (see the block above
-     product_catalog): detect the old two-column shape, drop it, rebuild with
-     company_id leading. COALESCE(company_id,1) is a safety net only — every
-     row is backfilled above, so it should never actually see a NULL. */
-  await pool.query(`
-    DO $$
-    DECLARE
-      def text;
-      dup_types text;
-    BEGIN
-      SELECT indexdef INTO def FROM pg_indexes
-        WHERE schemaname='public' AND indexname='ux_reports_type_reportdate';
+  /* Widen the one-report-per-(type,reportDate) rule to per-company.
+     Done from plain JS, not a dynamic-SQL DO block: a first attempt at this
+     used a plpgsql EXCEPTION handler around the same logic and it still took
+     the whole server down twice on real duplicate data (prod_dried_meat had
+     two rows for the same date — a real data bug, not a maintenance-style
+     "many per day" type). Whatever the exact cause, a plpgsql-level safety
+     net cannot be trusted here; a plain JS try/catch around the actual
+     `await` cannot fail to catch it — Node has no equivalent ambiguity. */
+  try {
+    const { rows: idxRows } = await pool.query(
+      `SELECT indexdef FROM pg_indexes WHERE schemaname='public' AND indexname='ux_reports_type_reportdate'`
+    );
+    const currentDef = idxRows[0]?.indexdef || null;
+    if (currentDef && !currentDef.includes("company_id")) {
+      await pool.query(`DROP INDEX ux_reports_type_reportdate`);
+    }
 
-      IF def IS NOT NULL AND position('company_id' IN def) = 0 THEN
-        EXECUTE 'DROP INDEX ux_reports_type_reportdate';
-      END IF;
+    const { rows: stillThere } = await pool.query(
+      `SELECT 1 FROM pg_indexes WHERE schemaname='public' AND indexname='ux_reports_type_reportdate'`
+    );
+    if (!stillThere.length) {
+      // أي نوع عنده أصلاً أكتر من سجل بنفس (الشركة، التاريخ) بيستثنى من
+      // القيد — تمامًا متل maintenance من زمان — بدل ما يوقف الإقلاع. لازم
+      // حدا يراجع كل نوع بالقائمة يدويًا: إما ينضّف الازدواج (وبيرجع يتحمي
+      // تلقائيًا بأول إقلاع بعدها)، أو يثبت إنه فعلاً نوع "أكتر من سجل
+      // باليوم" وينضاف بشكل دائم جنب maintenance بالكود.
+      const { rows: dupRows } = await pool.query(`
+        SELECT type
+          FROM reports
+         WHERE type <> 'maintenance' AND payload->>'reportDate' IS NOT NULL
+         GROUP BY type, COALESCE(company_id, 1), payload->>'reportDate'
+        HAVING COUNT(*) > 1
+      `);
+      const dupTypes = [...new Set(dupRows.map((r) => r.type))];
+      if (dupTypes.length) {
+        console.warn(
+          `[schema] ux_reports_type_reportdate: excluding types with pre-existing duplicate ` +
+            `(company,type,reportDate) rows — review and clean up manually: ${dupTypes.join(", ")}`
+        );
+      }
+      const exclude = dupTypes.length
+        ? ` AND type NOT IN (${dupTypes.map((t) => `'${String(t).replace(/'/g, "''")}'`).join(",")})`
+        : "";
+      await pool.query(`
+        CREATE UNIQUE INDEX ux_reports_type_reportdate
+          ON reports (COALESCE(company_id, 1), type, ((payload->>'reportDate')))
+         WHERE type <> 'maintenance'${exclude}
+      `);
+    }
+  } catch (e) {
+    console.warn("[schema] ux_reports_type_reportdate widen skipped:", e?.message || e);
+  }
 
-      IF NOT EXISTS (
-        SELECT 1 FROM pg_indexes
-         WHERE schemaname='public' AND indexname='ux_reports_type_reportdate'
-      ) THEN
-        -- أي نوع عنده أصلاً أكتر من سجل بنفس (الشركة، التاريخ) بيبقى مستثنى
-        -- من القيد، تمامًا متل maintenance من زمان: القيد ما بيقدر يتفرض على
-        -- بيانات مخالفة له أصلاً موجودة قبل ما ينضاف، وإلا كل إقلاع السيرفر
-        -- بيفشل (هيك بالضبط صار مع prod_dried_meat). النوع المستثنى هون
-        -- بيرجع يتحمي تلقائيًا بأول إقلاع بعد ما حدا ينضّف الازدواج يدويًا،
-        -- أو ينضاف لقائمة "أكتر من سجل باليوم" الدائمة جنب maintenance لو
-        -- تبيّن إنه متعمّد.
-        SELECT string_agg(DISTINCT quote_literal(t), ',') INTO dup_types
-          FROM (
-            SELECT type AS t
-              FROM reports
-             WHERE type <> 'maintenance' AND payload->>'reportDate' IS NOT NULL
-             GROUP BY type, COALESCE(company_id, 1), payload->>'reportDate'
-            HAVING COUNT(*) > 1
-          ) x;
-
-        IF dup_types IS NOT NULL THEN
-          RAISE WARNING 'ux_reports_type_reportdate: excluding types with pre-existing duplicate (company,type,reportDate) rows: %', dup_types;
-        END IF;
-
-        EXECUTE 'CREATE UNIQUE INDEX ux_reports_type_reportdate '
-             || 'ON reports (COALESCE(company_id, 1), type, ((payload->>''reportDate''))) '
-             || 'WHERE type <> ''maintenance'''
-             || COALESCE(' AND type NOT IN (' || dup_types || ')', '');
-      END IF;
-    EXCEPTION WHEN OTHERS THEN
-      RAISE WARNING 'ux_reports_type_reportdate not created: %', SQLERRM;
-    END $$;
-  `);
-
-  /* Same widening for the business-date range index (backs ?from=&to=). */
-  await pool.query(`
-    DO $$
-    DECLARE
-      def text;
-    BEGIN
-      SELECT indexdef INTO def FROM pg_indexes
-        WHERE schemaname='public' AND indexname='idx_reports_business_date';
-      IF def IS NOT NULL AND position('company_id' IN def) = 0 THEN
-        EXECUTE 'DROP INDEX idx_reports_business_date';
-      END IF;
-    EXCEPTION WHEN OTHERS THEN
-      RAISE WARNING 'idx_reports_business_date drop skipped: %', SQLERRM;
-    END $$;
-  `);
-  await pool.query(`
-    DO $$
-    BEGIN
+  /* Same widening for the business-date range index (backs ?from=&to=).
+     Not a UNIQUE index, so it can't hit a duplicate-key error the way the
+     one above did — kept as plain JS too, for the same easier-to-trust
+     reasoning as above rather than mixing styles. */
+  try {
+    const { rows: idxRows } = await pool.query(
+      `SELECT indexdef FROM pg_indexes WHERE schemaname='public' AND indexname='idx_reports_business_date'`
+    );
+    const currentDef = idxRows[0]?.indexdef || null;
+    if (currentDef && !currentDef.includes("company_id")) {
+      await pool.query(`DROP INDEX idx_reports_business_date`);
+    }
+    await pool.query(`
       CREATE INDEX IF NOT EXISTS idx_reports_business_date ON reports (
         COALESCE(company_id, 1),
         type,
@@ -416,11 +412,11 @@ module.exports = async function ensureSchema({ pool, genSalt, hashPw }) {
           NULLIF(payload->>'date', ''),
           NULLIF(LEFT(payload->>'reportDate', 10), '')
         ))
-      );
-    EXCEPTION WHEN OTHERS THEN
-      RAISE WARNING 'idx_reports_business_date not created: %', SQLERRM;
-    END $$;
-  `);
+      )
+    `);
+  } catch (e) {
+    console.warn("[schema] idx_reports_business_date widen skipped:", e?.message || e);
+  }
 
   /* ── Seed default admin if table is empty ── */
   const existsAdmin = await pool.query(`SELECT 1 FROM app_users WHERE username='admin' LIMIT 1`);
