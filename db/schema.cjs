@@ -347,6 +347,7 @@ module.exports = async function ensureSchema({ pool, genSalt, hashPw }) {
     DO $$
     DECLARE
       def text;
+      dup_types text;
     BEGIN
       SELECT indexdef INTO def FROM pg_indexes
         WHERE schemaname='public' AND indexname='ux_reports_type_reportdate';
@@ -359,10 +360,33 @@ module.exports = async function ensureSchema({ pool, genSalt, hashPw }) {
         SELECT 1 FROM pg_indexes
          WHERE schemaname='public' AND indexname='ux_reports_type_reportdate'
       ) THEN
+        -- أي نوع عنده أصلاً أكتر من سجل بنفس (الشركة، التاريخ) بيبقى مستثنى
+        -- من القيد، تمامًا متل maintenance من زمان: القيد ما بيقدر يتفرض على
+        -- بيانات مخالفة له أصلاً موجودة قبل ما ينضاف، وإلا كل إقلاع السيرفر
+        -- بيفشل (هيك بالضبط صار مع prod_dried_meat). النوع المستثنى هون
+        -- بيرجع يتحمي تلقائيًا بأول إقلاع بعد ما حدا ينضّف الازدواج يدويًا،
+        -- أو ينضاف لقائمة "أكتر من سجل باليوم" الدائمة جنب maintenance لو
+        -- تبيّن إنه متعمّد.
+        SELECT string_agg(DISTINCT quote_literal(t), ',') INTO dup_types
+          FROM (
+            SELECT type AS t
+              FROM reports
+             WHERE type <> 'maintenance' AND payload->>'reportDate' IS NOT NULL
+             GROUP BY type, COALESCE(company_id, 1), payload->>'reportDate'
+            HAVING COUNT(*) > 1
+          ) x;
+
+        IF dup_types IS NOT NULL THEN
+          RAISE WARNING 'ux_reports_type_reportdate: excluding types with pre-existing duplicate (company,type,reportDate) rows: %', dup_types;
+        END IF;
+
         EXECUTE 'CREATE UNIQUE INDEX ux_reports_type_reportdate '
              || 'ON reports (COALESCE(company_id, 1), type, ((payload->>''reportDate''))) '
-             || 'WHERE type <> ''maintenance''';
+             || 'WHERE type <> ''maintenance'''
+             || COALESCE(' AND type NOT IN (' || dup_types || ')', '');
       END IF;
+    EXCEPTION WHEN OTHERS THEN
+      RAISE WARNING 'ux_reports_type_reportdate not created: %', SQLERRM;
     END $$;
   `);
 
