@@ -331,6 +331,21 @@ module.exports = async function ensureSchema({ pool, genSalt, hashPw }) {
     ALTER TABLE reports
       ADD COLUMN IF NOT EXISTS company_id INT REFERENCES companies(id) ON DELETE SET NULL
   `);
+
+  /* CRITICAL ORDERING: drop the unique index BEFORE the backfill UPDATE.
+     The stack trace on the repeated boot crash pointed at the UPDATE line,
+     not the CREATE INDEX line — because a PRIOR deploy had already built the
+     widened unique index on (COALESCE(company_id,1), type, reportDate).
+     With that index live, the moment this UPDATE flips two same-date rows
+     of a genuinely-duplicated type (prod_dried_meat, 2026-07-02) from NULL
+     to the same company id, they both map to the same key → 23505, and the
+     whole boot dies before any later "exclude duplicates" logic can run.
+     Dropping the index first means the backfill can never collide; the index
+     is rebuilt (excluding still-duplicated types) further down. */
+  await pool.query(`DROP INDEX IF EXISTS ux_reports_type_reportdate`).catch((e) =>
+    console.warn("[schema] pre-backfill drop of ux_reports_type_reportdate skipped:", e?.message || e)
+  );
+
   await pool.query(`
     UPDATE reports
        SET company_id = (SELECT id FROM companies ORDER BY id ASC LIMIT 1)

@@ -117,14 +117,23 @@ registerEmailHistoryRoutes(app, deps);
 registerMailerRoutes(app, deps);
 registerAuditRoutes(app, deps);
 
+// Schema migrations are meant to be additive/idempotent, and every table
+// that matters has existed for a long time — one bad migration step should
+// never take the whole app down, since the DB is almost certainly still
+// perfectly usable for everything except whatever that one step was trying
+// to add. Repeated live incidents (a duplicate-data-triggered index build
+// crashing boot, more than once, from more than one angle) showed the old
+// "any schema error kills the process" behaviour is worse than the disease:
+// it turns one bad row somewhere into a full outage. Log loudly and start
+// serving traffic regardless — a half-applied migration can be retried on
+// the next boot once the underlying data or code issue is fixed.
 ensureSchema({ pool, genSalt: password.genSalt, hashPw: password.hashPw })
-  .then(() =>
+  .catch((err) => {
+    console.error("DB init had a problem (continuing to start anyway):", err);
+  })
+  .finally(() => {
     app.listen(PORT, () => {
       console.log(`API running on :${PORT} (FULL public access: read/write/delete enabled)`);
       console.log("STARTED AT:", new Date().toISOString());
-    })
-  )
-  .catch((err) => {
-    console.error("DB init failed:", err);
-    process.exit(1);
+    });
   });
