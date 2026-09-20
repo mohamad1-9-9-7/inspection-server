@@ -52,6 +52,8 @@ const REF_PREFIX = {
   // share a sequence.
   qcs_non_conformance:    "NCR",
   pos19_non_conformance:  "NCP",
+  // شكاوي الجودة (فروع وموردين) — كل شكوى تحمل مرجعًا مستقلًا (AM-CMP-000123)
+  qa_complaint:           "CMP",
 };
 
 const REF_PAD = 6;
@@ -220,11 +222,14 @@ function auditCreate(req, row) {
 
 /** Fetch the current row for a (type, reportDate) pair — used to capture
  *  the "old" payload before an upsert-style UPDATE overwrites it. */
-async function fetchOldByTypeDate(type, reportDate) {
+/** `companyId` لازم يكون رقم حقيقي (نتيجة companyIdForWrite)، حتى ما نجيب
+ *  "القديم" من صف شركة تانية بالغلط لمّا يتوسّع القيد الفريد ليصير
+ *  (company_id, type, reportDate) ويسمح بأكتر من صف لنفس النوع والتاريخ. */
+async function fetchOldByTypeDate(type, reportDate, companyId) {
   try {
     const q = await pool.query(
-      `SELECT id, payload FROM reports WHERE type=$1 AND payload->>'reportDate'=$2 LIMIT 1`,
-      [type, reportDate]
+      `SELECT id, payload FROM reports WHERE type=$1 AND payload->>'reportDate'=$2 AND company_id=$3 LIMIT 1`,
+      [type, reportDate, companyId]
     );
     return q.rows[0] || null;
   } catch {
@@ -235,7 +240,7 @@ async function fetchOldByTypeDate(type, reportDate) {
 /** Same, by numeric id. */
 async function fetchOldById(id) {
   try {
-    const q = await pool.query(`SELECT id, type, payload FROM reports WHERE id=$1`, [id]);
+    const q = await pool.query(`SELECT id, type, payload, company_id FROM reports WHERE id=$1`, [id]);
     return q.rows[0] || null;
   } catch {
     return null;
@@ -331,6 +336,52 @@ const stripDrafts = (rows) =>
   );
 
 /* ============================================================
+   نطاق الشركة (multi-tenant)
+   ------------------------------------------------------------
+   كل تقرير تابع لشركة. صاحب حساب عادي عنده company_id ثابت جوّا التوكن
+   (من app_users) — هو نطاقه ولا ينكسر بأي باراميتر من العميل، حتى لو
+   حاول يمرّر ?company_id لشركة ثانية.
+
+   حساب المنصّة (سوبر أدمن، companyId=null بالتوكن) بيقدر يحدد
+   ?company_id=N بالطلب ليشتغل داخل شركة معيّنة — شاشة تبديل الشركة
+   بالواجهة رح ترسلها. إذا ما حددها، منرجّع null = بلا حصر (أدوات الأدمن
+   العامة زي النسخ الاحتياطي والتصدير اللي بتشتغل عبر كل الشركات).
+
+   بلا توكن معروف إطلاقاً (المرحلة الانتقالية، أو AUTH_SECRET مش مضبوط
+   بعد) → المواشي. هاد مطابق تماماً للواقع الحالي بالكامل (كل حساب
+   موجود اليوم أصلاً company_id=1)، فتفعيل الفلترة هون ما بيغيّر أي سلوك
+   ظاهر قبل ما تنضاف شركة تانية فعلاً. */
+const DEFAULT_COMPANY_ID = 1;
+
+function companyIdOf(req) {
+  const u = req.user;
+  const fromToken = u && Number.isFinite(Number(u.companyId)) && Number(u.companyId) > 0
+    ? Number(u.companyId)
+    : null;
+  if (fromToken) return fromToken;
+
+  if (u && u.isSuperAdmin) {
+    const q = Number(req.query?.company_id ?? req.body?.companyId);
+    return Number.isFinite(q) && q > 0 ? q : null;
+  }
+
+  return DEFAULT_COMPANY_ID;
+}
+
+/** لأي كتابة أو استهداف سجل بعينه: لازم رقم شركة حقيقي دايمًا. "بلا حصر"
+ *  ما إلوش معنى هون — سوبر أدمن ما اختار شركة بعد بينكتب للمواشي افتراضيًا،
+ *  بدل ما يضيع الصف بدون شركة أو يهرب من فحص التطابق تحت. */
+function companyIdForWrite(req) {
+  return companyIdOf(req) || DEFAULT_COMPANY_ID;
+}
+
+/** true إذا الصف تابع لشركة غير نطاق الطالب — يعني "مش موجود" بالنسبة إلو.
+ *  سوبر أدمن بلا نطاق (null) ما إلوش تعارض، بيشوف/يعدّل أي صف. */
+function companyMismatch(scope, rowCompanyId) {
+  return scope != null && Number(rowCompanyId) !== Number(scope);
+}
+
+/* ============================================================
    Reports API  (all routes gated by `auth` — audit or enforce
    depending on REQUIRE_AUTH; ping probes bypass via pingBypass)
 ============================================================ */
@@ -346,6 +397,10 @@ app.get("/api/reports", pingBypass, readLimiter, auth, async (req, res) => {
 
     // null = بلا حصر (الحالة الغالبة). مصفوفة = ملاحم صاحب التوكن.
     const scopeSites = await cutScopeSites(req, type);
+
+    // null = بلا حصر شركة (سوبر أدمن بلا اختيار — أدوات الأدمن العامة).
+    // رقم = يقتصر على تقارير هالشركة فقط.
+    const companyScope = companyIdOf(req);
 
     // One canonical business date for every report shape. Older forms use
     // payload.date or payload.cutDate, while newer forms use reportDate.
@@ -382,15 +437,13 @@ app.get("/api/reports", pingBypass, readLimiter, auth, async (req, res) => {
     if (truthy(req.query?.dates) && type) {
       // هالفرع بيرجّع تواريخ بلا payload، فما فينا نفلتر بعدين — الشرط بالـSQL.
       const dp = [type];
-      let siteWhere = "";
-      if (scopeSites) {
-        dp.push(scopeSites);
-        siteWhere = ` AND payload->>'branch' = ANY($${dp.length})`;
-      }
+      let where = "";
+      if (companyScope != null) { dp.push(companyScope); where += ` AND company_id = $${dp.length}`; }
+      if (scopeSites) { dp.push(scopeSites); where += ` AND payload->>'branch' = ANY($${dp.length})`; }
       const { rows } = await pool.query(
         `SELECT id, ${BUSINESS_DATE} AS "reportDate"
            FROM reports
-          WHERE type = $1 AND ${BUSINESS_DATE} IS NOT NULL${siteWhere}
+          WHERE type = $1 AND ${BUSINESS_DATE} IS NOT NULL${where}
           ORDER BY ${BUSINESS_DATE} DESC, created_at DESC`,
         dp
       );
@@ -401,12 +454,15 @@ app.get("/api/reports", pingBypass, readLimiter, auth, async (req, res) => {
     // Hits ux_reports_type_reportdate directly.
     const reportDate = normText(req.query?.reportDate || "");
     if (type && reportDate) {
+      const rdp = [type, reportDate];
+      let rdWhere = "";
+      if (companyScope != null) { rdp.push(companyScope); rdWhere = ` AND company_id = $${rdp.length}`; }
       const { rows } = await pool.query(
         `SELECT * FROM reports
-          WHERE type = $1 AND ${BUSINESS_DATE} = $2
+          WHERE type = $1 AND ${BUSINESS_DATE} = $2${rdWhere}
           ORDER BY created_at DESC
           LIMIT 1`,
-        [type, reportDate]
+        rdp
       );
       return res.json({ ok: true, data: stripDrafts(scopeRows(rows, scopeSites)) });
     }
@@ -440,6 +496,7 @@ app.get("/api/reports", pingBypass, readLimiter, auth, async (req, res) => {
     if (type && (isDay(from) || isDay(to))) {
       const where = ["type = $1"];
       const p = [type];
+      if (companyScope != null) { p.push(companyScope); where.push(`company_id = $${p.length}`); }
       if (isDay(from)) { p.push(from); where.push(`${BUSINESS_DATE} >= $${p.length}`); }
       if (isDay(to)) { p.push(to); where.push(`${BUSINESS_DATE} <= $${p.length}`); }
       if (employeeNo) {
@@ -462,6 +519,11 @@ app.get("/api/reports", pingBypass, readLimiter, auth, async (req, res) => {
 
     if (isLite) {
       if (type) {
+        const lp = [type];
+        let lWhere = "";
+        if (companyScope != null) { lp.push(companyScope); lWhere += ` AND company_id = $${lp.length}`; }
+        if (scopeSites) { lp.push(scopeSites); lWhere += ` AND payload->>'branch' = ANY($${lp.length})`; }
+        lp.push(limit);
         q = `
           SELECT
             id,
@@ -472,13 +534,17 @@ app.get("/api/reports", pingBypass, readLimiter, auth, async (req, res) => {
             ${BUSINESS_DATE} AS "reportDate",
             payload->>'invoiceNo'  AS "invoiceNo"
           FROM reports
-          WHERE type = $1${scopeSites ? ` AND payload->>'branch' = ANY($3)` : ""}
+          WHERE type = $1${lWhere}
           ORDER BY created_at DESC
-          LIMIT $2
+          LIMIT $${lp.length}
         `;
         // lite ما بيرجّع payload، فما فينا نفلتر بعدين — الشرط لازم يكون بالـSQL.
-        params = scopeSites ? [type, limit, scopeSites] : [type, limit];
+        params = lp;
       } else {
+        const lp = [];
+        let lWhere = "";
+        if (companyScope != null) { lp.push(companyScope); lWhere = ` WHERE company_id = $1`; }
+        lp.push(limit);
         q = `
           SELECT
             id,
@@ -488,26 +554,25 @@ app.get("/api/reports", pingBypass, readLimiter, auth, async (req, res) => {
             updated_at,
             ${BUSINESS_DATE} AS "reportDate",
             payload->>'invoiceNo'  AS "invoiceNo"
-          FROM reports
+          FROM reports${lWhere}
           ORDER BY created_at DESC
-          LIMIT $1
+          LIMIT $${lp.length}
         `;
-        params = [limit];
+        params = lp;
       }
     } else {
+      const gp = [];
+      const gWhere = [];
+      if (type) { gp.push(type); gWhere.push(`type = $${gp.length}`); }
+      if (companyScope != null) { gp.push(companyScope); gWhere.push(`company_id = $${gp.length}`); }
       if (type && employeeNo) {
         // نفس فلتر الموظّف لما ما في نافذة تاريخ
-        q = `SELECT * FROM reports
-              WHERE type=$1 AND payload->>'employeeNo' = $2
-              ORDER BY created_at DESC LIMIT $3`;
-        params = [type, employeeNo, limit];
-      } else if (type) {
-        q = `SELECT * FROM reports WHERE type=$1 ORDER BY created_at DESC LIMIT $2`;
-        params = [type, limit];
-      } else {
-        q = `SELECT * FROM reports ORDER BY created_at DESC LIMIT $1`;
-        params = [limit];
+        gp.push(employeeNo); gWhere.push(`payload->>'employeeNo' = $${gp.length}`);
       }
+      gp.push(limit);
+      q = `SELECT * FROM reports${gWhere.length ? ` WHERE ${gWhere.join(" AND ")}` : ""}
+           ORDER BY created_at DESC LIMIT $${gp.length}`;
+      params = gp;
     }
 
     const { rows } = await pool.query(q, params);
@@ -564,6 +629,13 @@ app.get("/api/reports/butcher-stats", pingBypass, readLimiter, auth, async (req,
     const D = BUTCHER_DATE;
     const N = (e) => `NULLIF(${e}, '')::numeric`;
 
+    // null = بلا حصر شركة (سوبر أدمن بلا اختيار). غير هيك، أرقام كل شركة
+    // منفصلة عن التانية — جزار شركة ما بيظهر بترتيب جزارين شركة تانية.
+    const companyScope = companyIdOf(req);
+    const statsParams = [from, to];
+    let companyWhere = "";
+    if (companyScope != null) { statsParams.push(companyScope); companyWhere = ` AND r.company_id = $${statsParams.length}`; }
+
     const sql = `
       WITH ops AS (
         SELECT
@@ -581,7 +653,7 @@ app.get("/api/reports/butcher-stats", pingBypass, readLimiter, auth, async (req,
         WHERE r.type = 'butcher_cut_log'
           AND COALESCE(r.payload->'changeRequest'->>'status', '') <> 'approved'
           AND ${D} >= $1
-          AND ${D} <= $2
+          AND ${D} <= $2${companyWhere}
       ),
       sums AS (
         SELECT
@@ -651,7 +723,7 @@ app.get("/api/reports/butcher-stats", pingBypass, readLimiter, auth, async (req,
       GROUP BY emp
       ORDER BY "ops" DESC`;
 
-    const { rows } = await pool.query(sql, [from, to]);
+    const { rows } = await pool.query(sql, statsParams);
     res.json({ ok: true, from, to, data: rows });
   } catch (e) {
     console.error("[butcher-stats]", e);
@@ -671,12 +743,13 @@ app.post("/api/reports", auth, async (req, res) => {
     }
 
     const stamped = await stampRef(pool, type, payload);
+    const companyId = companyIdForWrite(req);
 
     const ins = await pool.query(
-      `INSERT INTO reports (reporter, type, payload)
-       VALUES ($1, $2, $3::jsonb)
+      `INSERT INTO reports (reporter, type, payload, company_id)
+       VALUES ($1, $2, $3::jsonb, $4)
        RETURNING *`,
-      [reporter, type, JSON.stringify(stamped)]
+      [reporter, type, JSON.stringify(stamped), companyId]
     );
 
     auditCreate(req, ins.rows[0]);
@@ -711,17 +784,18 @@ app.put("/api/reports", auth, async (req, res) => {
     }
 
     const payload = { ...payload0, reportDate };
+    const companyId = companyIdForWrite(req);
 
-    const old = await fetchOldByTypeDate(type, reportDate);
+    const old = await fetchOldByTypeDate(type, reportDate, companyId);
 
     const upd = await pool.query(
       `UPDATE reports
           SET reporter = COALESCE($1, reporter),
               payload=${KEEP_REF("$2")},
               updated_at=now()
-        WHERE type=$3 AND payload->>'reportDate'=$4
+        WHERE type=$3 AND payload->>'reportDate'=$4 AND company_id=$5
         RETURNING *`,
-      [reporter || null, JSON.stringify(payload), type, reportDate]
+      [reporter || null, JSON.stringify(payload), type, reportDate, companyId]
     );
 
     if (upd.rowCount > 0) {
@@ -738,10 +812,10 @@ app.put("/api/reports", auth, async (req, res) => {
     const stamped = await stampRef(pool, type, payload);
 
     const ins = await pool.query(
-      `INSERT INTO reports (reporter, type, payload)
-       VALUES ($1, $2, $3::jsonb)
+      `INSERT INTO reports (reporter, type, payload, company_id)
+       VALUES ($1, $2, $3::jsonb, $4)
        RETURNING *`,
-      [reporter, type, JSON.stringify(stamped)]
+      [reporter, type, JSON.stringify(stamped), companyId]
     );
 
     auditCreate(req, ins.rows[0]);
@@ -772,16 +846,17 @@ app.put("/api/reports/returns", auth, async (req, res) => {
       _clientSavedAt: _clientSavedAt || Date.now(),
     };
 
-    const old = await fetchOldByTypeDate("returns", reportDate);
+    const companyId = companyIdForWrite(req);
+    const old = await fetchOldByTypeDate("returns", reportDate, companyId);
 
     const upd = await pool.query(
       `UPDATE reports
           SET reporter = COALESCE(reporter,'anonymous'),
               payload=${KEEP_REF("$1")},
               updated_at=now()
-        WHERE type='returns' AND payload->>'reportDate'=$2
+        WHERE type='returns' AND payload->>'reportDate'=$2 AND company_id=$3
         RETURNING *`,
-      [payload, reportDate]
+      [payload, reportDate, companyId]
     );
 
     if (upd.rowCount > 0) {
@@ -796,10 +871,10 @@ app.put("/api/reports/returns", auth, async (req, res) => {
     }
 
     const ins = await pool.query(
-      `INSERT INTO reports (reporter,type,payload)
-       VALUES ('anonymous','returns',$1::jsonb)
+      `INSERT INTO reports (reporter,type,payload,company_id)
+       VALUES ('anonymous','returns',$1::jsonb,$2)
        RETURNING *`,
-      [await stampRef(pool, "returns", payload)]
+      [await stampRef(pool, "returns", payload), companyId]
     );
 
     auditCreate(req, ins.rows[0]);
@@ -822,16 +897,17 @@ app.put("/api/reports/qcs", auth, async (req, res) => {
       _clientSavedAt: _clientSavedAt || Date.now(),
     };
 
-    const old = await fetchOldByTypeDate("qcs", reportDate);
+    const companyId = companyIdForWrite(req);
+    const old = await fetchOldByTypeDate("qcs", reportDate, companyId);
 
     const upd = await pool.query(
       `UPDATE reports
           SET reporter = COALESCE(reporter,'anonymous'),
               payload=${KEEP_REF("$1")},
               updated_at=now()
-        WHERE type='qcs' AND payload->>'reportDate'=$2
+        WHERE type='qcs' AND payload->>'reportDate'=$2 AND company_id=$3
         RETURNING *`,
-      [payload, reportDate]
+      [payload, reportDate, companyId]
     );
     if (upd.rowCount > 0) {
       auditWrite(req, {
@@ -845,10 +921,10 @@ app.put("/api/reports/qcs", auth, async (req, res) => {
     }
 
     const ins = await pool.query(
-      `INSERT INTO reports (reporter,type,payload)
-       VALUES ('anonymous','qcs',$1::jsonb)
+      `INSERT INTO reports (reporter,type,payload,company_id)
+       VALUES ('anonymous','qcs',$1::jsonb,$2)
        RETURNING *`,
-      [await stampRef(pool, "qcs", payload)]
+      [await stampRef(pool, "qcs", payload), companyId]
     );
     auditCreate(req, ins.rows[0]);
     return res.status(201).json({ ok: true, report: ins.rows[0], method: "insert" });
@@ -881,17 +957,18 @@ app.put("/api/reports/:type([A-Za-z_][A-Za-z0-9_-]*)", auth, async (req, res) =>
 
     payload.reportDate = reportDate;
     const reporter = normText(req.body?.reporter || "anonymous");
+    const companyId = companyIdForWrite(req);
 
-    const old = await fetchOldByTypeDate(type, reportDate);
+    const old = await fetchOldByTypeDate(type, reportDate, companyId);
 
     const upd = await pool.query(
       `UPDATE reports
           SET reporter = COALESCE($1, reporter),
               payload=${KEEP_REF("$2")},
               updated_at=now()
-        WHERE type=$3 AND payload->>'reportDate'=$4
+        WHERE type=$3 AND payload->>'reportDate'=$4 AND company_id=$5
         RETURNING *`,
-      [reporter || null, JSON.stringify(payload), type, reportDate]
+      [reporter || null, JSON.stringify(payload), type, reportDate, companyId]
     );
 
     if (upd.rowCount > 0) {
@@ -908,10 +985,10 @@ app.put("/api/reports/:type([A-Za-z_][A-Za-z0-9_-]*)", auth, async (req, res) =>
     const stamped = await stampRef(pool, type, payload);
 
     const ins = await pool.query(
-      `INSERT INTO reports (reporter, type, payload)
-       VALUES ($1, $2, $3::jsonb)
+      `INSERT INTO reports (reporter, type, payload, company_id)
+       VALUES ($1, $2, $3::jsonb, $4)
        RETURNING *`,
-      [reporter, type, JSON.stringify(stamped)]
+      [reporter, type, JSON.stringify(stamped), companyId]
     );
 
     auditCreate(req, ins.rows[0]);
@@ -1186,6 +1263,11 @@ app.get("/api/reports/:id(\\d+)", auth, async (req, res) => {
 
     const q = await pool.query(`SELECT * FROM reports WHERE id=$1`, [id]);
     if (!q.rowCount) return res.status(404).json({ ok: false, error: "not found" });
+    // سجل موجود بس تابع لشركة تانية = "مش موجود" بالنسبة لصاحب الطلب —
+    // ما منفرّق بين الحالتين حتى ما نأكّد وجود سجل هو أصلاً ما إلوش صلاحية يشوفه.
+    if (companyMismatch(companyIdOf(req), q.rows[0].company_id)) {
+      return res.status(404).json({ ok: false, error: "not found" });
+    }
 
     return res.json({ ok: true, report: q.rows[0] });
   } catch (e) {
@@ -1207,15 +1289,22 @@ app.patch("/api/reports/:id(\\d+)", auth, async (req, res) => {
     }
 
     const old = await fetchOldById(id);
+    if (old && companyMismatch(companyIdOf(req), old.company_id)) {
+      return res.status(404).json({ ok: false, error: "not found" });
+    }
+    // سجل موجود = بيحمل شركته الحقيقية أصلاً (فحصناها فوق)؛ استخدامها هون بدل
+    // إعادة اشتقاق النطاق بيضمن التحديث يلاقي نفس الصف حتى لو سوبر أدمن بلا
+    // نطاق محدد كان عم يعدّل تقرير شركة تانية.
+    const companyForFilter = old ? old.company_id : companyIdForWrite(req);
 
     const upd = await pool.query(
       `UPDATE reports
           SET payload=${KEEP_REF("$1")},
               reporter=COALESCE($2, reporter),
               updated_at=now()
-        WHERE id=$3
+        WHERE id=$3 AND company_id=$4
         RETURNING *`,
-      [JSON.stringify(payload), reporter ? String(reporter) : null, id]
+      [JSON.stringify(payload), reporter ? String(reporter) : null, id, companyForFilter]
     );
 
     if (!upd.rowCount) return res.status(404).json({ ok: false, error: "not found" });
@@ -1248,15 +1337,19 @@ app.put("/api/reports/:id(\\d+)", auth, async (req, res) => {
     }
 
     const old = await fetchOldById(id);
+    if (old && companyMismatch(companyIdOf(req), old.company_id)) {
+      return res.status(404).json({ ok: false, error: "not found" });
+    }
+    const companyForFilter = old ? old.company_id : companyIdForWrite(req);
 
     const upd = await pool.query(
       `UPDATE reports
           SET type = COALESCE(NULLIF($1,''), type),
               payload=${KEEP_REF("$2")},
               updated_at=now()
-        WHERE id=$3
+        WHERE id=$3 AND company_id=$4
         RETURNING *`,
-      [type || null, JSON.stringify(payload), id]
+      [type || null, JSON.stringify(payload), id, companyForFilter]
     );
 
     if (!upd.rowCount) return res.status(404).json({ ok: false, error: "not found" });
@@ -1287,8 +1380,8 @@ app.delete("/api/reports", auth, async (req, res) => {
     if (!type || !reportDate) return res.status(400).json({ ok: false, error: "type & reportDate required" });
 
     const del = await pool.query(
-      `DELETE FROM reports WHERE type=$1 AND payload->>'reportDate'=$2 RETURNING id, type, payload`,
-      [type, reportDate]
+      `DELETE FROM reports WHERE type=$1 AND payload->>'reportDate'=$2 AND company_id=$3 RETURNING id, type, payload`,
+      [type, reportDate, companyIdForWrite(req)]
     );
     del.rows.forEach((row) =>
       auditWrite(req, {
@@ -1308,9 +1401,16 @@ app.delete("/api/reports", auth, async (req, res) => {
 
 app.delete("/api/reports/:id(\\d+)", auth, async (req, res) => {
   try {
+    const id = Number(req.params.id);
+    const old = await fetchOldById(id);
+    if (old && companyMismatch(companyIdOf(req), old.company_id)) {
+      return res.status(404).json({ ok: false, error: "not found" });
+    }
+    const companyForFilter = old ? old.company_id : companyIdForWrite(req);
+
     const del = await pool.query(
-      `DELETE FROM reports WHERE id=$1 RETURNING id, type, payload`,
-      [Number(req.params.id)]
+      `DELETE FROM reports WHERE id=$1 AND company_id=$2 RETURNING id, type, payload`,
+      [id, companyForFilter]
     );
     if (!del.rowCount) return res.status(404).json({ ok: false, error: "not found" });
     auditWrite(req, {

@@ -4,6 +4,24 @@ module.exports = function registerBillingRoutes(app, deps = {}) {
   const noGate = (_req, _res, next) => next();
   const strict = typeof requireAuthStrict === "function" ? requireAuthStrict : noGate;
 
+  /* Company CRUD (create/rename/re-plan/delete a tenant) used to be gated
+     only by "is this account an admin at all" on the client — any branch
+     admin's token could hit these routes directly and manage OTHER
+     companies. `strict` above just proves a valid session; this proves the
+     session belongs to the platform owner. Runs after `strict`, so
+     req.user is already populated when it does. */
+  function superOnly(req, res, next) {
+    if (req.user && req.user.isSuperAdmin) return next();
+    // No AUTH_SECRET at all → `strict` already let everyone through open
+    // (with its own warning); rejecting only here would just 403 every
+    // admin in that same unconfigured environment instead of the one
+    // thing actually missing. Once a secret exists, `strict` guarantees
+    // req.user is populated before we get here, so this only matters
+    // pre-configuration (local/dev).
+    if (!process.env.AUTH_SECRET) return next();
+    return res.status(403).json({ ok: false, error: "super_admin_required" });
+  }
+
   /* GET /api/plans and GET /api/subscription stay open on purpose: App.jsx
      caches the subscription on boot, before anyone has logged in, and plan
      tiers are just public pricing. Everything else in this file is either a
@@ -88,7 +106,7 @@ app.get("/api/companies", strict, async (req, res) => {
   }
 });
 
-app.post("/api/companies", strict, async (req, res) => {
+app.post("/api/companies", strict, superOnly, async (req, res) => {
   try {
     const { name, contact_name, contact_email, contact_phone, plan_id, status, start_date, end_date, notes } = req.body;
     if (!name) return res.status(400).json({ ok: false, error: "name required" });
@@ -105,7 +123,7 @@ app.post("/api/companies", strict, async (req, res) => {
   }
 });
 
-app.put("/api/companies/:id", strict, async (req, res) => {
+app.put("/api/companies/:id", strict, superOnly, async (req, res) => {
   try {
     const { name, contact_name, contact_email, contact_phone, plan_id, status, start_date, end_date, notes } = req.body;
     const q = await pool.query(
@@ -123,9 +141,10 @@ app.put("/api/companies/:id", strict, async (req, res) => {
   }
 });
 
-app.delete("/api/companies/:id", strict, async (req, res) => {
+app.delete("/api/companies/:id", strict, superOnly, async (req, res) => {
   try {
-    await pool.query(`DELETE FROM companies WHERE id=$1`, [req.params.id]);
+    const del = await pool.query(`DELETE FROM companies WHERE id=$1 RETURNING id`, [req.params.id]);
+    if (!del.rowCount) return res.status(404).json({ ok: false, error: "not_found" });
     res.json({ ok: true });
   } catch (e) {
     console.error("DELETE /api/companies/:id ERROR:", e);

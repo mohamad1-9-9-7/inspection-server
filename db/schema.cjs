@@ -320,6 +320,84 @@ module.exports = async function ensureSchema({ pool, genSalt, hashPw }) {
        AND is_super_admin = false
   `);
 
+  /* ── Multi-tenant: link reports → companies ──
+     Unlike app_users, a report row is never "platform-level" — every report
+     was filed inside some company's operation, so NULL never persists here.
+     Existing rows (recorded before multi-tenant existed) backfill to the
+     same primary company app_users used above: one rule for "no company on
+     record yet", not a different one per table. New companies get their own
+     real id from here on, and every report saved for them carries it. */
+  await pool.query(`
+    ALTER TABLE reports
+      ADD COLUMN IF NOT EXISTS company_id INT REFERENCES companies(id) ON DELETE SET NULL
+  `);
+  await pool.query(`
+    UPDATE reports
+       SET company_id = (SELECT id FROM companies ORDER BY id ASC LIMIT 1)
+     WHERE company_id IS NULL
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_reports_company_id ON reports(company_id)`);
+
+  /* Widen the one-report-per-(type,reportDate) rule to per-company, the same
+     way it was earlier migrated from global to partial (see the block above
+     product_catalog): detect the old two-column shape, drop it, rebuild with
+     company_id leading. COALESCE(company_id,1) is a safety net only — every
+     row is backfilled above, so it should never actually see a NULL. */
+  await pool.query(`
+    DO $$
+    DECLARE
+      def text;
+    BEGIN
+      SELECT indexdef INTO def FROM pg_indexes
+        WHERE schemaname='public' AND indexname='ux_reports_type_reportdate';
+
+      IF def IS NOT NULL AND position('company_id' IN def) = 0 THEN
+        EXECUTE 'DROP INDEX ux_reports_type_reportdate';
+      END IF;
+
+      IF NOT EXISTS (
+        SELECT 1 FROM pg_indexes
+         WHERE schemaname='public' AND indexname='ux_reports_type_reportdate'
+      ) THEN
+        EXECUTE 'CREATE UNIQUE INDEX ux_reports_type_reportdate '
+             || 'ON reports (COALESCE(company_id, 1), type, ((payload->>''reportDate''))) '
+             || 'WHERE type <> ''maintenance''';
+      END IF;
+    END $$;
+  `);
+
+  /* Same widening for the business-date range index (backs ?from=&to=). */
+  await pool.query(`
+    DO $$
+    DECLARE
+      def text;
+    BEGIN
+      SELECT indexdef INTO def FROM pg_indexes
+        WHERE schemaname='public' AND indexname='idx_reports_business_date';
+      IF def IS NOT NULL AND position('company_id' IN def) = 0 THEN
+        EXECUTE 'DROP INDEX idx_reports_business_date';
+      END IF;
+    EXCEPTION WHEN OTHERS THEN
+      RAISE WARNING 'idx_reports_business_date drop skipped: %', SQLERRM;
+    END $$;
+  `);
+  await pool.query(`
+    DO $$
+    BEGIN
+      CREATE INDEX IF NOT EXISTS idx_reports_business_date ON reports (
+        COALESCE(company_id, 1),
+        type,
+        (COALESCE(
+          NULLIF(payload->>'cutDate', ''),
+          NULLIF(payload->>'date', ''),
+          NULLIF(LEFT(payload->>'reportDate', 10), '')
+        ))
+      );
+    EXCEPTION WHEN OTHERS THEN
+      RAISE WARNING 'idx_reports_business_date not created: %', SQLERRM;
+    END $$;
+  `);
+
   /* ── Seed default admin if table is empty ── */
   const existsAdmin = await pool.query(`SELECT 1 FROM app_users WHERE username='admin' LIMIT 1`);
   if (!existsAdmin.rowCount) {
