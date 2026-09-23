@@ -52,6 +52,7 @@ const REF_PREFIX = {
   // share a sequence.
   qcs_non_conformance:    "NCR",
   pos19_non_conformance:  "NCP",
+  sweets_non_conformance: "NCR",
   // شكاوي الجودة (فروع وموردين) — كل شكوى تحمل مرجعًا مستقلًا (AM-CMP-000123)
   qa_complaint:           "CMP",
 };
