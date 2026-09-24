@@ -52,12 +52,22 @@ const REF_PREFIX = {
   // share a sequence.
   qcs_non_conformance:    "NCR",
   pos19_non_conformance:  "NCP",
-  sweets_non_conformance: "NCR",
+  sweets_non_conformance: "NCR",   // numbered SW-NCR-…, see REF_ORG below
   // شكاوي الجودة (فروع وموردين) — كل شكوى تحمل مرجعًا مستقلًا (AM-CMP-000123)
   qa_complaint:           "CMP",
 };
 
 const REF_PAD = 6;
+
+/* Leading company code of a reference. Everything defaults to "AM" (Al
+   Mawashi); a type that belongs to another company gets its own code, so its
+   numbers never carry Al Mawashi's name. It also keeps the numbers unique:
+   sweets_non_conformance counts on its own sequence, and with the same "AM-NCR"
+   prefix its 000001 would collide with QCS's AM-NCR-000001 on the unique
+   ux_reports_ref_no index and the save would fail. */
+const REF_ORG = {
+  sweets_non_conformance: "SW",
+};
 
 /* Branch-scoped references: instead of one global counter per type, these keep
    a separate counter per branch and lead the number with the branch code —
@@ -107,7 +117,8 @@ async function allocRef(q, type, payload) {
   if (!prefix) return null;
 
   const n = await bumpCounter(q, type);
-  return `AM-${prefix}-${String(n).padStart(REF_PAD, "0")}`;
+  const org = REF_ORG[type] || "AM";
+  return `${org}-${prefix}-${String(n).padStart(REF_PAD, "0")}`;
 }
 
 /** Stamp a reference onto a payload that is about to be INSERTed.

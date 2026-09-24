@@ -64,6 +64,23 @@ module.exports = async function ensureSchema({ pool, genSalt, hashPw }) {
     );
   `);
 
+  /* Sweets NCRs were first numbered with Al Mawashi's "AM-" code. They now get
+     "SW-" (REF_ORG in routes/reports.cjs); renumber the ones already saved so
+     no Sweets record shows the old company's code. Same counter, same number —
+     only the leading code changes. Runs before the unique index below, since
+     an AM-NCR clash with QCS is exactly what could keep that index from
+     building. Idempotent: nothing matches once renamed. */
+  try {
+    await pool.query(`
+      UPDATE reports
+         SET payload = jsonb_set(payload, '{refNo}', to_jsonb('SW-' || substring(payload->>'refNo' FROM 4)))
+       WHERE type = 'sweets_non_conformance'
+         AND payload->>'refNo' LIKE 'AM-NCR-%'
+    `);
+  } catch (e) {
+    console.warn("sweets NCR refNo rename skipped:", e.message);
+  }
+
   // Lookups by reference (the "ref:" search token) and a guard against a
   // backfill or a bad import handing out the same number twice.
   // Wrapped: if legacy data already holds a duplicate refNo the index cannot be
@@ -560,4 +577,16 @@ module.exports = async function ensureSchema({ pool, genSalt, hashPw }) {
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_email_hist_sent_at     ON email_history(sent_at DESC);`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_email_hist_report_type ON email_history(report_type);`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_email_hist_sent_by     ON email_history(sent_by);`);
+  /* Keep the send history pointing at the renumbered Sweets NCRs (AM- → SW-,
+     see the reports rename above), or their per-report history goes empty. */
+  try {
+    await pool.query(`
+      UPDATE email_history
+         SET report_ref = 'SW-' || substring(report_ref FROM 4)
+       WHERE report_type = 'sweets_non_conformance'
+         AND report_ref LIKE 'AM-NCR-%'
+    `);
+  } catch (e) {
+    console.warn("sweets NCR email_history ref rename skipped:", e.message);
+  }
 }
