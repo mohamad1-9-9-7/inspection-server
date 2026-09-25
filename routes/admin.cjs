@@ -210,7 +210,7 @@ app.post("/api/auth/login", async (req, res) => {
     if (user.company_id) {
       const cq = await pool.query(
         `SELECT c.id, c.name, c.status, c.start_date, c.end_date, c.industry,
-                p.name AS plan_name, p.max_branches, p.max_users
+                p.name AS plan_name
            FROM companies c
            LEFT JOIN plans p ON p.id = c.plan_id
           WHERE c.id = $1 LIMIT 1`,
@@ -282,8 +282,6 @@ app.post("/api/auth/login", async (req, res) => {
           endDate:   company.end_date,
           industry:  company.industry || "meat",
           planName:  company.plan_name || null,
-          maxBranches: company.max_branches ?? -1,
-          maxUsers:    company.max_users ?? -1,
         } : null,
       },
     });

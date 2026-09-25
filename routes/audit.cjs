@@ -36,9 +36,28 @@ module.exports = function registerAuditRoutes(app, deps = {}) {
     next();
   }
 
-  /** Build the shared WHERE clause from query filters.
+  /** Company scope for a request. A normal (company) admin is locked to their
+   *  own company_id from the token and cannot widen it; only the platform
+   *  super-admin sees across companies (null = all) or narrows to one via
+   *  ?company_id. A token with no company on it falls back to the primary
+   *  company so a stray account can never see the whole platform's trail. */
+  function companyScopeOf(req) {
+    const u = req.user || {};
+    const fromToken =
+      Number.isFinite(Number(u.companyId)) && Number(u.companyId) > 0
+        ? Number(u.companyId)
+        : null;
+    if (fromToken) return fromToken;
+    if (u.isSuperAdmin) {
+      const q = Number(req.query?.company_id);
+      return Number.isFinite(q) && q > 0 ? q : null; // null = all companies
+    }
+    return 1; // primary company
+  }
+
+  /** Build the shared WHERE clause from query filters + company scope.
    *  Returns { sql, params } — params are positional starting at $1. */
-  function buildWhere(query) {
+  function buildWhere(query, companyScope) {
     const action = normText(query.action || "");
     const type = normText(query.type || "");
     const username = normText(query.username || "");
@@ -60,6 +79,11 @@ module.exports = function registerAuditRoutes(app, deps = {}) {
     if (from) add(`created_at >= ?::date`, from);
     if (to) add(`created_at < (?::date + INTERVAL '1 day')`, to);
     if (Number.isFinite(reportId) && reportId > 0) add(`report_id = ?`, reportId);
+
+    // Multi-tenant: never let one company read another's audit trail.
+    if (Number.isFinite(Number(companyScope)) && Number(companyScope) > 0) {
+      add(`company_id = ?`, Number(companyScope));
+    }
 
     // Free-text search across BOTH payload snapshots — "who changed a
     // temperature to 9.4?" is answered by searching the raw JSON text.
@@ -112,7 +136,7 @@ module.exports = function registerAuditRoutes(app, deps = {}) {
      filter works across the WHOLE dataset, not just the loaded page. */
   app.get("/api/audit", requireAdmin, async (req, res) => {
     try {
-      const { sql: whereSql, params } = buildWhere(req.query);
+      const { sql: whereSql, params } = buildWhere(req.query, companyScopeOf(req));
       const suspiciousOnly = String(req.query.suspicious || "") === "1";
 
       const limit = clampInt(req.query.limit, 100, 1, 500);
@@ -162,7 +186,7 @@ module.exports = function registerAuditRoutes(app, deps = {}) {
      Computed over the FULL filtered set, not just the current page. */
   app.get("/api/audit/stats", requireAdmin, async (req, res) => {
     try {
-      const { sql: whereSql, params } = buildWhere(req.query);
+      const { sql: whereSql, params } = buildWhere(req.query, companyScopeOf(req));
       const days = clampInt(req.query.days, 30, 7, 180);
 
       const base = `

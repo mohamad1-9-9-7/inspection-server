@@ -9,7 +9,7 @@ const common = require("./utils/common.cjs");
 const password = require("./utils/password.cjs");
 const rateLimit = require("./utils/rateLimit.cjs");
 const token = require("./utils/token.cjs");
-const { requireAuth, requireAuthStrict } = require("./utils/requireAuth.cjs");
+const { requireAuth, requireAuthStrict, requireSuperAdmin } = require("./utils/requireAuth.cjs");
 const { rejectBase64 } = require("./utils/noBase64.cjs");
 
 const registerReportsRoutes = require("./routes/reports.cjs");
@@ -20,6 +20,7 @@ const registerTrainingLinkRoutes = require("./routes/trainingLinks.cjs");
 const registerMediaRoutes = require("./routes/media.cjs");
 const registerAdminRoutes = require("./routes/admin.cjs");
 const registerBillingRoutes = require("./routes/billing.cjs");
+const registerQuotationRoutes = require("./routes/quotations.cjs");
 const registerEmailHistoryRoutes = require("./routes/emailHistory.cjs");
 const registerMailerRoutes = require("./routes/mailer.cjs");
 const registerAuditRoutes = require("./routes/audit.cjs");
@@ -92,6 +93,14 @@ app.use("/api/reports", (req, res, next) => {
   }
   return rejectBase64(req, res, next);
 });
+/* INSPECT PRO's own documents (quotations + their settings) live outside
+   /api/reports now, and get the same no-embedded-files rule. */
+for (const base of ["/api/quotations", "/api/platform-settings"]) {
+  app.use(base, (req, res, next) =>
+    req.method === "GET" || req.method === "DELETE" || req.method === "OPTIONS"
+      ? next()
+      : rejectBase64(req, res, next));
+}
 
 const deps = {
   pool,
@@ -103,6 +112,7 @@ const deps = {
   ...token,
   requireAuth,
   requireAuthStrict,
+  requireSuperAdmin,
 };
 
 registerReportsRoutes(app, deps);
@@ -113,6 +123,7 @@ registerTrainingLinkRoutes(app, deps);
 registerMediaRoutes(app, deps);
 registerAdminRoutes(app, deps);
 registerBillingRoutes(app, deps);
+registerQuotationRoutes(app, deps);
 registerEmailHistoryRoutes(app, deps);
 registerMailerRoutes(app, deps);
 registerAuditRoutes(app, deps);

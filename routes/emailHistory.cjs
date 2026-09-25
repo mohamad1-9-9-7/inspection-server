@@ -6,6 +6,28 @@ module.exports = function registerEmailHistoryRoutes(app, deps = {}) {
      read or written from logged-in screens. */
   const strict = typeof requireAuthStrict === "function" ? requireAuthStrict : noGate;
 
+  /* Multi-tenant scope. `strict` has already decoded the token onto req.user
+     (when AUTH_SECRET is set). A normal user is locked to their own company;
+     the super-admin reads across all companies (null) unless ?company_id
+     narrows it. Unknown token → primary company, so nothing leaks. Returns a
+     positive integer, or null meaning "every company" (super-admin reads). */
+  function companyScopeOf(req) {
+    const u = req.user || {};
+    const fromToken =
+      Number.isFinite(Number(u.companyId)) && Number(u.companyId) > 0
+        ? Number(u.companyId)
+        : null;
+    if (fromToken) return fromToken;
+    if (u.isSuperAdmin) {
+      const q = Number(req.query?.company_id ?? req.body?.company_id);
+      return Number.isFinite(q) && q > 0 ? q : null;
+    }
+    return 1;
+  }
+  // For a WRITE we always need a concrete company; super-admin with no
+  // selection files under the primary company rather than a null row.
+  const companyForWrite = (req) => companyScopeOf(req) || 1;
+
 /* ════════════════════════════════════════════════════════════
    EMAIL HISTORY — log + list + stats + cleanup
 ═════════════════════════════════════════════════════════════ */
@@ -23,9 +45,9 @@ app.post("/api/email-history", strict, async (req, res) => {
          sent_by, report_type, report_title, report_date, report_ref,
          subject, to_emails, cc_emails, bcc_emails, recipient_count,
          classification, priority, method, attachment_count, note,
-         template_id, status
+         template_id, status, company_id
        ) VALUES (
-         $1,$2,$3,$4,$5,$6,$7::jsonb,$8::jsonb,$9::jsonb,$10,$11,$12,$13,$14,$15,$16,$17
+         $1,$2,$3,$4,$5,$6,$7::jsonb,$8::jsonb,$9::jsonb,$10,$11,$12,$13,$14,$15,$16,$17,$18
        ) RETURNING id, sent_at`,
       [
         String(f.sent_by || "").slice(0, 100),
@@ -45,6 +67,7 @@ app.post("/api/email-history", strict, async (req, res) => {
         String(f.note || "").slice(0, 2000),
         f.template_id ? String(f.template_id).slice(0, 100) : null,
         String(f.status || "sent").slice(0, 20),
+        companyForWrite(req),
       ]
     );
     res.json({ ok: true, id: q.rows[0].id, sent_at: q.rows[0].sent_at });
@@ -60,6 +83,12 @@ app.get("/api/email-history", strict, async (req, res) => {
     const limit = Math.min(Math.max(parseInt(req.query.limit) || 100, 1), 500);
     const where = [];
     const params = [];
+    // Multi-tenant: a company only sees its own send log (super-admin: all).
+    const scope = companyScopeOf(req);
+    if (scope != null) {
+      params.push(scope);
+      where.push(`company_id = $${params.length}`);
+    }
     if (req.query.report_type) {
       params.push(req.query.report_type);
       where.push(`report_type = $${params.length}`);
@@ -113,6 +142,14 @@ app.get("/api/email-history/stats", strict, async (req, res) => {
   try {
     const days = Math.min(Math.max(parseInt(req.query.days) || 30, 1), 365);
 
+    /* Multi-tenant: every aggregate below is confined to the caller's company
+       (super-admin: all). `cid` is a validated integer, so it is safe to
+       inline; compWhere seeds a base filter, compAnd extends existing ones. */
+    const scope = companyScopeOf(req);
+    const cid = scope != null ? Number(scope) : null;
+    const compWhere = cid != null ? ` WHERE company_id = ${cid}` : "";
+    const compAnd = cid != null ? ` AND company_id = ${cid}` : "";
+
     const [summary, byType, byClass, dailyTrend, topRecipients, topSenders] = await Promise.all([
       pool.query(`
         SELECT
@@ -125,12 +162,12 @@ app.get("/api/email-history/stats", strict, async (req, res) => {
           COUNT(*) FILTER (WHERE method='outlook'  AND sent_at >= now() - INTERVAL '${days} days') AS method_outlook,
           COUNT(*) FILTER (WHERE method='whatsapp' AND sent_at >= now() - INTERVAL '${days} days') AS method_whatsapp,
           COUNT(*) FILTER (WHERE method='copy'     AND sent_at >= now() - INTERVAL '${days} days') AS method_copy
-        FROM email_history
+        FROM email_history${compWhere}
       `),
       pool.query(`
         SELECT report_type, COUNT(*)::int AS count
         FROM email_history
-        WHERE sent_at >= now() - INTERVAL '${days} days'
+        WHERE sent_at >= now() - INTERVAL '${days} days'${compAnd}
         GROUP BY report_type
         ORDER BY count DESC
         LIMIT 20
@@ -138,14 +175,14 @@ app.get("/api/email-history/stats", strict, async (req, res) => {
       pool.query(`
         SELECT classification, COUNT(*)::int AS count
         FROM email_history
-        WHERE sent_at >= now() - INTERVAL '${days} days'
+        WHERE sent_at >= now() - INTERVAL '${days} days'${compAnd}
         GROUP BY classification
         ORDER BY count DESC
       `),
       pool.query(`
         SELECT DATE(sent_at)::text AS day, COUNT(*)::int AS count
         FROM email_history
-        WHERE sent_at >= now() - INTERVAL '${days} days'
+        WHERE sent_at >= now() - INTERVAL '${days} days'${compAnd}
         GROUP BY day
         ORDER BY day ASC
       `),
@@ -153,10 +190,10 @@ app.get("/api/email-history/stats", strict, async (req, res) => {
         SELECT email, COUNT(*)::int AS count
         FROM (
           SELECT jsonb_array_elements_text(to_emails) AS email FROM email_history
-          WHERE sent_at >= now() - INTERVAL '${days} days'
+          WHERE sent_at >= now() - INTERVAL '${days} days'${compAnd}
           UNION ALL
           SELECT jsonb_array_elements_text(cc_emails) FROM email_history
-          WHERE sent_at >= now() - INTERVAL '${days} days'
+          WHERE sent_at >= now() - INTERVAL '${days} days'${compAnd}
         ) AS r
         WHERE email IS NOT NULL AND email <> ''
         GROUP BY email
@@ -166,7 +203,7 @@ app.get("/api/email-history/stats", strict, async (req, res) => {
       pool.query(`
         SELECT sent_by, COUNT(*)::int AS count
         FROM email_history
-        WHERE sent_at >= now() - INTERVAL '${days} days' AND sent_by <> ''
+        WHERE sent_at >= now() - INTERVAL '${days} days' AND sent_by <> ''${compAnd}
         GROUP BY sent_by
         ORDER BY count DESC
         LIMIT 10

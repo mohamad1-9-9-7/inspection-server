@@ -242,7 +242,7 @@ module.exports = async function ensureSchema({ pool, genSalt, hashPw }) {
       start_date  DATE           NOT NULL DEFAULT CURRENT_DATE,
       end_date    DATE           NOT NULL DEFAULT (CURRENT_DATE + INTERVAL '365 days'),
       price       NUMERIC(10,2),
-      currency    VARCHAR(10)    NOT NULL DEFAULT 'USD',
+      currency    VARCHAR(10)    NOT NULL DEFAULT 'AED',
       notes       TEXT           NOT NULL DEFAULT '',
       updated_by  TEXT           NOT NULL DEFAULT 'system',
       updated_at  TIMESTAMPTZ    NOT NULL DEFAULT now()
@@ -261,7 +261,8 @@ module.exports = async function ensureSchema({ pool, genSalt, hashPw }) {
       id            SERIAL PRIMARY KEY,
       name          TEXT           NOT NULL UNIQUE,
       price         NUMERIC(10,2)  NOT NULL DEFAULT 0,
-      currency      VARCHAR(10)    NOT NULL DEFAULT 'USD',
+      currency      VARCHAR(10)    NOT NULL DEFAULT 'AED',
+      setup_fee     NUMERIC(10,2)  NOT NULL DEFAULT 0,
       max_branches  INT            NOT NULL DEFAULT -1,
       max_users     INT            NOT NULL DEFAULT -1,
       description   TEXT           NOT NULL DEFAULT '',
@@ -270,12 +271,14 @@ module.exports = async function ensureSchema({ pool, genSalt, hashPw }) {
       updated_at    TIMESTAMPTZ    NOT NULL DEFAULT now()
     );
   `);
-  /* Seed default plans */
+  /* Seed default plans — pricing is in AED (UAE dirham). Monthly fee is the
+     recurring charge; setup_fee is a ONE-TIME onboarding cost. Lowest tier
+     starts at AED 1500/month. Only seeds a brand-new empty install. */
   await pool.query(`
-    INSERT INTO plans (name, price, currency, max_branches, max_users, description) VALUES
-      ('Starter',    49,  'USD',  5,  3,  'Small operations up to 5 branches'),
-      ('Growth',     99,  'USD', 15, 10,  'Growing businesses up to 15 branches'),
-      ('Enterprise', 199, 'USD', -1, -1,  'Unlimited branches and users')
+    INSERT INTO plans (name, price, currency, setup_fee, max_branches, max_users, description) VALUES
+      ('Starter',    1500, 'AED', 2500,  5,  3,  'Small operations up to 5 branches'),
+      ('Growth',     2500, 'AED', 4000, 15, 10,  'Growing businesses up to 15 branches'),
+      ('Enterprise', 4000, 'AED', 6000, -1, -1,  'Unlimited branches and users')
     ON CONFLICT (name) DO NOTHING
   `);
 
@@ -560,4 +563,304 @@ module.exports = async function ensureSchema({ pool, genSalt, hashPw }) {
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_email_hist_sent_at     ON email_history(sent_at DESC);`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_email_hist_report_type ON email_history(report_type);`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_email_hist_sent_by     ON email_history(sent_by);`);
+
+  /* ════════════════════════════════════════════════════════════
+     MULTI-TENANT — company_id on the auxiliary tables.
+
+     The `reports` table has carried company_id for a while, but the
+     audit trail, the e-mail log and the subscription record had not —
+     so one company could still read another company's change history,
+     e-mail analytics or subscription state. These are additive ALTERs:
+     every pre-existing row defaults to the primary company (id 1 =
+     Al Mawashi), so nothing an existing company sees changes until a
+     second company's own rows start to arrive. All wrapped so a single
+     failed step can never take boot down (see the reports notes above).
+  ═════════════════════════════════════════════════════════════ */
+
+  /* report_audit → company_id. Backfill from the linked report's company
+     (the truth); rows whose report was already deleted fall back to 1. */
+  try {
+    await pool.query(`ALTER TABLE report_audit ADD COLUMN IF NOT EXISTS company_id INT`);
+    await pool.query(`
+      UPDATE report_audit a
+         SET company_id = COALESCE(
+               (SELECT r.company_id FROM reports r WHERE r.id = a.report_id),
+               1)
+       WHERE a.company_id IS NULL
+    `);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_report_audit_company_id ON report_audit(company_id)`);
+  } catch (e) {
+    console.warn("[schema] report_audit company_id step skipped:", e?.message || e);
+  }
+
+  /* email_history → company_id. No per-row source to join, so every
+     existing send belongs to the primary company. */
+  try {
+    await pool.query(`ALTER TABLE email_history ADD COLUMN IF NOT EXISTS company_id INT`);
+    await pool.query(`UPDATE email_history SET company_id = 1 WHERE company_id IS NULL`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_email_hist_company_id ON email_history(company_id)`);
+  } catch (e) {
+    console.warn("[schema] email_history company_id step skipped:", e?.message || e);
+  }
+
+  /* subscription → one row PER company. The old table held a single
+     global row (the whole platform shared one subscription); it becomes
+     company 1's. Historical duplicates are collapsed to the newest row
+     per company before the unique index so the ON CONFLICT upsert in
+     routes/billing.cjs has a stable target. */
+  try {
+    await pool.query(`ALTER TABLE subscription ADD COLUMN IF NOT EXISTS company_id INT`);
+    await pool.query(`UPDATE subscription SET company_id = 1 WHERE company_id IS NULL`);
+    await pool.query(`
+      DELETE FROM subscription s
+       WHERE s.id < (SELECT MAX(s2.id) FROM subscription s2 WHERE s2.company_id = s.company_id)
+    `);
+    await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS ux_subscription_company ON subscription(company_id)`);
+  } catch (e) {
+    console.warn("[schema] subscription company_id step skipped:", e?.message || e);
+  }
+
+  /* plans → one-time setup_fee (recurring price stays in `price`). Additive:
+     existing plans default to a 0 setup fee until an admin sets one. */
+  try {
+    await pool.query(`ALTER TABLE plans ADD COLUMN IF NOT EXISTS setup_fee NUMERIC(10,2) NOT NULL DEFAULT 0`);
+  } catch (e) {
+    console.warn("[schema] plans setup_fee step skipped:", e?.message || e);
+  }
+
+  /* Re-price the ORIGINAL seed plans from the old USD placeholders to the real
+     AED pricing (lowest tier = AED 1500/mo + one-time setup fee). Guarded to
+     the exact untouched seed rows (name + old price + USD), so a plan an admin
+     has already edited is never overwritten. Idempotent: once converted the
+     WHERE no longer matches. */
+  try {
+    await pool.query(`UPDATE plans SET price=1500, currency='AED', setup_fee=2500 WHERE name='Starter'    AND currency='USD' AND price=49`);
+    await pool.query(`UPDATE plans SET price=2500, currency='AED', setup_fee=4000 WHERE name='Growth'     AND currency='USD' AND price=99`);
+    await pool.query(`UPDATE plans SET price=4000, currency='AED', setup_fee=6000 WHERE name='Enterprise' AND currency='USD' AND price=199`);
+  } catch (e) {
+    console.warn("[schema] plans AED re-price step skipped:", e?.message || e);
+  }
+
+  /* billing_profile → the SELLER: INSPECT PRO, the platform owner, printed
+     at the top of every quotation and invoice. It used to be one ambiguous
+     row that quotations read as the issuer and invoices read as the buyer.
+     Additive only; existing values stay. company_name keeps meaning the
+     trade name and tax_id the TRN, so nothing that already reads them moves.
+     vat_registered defaults to false: a freelancer without a TRN may not
+     charge VAT, so documents stay "Invoice", never "Tax Invoice". */
+  try {
+    const cols = [
+      "owner_name        TEXT    NOT NULL DEFAULT ''",
+      "license_status    TEXT    NOT NULL DEFAULT 'pending'",
+      "license_no        TEXT    NOT NULL DEFAULT ''",
+      "license_authority TEXT    NOT NULL DEFAULT ''",
+      "license_expiry    DATE",
+      "vat_registered    BOOLEAN NOT NULL DEFAULT false",
+      "website           TEXT    NOT NULL DEFAULT ''",
+      "logo_url          TEXT    NOT NULL DEFAULT ''",
+      "bank_name         TEXT    NOT NULL DEFAULT ''",
+      "account_name      TEXT    NOT NULL DEFAULT ''",
+      "iban              TEXT    NOT NULL DEFAULT ''",
+      "swift             TEXT    NOT NULL DEFAULT ''",
+      "payment_terms_days INT    NOT NULL DEFAULT 14",
+    ];
+    for (const c of cols) {
+      await pool.query(`ALTER TABLE billing_profile ADD COLUMN IF NOT EXISTS ${c}`);
+    }
+    await pool.query(`UPDATE billing_profile SET company_name = 'INSPECT PRO' WHERE company_name = ''`);
+  } catch (e) {
+    console.warn("[schema] billing_profile seller step skipped:", e?.message || e);
+  }
+
+  /* INSPECT PRO's own sales documents. Quotations used to live in `reports`
+     pinned to company_id = 1, i.e. inside Al Mawashi's data: its backups,
+     its data inventory, its audit trail. They are the platform owner's, not
+     a tenant's, so they get tables of their own that no company scope ever
+     reaches. `payload` keeps the full quotation exactly as the editor
+     built it; the columns beside it are just what lists sort and filter on. */
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS platform_quotations (
+        id                SERIAL PRIMARY KEY,
+        number            TEXT          NOT NULL,
+        status            TEXT          NOT NULL DEFAULT 'draft',
+        client_company_id INT           REFERENCES companies(id) ON DELETE SET NULL,
+        client_name       TEXT          NOT NULL DEFAULT '',
+        issue_date        DATE,
+        currency          TEXT          NOT NULL DEFAULT 'AED',
+        contract_value    NUMERIC(14,2) NOT NULL DEFAULT 0,
+        payload           JSONB         NOT NULL DEFAULT '{}'::jsonb,
+        created_by        TEXT          NOT NULL DEFAULT '',
+        created_at        TIMESTAMPTZ   NOT NULL DEFAULT now(),
+        updated_at        TIMESTAMPTZ   NOT NULL DEFAULT now()
+      )
+    `);
+    await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS ux_platform_quotations_number ON platform_quotations(number)`);
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS platform_settings (
+        key        TEXT        PRIMARY KEY,
+        value      JSONB       NOT NULL DEFAULT '{}'::jsonb,
+        updated_by TEXT        NOT NULL DEFAULT '',
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+      )
+    `);
+  } catch (e) {
+    console.warn("[schema] platform_quotations tables step skipped:", e?.message || e);
+  }
+
+  /* invoices → issued BY INSPECT PRO TO a company. Each invoice now knows
+     which company it bills (company_id), freezes the seller as it was on
+     the day (seller JSONB — later profile edits never rewrite an issued
+     invoice), carries its own lines and VAT split, and has a payment
+     status. Additive; old rows keep their values and are matched to a
+     company by name once, where the name is unambiguous. */
+  try {
+    const cols = [
+      "company_id   INT REFERENCES companies(id) ON DELETE SET NULL",
+      "status       TEXT          NOT NULL DEFAULT 'unpaid'",
+      "title        TEXT          NOT NULL DEFAULT 'Invoice'",
+      "due_date     DATE",
+      "paid_at      DATE",
+      "payment_ref  TEXT          NOT NULL DEFAULT ''",
+      "void_reason  TEXT          NOT NULL DEFAULT ''",
+      "subtotal     NUMERIC(14,2)",
+      "vat_pct      NUMERIC(5,2)  NOT NULL DEFAULT 0",
+      "vat_amount   NUMERIC(14,2) NOT NULL DEFAULT 0",
+      "lines        JSONB         NOT NULL DEFAULT '[]'::jsonb",
+      "seller       JSONB         NOT NULL DEFAULT '{}'::jsonb",
+      "buyer_contact TEXT         NOT NULL DEFAULT ''",
+      "buyer_email  TEXT          NOT NULL DEFAULT ''",
+    ];
+    for (const c of cols) await pool.query(`ALTER TABLE invoices ADD COLUMN IF NOT EXISTS ${c}`);
+    await pool.query(`
+      UPDATE invoices i SET company_id = c.id
+        FROM companies c
+       WHERE i.company_id IS NULL
+         AND lower(trim(i.company_name)) = lower(trim(c.name))
+         AND (SELECT COUNT(*) FROM companies c2 WHERE lower(trim(c2.name)) = lower(trim(c.name))) = 1
+    `);
+    await pool.query(`UPDATE invoices SET subtotal = amount WHERE subtotal IS NULL`);
+  } catch (e) {
+    console.warn("[schema] invoices per-company step skipped:", e?.message || e);
+  }
+  /* Invoice numbers are legal identifiers — never two alike. Separate step:
+     if old data already holds a duplicate, the index is skipped (logged)
+     and everything above still applies. */
+  try {
+    await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS ux_invoices_number ON invoices(invoice_number)`);
+  } catch (e) {
+    console.warn("[schema] ux_invoices_number skipped (duplicate numbers in old data):", e?.message || e);
+  }
+
+  /* ONE source for "what does this company have and until when": its row in
+     `companies`. The login lock (routes/admin.cjs) already reads only that
+     row, while the in-app lock read the separate `subscription` table — two
+     answers that could disagree. `subscription` is now retired (kept, never
+     read): its custom price/currency and any plan/date the company row lacks
+     are folded in once. The company's status is NOT overwritten — it is the
+     one the server has been enforcing all along. */
+  try {
+    await pool.query(`ALTER TABLE companies ADD COLUMN IF NOT EXISTS price    NUMERIC(10,2)`);
+    await pool.query(`ALTER TABLE companies ADD COLUMN IF NOT EXISTS currency TEXT`);
+    const done = await pool.query(`SELECT 1 FROM platform_settings WHERE key = 'migrated_subscription_to_companies'`);
+    if (!done.rowCount) {
+      await pool.query(`
+        UPDATE companies c SET
+          price      = COALESCE(c.price, s.price),
+          currency   = COALESCE(c.currency, NULLIF(s.currency, '')),
+          plan_id    = COALESCE(c.plan_id, (SELECT p.id FROM plans p WHERE lower(p.name) = lower(s.plan) LIMIT 1)),
+          start_date = COALESCE(c.start_date, s.start_date),
+          end_date   = COALESCE(c.end_date, s.end_date)
+        FROM subscription s
+        WHERE s.company_id = c.id
+          AND COALESCE(s.updated_by, '') <> 'system'  -- auto-seeded placeholders carry no real data
+      `);
+      await pool.query(
+        `INSERT INTO platform_settings (key, value, updated_by) VALUES ('migrated_subscription_to_companies', '{"v":1}', 'migration')
+         ON CONFLICT (key) DO NOTHING`
+      );
+    }
+  } catch (e) {
+    console.warn("[schema] subscription → companies step skipped:", e?.message || e);
+  }
+
+  /* One-time move of the existing quotations out of `reports`. All or
+     nothing in one transaction: the rows are copied, then deleted from
+     `reports`, so a quotation can never exist in both places or in neither.
+     Runs only while the new table is still empty, so it never repeats.
+     A duplicated number (the old store allowed it) keeps the first and
+     suffixes the rest, rather than failing the whole move. */
+  {
+    const client = await pool.connect().catch((e) => {
+      console.warn("[schema] quotation move: no DB client:", e?.message || e);
+      return null;
+    });
+    if (client) {
+      try {
+        await client.query("BEGIN");
+        const already = await client.query(`SELECT 1 FROM platform_quotations LIMIT 1`);
+        const pending = await client.query(
+          `SELECT 1 FROM reports WHERE type IN ('billing_quotation','billing_quotation_config') LIMIT 1`
+        );
+        if (!already.rowCount && pending.rowCount) {
+          const moved = await client.query(`
+            WITH src AS (
+              SELECT r.*,
+                     COALESCE(NULLIF(r.payload->>'number',''), 'Q-OLD-' || r.id) AS num,
+                     ROW_NUMBER() OVER (
+                       PARTITION BY COALESCE(NULLIF(r.payload->>'number',''), 'Q-OLD-' || r.id)
+                       ORDER BY r.id
+                     ) AS dup
+                FROM reports r
+               WHERE r.type = 'billing_quotation'
+            )
+            INSERT INTO platform_quotations
+              (number, status, client_company_id, client_name, issue_date, currency,
+               contract_value, payload, created_by, created_at, updated_at)
+            SELECT CASE WHEN dup = 1 THEN num ELSE num || '-' || dup END,
+                   COALESCE(NULLIF(payload->>'status',''), 'draft'),
+                   CASE WHEN payload->>'companyId' ~ '^[0-9]+$'
+                         AND EXISTS (SELECT 1 FROM companies c WHERE c.id = (payload->>'companyId')::int)
+                        THEN (payload->>'companyId')::int END,
+                   COALESCE(payload->>'clientName', ''),
+                   CASE WHEN payload->>'issueDate' ~ '^\\d{4}-\\d{2}-\\d{2}$' THEN (payload->>'issueDate')::date END,
+                   COALESCE(NULLIF(payload->>'currency',''), 'AED'),
+                   CASE WHEN payload#>>'{totals,contractValue}' ~ '^-?[0-9.]+$'
+                        THEN (payload#>>'{totals,contractValue}')::numeric ELSE 0 END,
+                   (payload - 'reportDate')
+                     || jsonb_build_object('number', CASE WHEN dup = 1 THEN num ELSE num || '-' || dup END),
+                   COALESCE(reporter, ''), created_at, updated_at
+              FROM src
+          `);
+          /* The settings row: newest wins. A logo that was stored inline
+             (base64) is dropped — the logo lives in the seller profile now. */
+          await client.query(`
+            INSERT INTO platform_settings (key, value, updated_by, updated_at)
+            SELECT 'quotation_config',
+                   CASE WHEN payload->>'logo' LIKE 'data:%' THEN payload - 'logo' ELSE payload END
+                     - 'reportDate' - '_clientSavedAt',
+                   'migration', updated_at
+              FROM reports
+             WHERE type = 'billing_quotation_config'
+             ORDER BY updated_at DESC, id DESC
+             LIMIT 1
+            ON CONFLICT (key) DO NOTHING
+          `);
+          const gone = await client.query(
+            `DELETE FROM reports WHERE type IN ('billing_quotation','billing_quotation_config')`
+          );
+          console.log(
+            `[schema] moved ${moved.rowCount} quotation(s) to platform_quotations; ` +
+              `removed ${gone.rowCount} row(s) from reports`
+          );
+        }
+        await client.query("COMMIT");
+      } catch (e) {
+        await client.query("ROLLBACK").catch(() => {});
+        console.warn("[schema] quotation move skipped (rolled back, nothing lost):", e?.message || e);
+      } finally {
+        client.release();
+      }
+    }
+  }
 }

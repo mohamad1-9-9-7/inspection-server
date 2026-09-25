@@ -99,4 +99,20 @@ function requireAuthStrict(req, res, next) {
   return res.status(401).json({ ok: false, error: "auth_required" });
 }
 
-module.exports = { requireAuth, requireAuthStrict, isEnforcing };
+/* ============================================================
+   requireSuperAdmin — the platform owner (INSPECT PRO) only.
+
+   Runs AFTER requireAuthStrict, so req.user is already the verified token.
+   `strict` proves "a valid session"; this proves "the session is the
+   platform owner" — tenant admins, however senior, are refused.
+   Same pre-configuration escape hatch as requireAuthStrict: with no
+   AUTH_SECRET no token can exist, so refusing here would only 403 every
+   caller in an environment that simply isn't set up yet (local/dev).
+============================================================ */
+function requireSuperAdmin(req, res, next) {
+  if (req.user && req.user.isSuperAdmin) return next();
+  if (!hasSecret()) return next();
+  return res.status(403).json({ ok: false, error: "super_admin_required" });
+}
+
+module.exports = { requireAuth, requireAuthStrict, requireSuperAdmin, isEnforcing };

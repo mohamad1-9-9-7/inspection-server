@@ -75,6 +75,14 @@ const REF_SCOPED = {
   },
 };
 
+/* Company-scoped references for the generic-industry tenants (sweets …).
+   These carry NO "AM-" prefix — that is the meat company's mark — and count
+   per company, so two tenants on the same template never share a sequence:
+   the counter key is `<type>:c<companyId>` → "NCR-000001". */
+const REF_COMPANY = {
+  sweets_non_conformance: "NCR",
+};
+
 function hasRef(payload) {
   return !!(payload && typeof payload.refNo === "string" && payload.refNo.trim());
 }
@@ -93,7 +101,13 @@ async function bumpCounter(q, key) {
   return rows[0].last;
 }
 
-async function allocRef(q, type, payload) {
+async function allocRef(q, type, payload, companyId = null) {
+  const companyPrefix = REF_COMPANY[type];
+  if (companyPrefix) {
+    const n = await bumpCounter(q, `${type}:c${companyId || "0"}`);
+    return `${companyPrefix}-${String(n).padStart(REF_PAD, "0")}`;
+  }
+
   // Branch-scoped types count per branch: "POS 10 — 00001".
   const scoped = REF_SCOPED[type];
   if (scoped) {
@@ -112,9 +126,9 @@ async function allocRef(q, type, payload) {
 
 /** Stamp a reference onto a payload that is about to be INSERTed.
  *  Never overwrites one the caller already supplied (restore / import). */
-async function stampRef(q, type, payload) {
-  if ((!REF_PREFIX[type] && !REF_SCOPED[type]) || hasRef(payload)) return payload;
-  const refNo = await allocRef(q, type, payload);
+async function stampRef(q, type, payload, companyId = null) {
+  if ((!REF_PREFIX[type] && !REF_SCOPED[type] && !REF_COMPANY[type]) || hasRef(payload)) return payload;
+  const refNo = await allocRef(q, type, payload, companyId);
   return refNo ? { ...payload, refNo } : payload;
 }
 
@@ -182,8 +196,8 @@ function auditWrite(req, { action, reportId, reportType, oldPayload, newPayload 
   pool
     .query(
       `INSERT INTO report_audit
-         (report_id, report_type, action, username, old_payload, new_payload, route, ip_addr)
-       VALUES ($1,$2,$3,$4,$5::jsonb,$6::jsonb,$7,$8)`,
+         (report_id, report_type, action, username, old_payload, new_payload, route, ip_addr, company_id)
+       VALUES ($1,$2,$3,$4,$5::jsonb,$6::jsonb,$7,$8,$9)`,
       [
         reportId ?? null,
         String(reportType || ""),
@@ -193,6 +207,7 @@ function auditWrite(req, { action, reportId, reportType, oldPayload, newPayload 
         newPayload == null ? null : JSON.stringify(newPayload),
         `${req.method} ${req.originalUrl || req.url || ""}`.slice(0, 300),
         auditIp(req),
+        companyIdForWrite(req),
       ]
     )
     .catch((e) => console.warn("[audit] insert failed:", e?.message || e));
@@ -743,8 +758,8 @@ app.post("/api/reports", auth, async (req, res) => {
       return res.status(400).json({ ok: false, error: "payload object required" });
     }
 
-    const stamped = await stampRef(pool, type, payload);
     const companyId = companyIdForWrite(req);
+    const stamped = await stampRef(pool, type, payload, companyId);
 
     const ins = await pool.query(
       `INSERT INTO reports (reporter, type, payload, company_id)
@@ -810,7 +825,7 @@ app.put("/api/reports", auth, async (req, res) => {
       return res.json({ ok: true, report: upd.rows[0], method: "update" });
     }
 
-    const stamped = await stampRef(pool, type, payload);
+    const stamped = await stampRef(pool, type, payload, companyId);
 
     const ins = await pool.query(
       `INSERT INTO reports (reporter, type, payload, company_id)
@@ -983,7 +998,7 @@ app.put("/api/reports/:type([A-Za-z_][A-Za-z0-9_-]*)", auth, async (req, res) =>
       return res.json({ ok: true, report: upd.rows[0], method: "update" });
     }
 
-    const stamped = await stampRef(pool, type, payload);
+    const stamped = await stampRef(pool, type, payload, companyId);
 
     const ins = await pool.query(
       `INSERT INTO reports (reporter, type, payload, company_id)
