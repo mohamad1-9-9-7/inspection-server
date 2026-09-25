@@ -271,16 +271,27 @@ module.exports = async function ensureSchema({ pool, genSalt, hashPw }) {
       updated_at    TIMESTAMPTZ    NOT NULL DEFAULT now()
     );
   `);
+  /* A plans table created before setup_fee existed (production's) lacks the
+     column the seed below writes. The ALTER used to sit near the END of this
+     file, so the seed failed on every boot and — being unguarded — aborted
+     every schema step after it, silently (boot carries on by design). The
+     column now exists before anything writes it, and the seed is guarded
+     so it can never block the rest of the schema again. */
+  await pool.query(`ALTER TABLE plans ADD COLUMN IF NOT EXISTS setup_fee NUMERIC(10,2) NOT NULL DEFAULT 0`);
   /* Seed default plans — pricing is in AED (UAE dirham). Monthly fee is the
      recurring charge; setup_fee is a ONE-TIME onboarding cost. Lowest tier
-     starts at AED 1500/month. Only seeds a brand-new empty install. */
-  await pool.query(`
-    INSERT INTO plans (name, price, currency, setup_fee, max_branches, max_users, description) VALUES
-      ('Starter',    1500, 'AED', 2500,  5,  3,  'Small operations up to 5 branches'),
-      ('Growth',     2500, 'AED', 4000, 15, 10,  'Growing businesses up to 15 branches'),
-      ('Enterprise', 4000, 'AED', 6000, -1, -1,  'Unlimited branches and users')
-    ON CONFLICT (name) DO NOTHING
-  `);
+     starts at AED 1500/month. Existing plans (same name) are left alone. */
+  try {
+    await pool.query(`
+      INSERT INTO plans (name, price, currency, setup_fee, description) VALUES
+        ('Starter',    1500, 'AED', 2500, 'For small operations'),
+        ('Growth',     2500, 'AED', 4000, 'For growing businesses'),
+        ('Enterprise', 4000, 'AED', 6000, 'For large, multi-site operations')
+      ON CONFLICT (name) DO NOTHING
+    `);
+  } catch (e) {
+    console.warn("[schema] default plans seed skipped:", e?.message || e);
+  }
 
   /* ── Companies table ── */
   await pool.query(`
@@ -764,11 +775,15 @@ module.exports = async function ensureSchema({ pool, genSalt, hashPw }) {
     await pool.query(`ALTER TABLE companies ADD COLUMN IF NOT EXISTS currency TEXT`);
     const done = await pool.query(`SELECT 1 FROM platform_settings WHERE key = 'migrated_subscription_to_companies'`);
     if (!done.rowCount) {
+      /* A price equal to the company's plan price is NOT a custom price —
+         copying it would freeze the number and possibly pair it with the
+         wrong currency (the old table defaulted to AED). Only a genuinely
+         different price is carried over, with its currency. */
       await pool.query(`
         UPDATE companies c SET
-          price      = COALESCE(c.price, s.price),
-          currency   = COALESCE(c.currency, NULLIF(s.currency, '')),
-          plan_id    = COALESCE(c.plan_id, (SELECT p.id FROM plans p WHERE lower(p.name) = lower(s.plan) LIMIT 1)),
+          price      = COALESCE(c.price, CASE WHEN s.price IS DISTINCT FROM (SELECT pp.price FROM plans pp WHERE pp.id = c.plan_id) THEN s.price END),
+          currency   = COALESCE(c.currency, CASE WHEN s.price IS DISTINCT FROM (SELECT pp.price FROM plans pp WHERE pp.id = c.plan_id) THEN NULLIF(s.currency, '') END),
+          plan_id    = COALESCE(c.plan_id, (SELECT p2.id FROM plans p2 WHERE lower(p2.name) = lower(s.plan) LIMIT 1)),
           start_date = COALESCE(c.start_date, s.start_date),
           end_date   = COALESCE(c.end_date, s.end_date)
         FROM subscription s
