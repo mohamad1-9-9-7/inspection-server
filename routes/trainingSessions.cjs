@@ -1,3 +1,7 @@
+// Session types come from the industries (meat: training_session, sweets:
+// sweets_training_session) — a token only ever matches its own row.
+const { TRAINING_SESSION_TYPES } = require("../industries/index.cjs");
+
 module.exports = function registerTrainingSessionRoutes(app, deps = {}) {
   const { pool, normText, safeArr, normKey, todayISO, isObj, rollbackQuietly, sendDbError,
           makeLimiter, requireAuthStrict } = deps;
@@ -70,12 +74,12 @@ app.get("/api/training-session/by-token/:token", publicLimiter, async (req, res)
       `
       SELECT id, reporter, type, created_at, updated_at, payload
       FROM reports
-      WHERE type='training_session'
+      WHERE type = ANY($2::text[])
         AND (payload->>'quizToken') = $1
       ORDER BY created_at DESC
       LIMIT 1
       `,
-      [token]
+      [token, TRAINING_SESSION_TYPES]
     );
 
     if (!q.rowCount) return res.status(404).json({ ok: false, error: "SESSION_NOT_FOUND" });
@@ -140,13 +144,13 @@ app.post("/api/training-session/by-token/:token/submit", publicLimiter, async (r
       `
       SELECT id, payload
       FROM reports
-      WHERE type='training_session'
+      WHERE type = ANY($2::text[])
         AND (payload->>'quizToken') = $1
       ORDER BY created_at DESC
       LIMIT 1
       FOR UPDATE
       `,
-      [token]
+      [token, TRAINING_SESSION_TYPES]
     );
 
     if (!q.rowCount) {

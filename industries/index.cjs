@@ -21,9 +21,12 @@ const makeMeatCutScope = require("./meat/cutScope.cjs");
 const registerMeatReportRoutes = require("./meat/reportRoutes.cjs");
 
 const INDUSTRIES = [
-  { name: "meat", refs: meatRefs },
-  { name: "sweets", refs: sweetsRefs },
+  { name: "meat", refs: meatRefs, training: require("./meat/training.cjs") },
+  { name: "sweets", refs: sweetsRefs, training: require("./sweets/training.cjs") },
 ];
+
+/* Report types that hold a training session with a public quiz token. */
+const TRAINING_SESSION_TYPES = [...new Set(INDUSTRIES.map((i) => i.training?.sessionType).filter(Boolean))];
 
 /* Merge every industry's reference rules into the three shapes the core
    allocator understands, refusing any type claimed twice. */
@@ -80,4 +83,4 @@ function forReports(pool) {
   };
 }
 
-module.exports = { forReports, REF_RULES };
+module.exports = { forReports, REF_RULES, TRAINING_SESSION_TYPES };
