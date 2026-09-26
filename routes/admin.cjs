@@ -1,6 +1,6 @@
 module.exports = function registerAdminRoutes(app, deps = {}) {
   const { pool, clampInt, normText, rlCheck, rlReset, genSalt, hashPw, verifyPw, signToken,
-          requireAuthStrict } = deps;
+          requireAuthStrict, requireSuperAdmin, verifyToken, tokenFromReq } = deps;
   const SCRYPT_PFX = "scrypt:";
 
   const noLimit = (_req, _res, next) => next();
@@ -8,6 +8,11 @@ module.exports = function registerAdminRoutes(app, deps = {}) {
      nothing but the client-side isAdmin flag, which anyone can skip by
      calling the URL directly. */
   const strict = typeof requireAuthStrict === "function" ? requireAuthStrict : noLimit;
+  /* Accounts are created, edited and deleted by the platform super-admin
+     ONLY — from the Platform Center, never from inside a company. A company
+     admin used to be able to call these URLs directly (the only check was
+     the client-side isAdmin flag), and so could any signed-in account. */
+  const superOnly = typeof requireSuperAdmin === "function" ? requireSuperAdmin : noLimit;
 
 /* --------- Auth: verify role password --------- */
 app.post("/api/auth/verify-role", (req, res) => {
@@ -45,8 +50,24 @@ app.post("/api/auth/verify-role", (req, res) => {
    Reports summary — one query returns count + latest per type.
    Used by the KPI dashboard so it doesn't have to fan out N fetches.
 ============================================================ */
-app.get("/api/reports/summary", async (_req, res) => {
+/* Company-scoped: it used to be open and count every company's reports.
+   Super-admin: all, or ?company_id; an account: its own company; no valid
+   token: nothing. */
+app.get("/api/reports/summary", async (req, res) => {
   try {
+    const raw = typeof tokenFromReq === "function" ? tokenFromReq(req) : null;
+    const u = raw && typeof verifyToken === "function" ? verifyToken(raw) : null;
+    let scope = null; // null = all companies (super-admin only)
+    if (!u) {
+      if (process.env.AUTH_SECRET) return res.json({ ok: true, data: [] });
+    } else if (u.isSuperAdmin) {
+      const q = Number(req.query?.company_id);
+      if (Number.isFinite(q) && q > 0) scope = q;
+    } else {
+      const own = Number(u.companyId);
+      if (!(Number.isFinite(own) && own > 0)) return res.json({ ok: true, data: [] });
+      scope = own;
+    }
     const { rows } = await pool.query(`
       SELECT
         type,
@@ -57,9 +78,10 @@ app.get("/api/reports/summary", async (_req, res) => {
         ))                                                 AS latest_date,
         MAX(created_at)                                    AS last_created_at
       FROM reports
+      ${scope != null ? "WHERE company_id = $1" : ""}
       GROUP BY type
       ORDER BY count DESC
-    `);
+    `, scope != null ? [scope] : []);
     res.json({ ok: true, data: rows });
   } catch (e) {
     console.error("reports/summary error:", e);
@@ -324,18 +346,27 @@ app.post("/api/auth/logout", async (req, res) => {
 });
 
 /* ============================================================
-   APP USERS — CRUD (admin only — validated client-side via isAdmin flag)
+   APP USERS — CRUD. Writes: super-admin only. Reads: super-admin sees every
+   company (or one via ?company_id); anyone else sees their OWN company's
+   accounts only (Workforce links people to them), never a super-admin row.
 ============================================================ */
 
 /* GET /api/app-users */
 app.get("/api/app-users", strict, async (req, res) => {
   try {
-    /* Multi-tenant scoping: ?company_id=N restricts to that company.
-       Super-admin UI omits it to see everyone. */
-    const companyId = req.query.company_id ? parseInt(req.query.company_id) : null;
+    const u = req.user || {};
+    const seesAll = !!u.isSuperAdmin || !process.env.AUTH_SECRET;
     const params = [];
     let where = "";
-    if (companyId) { params.push(companyId); where = `WHERE u.company_id = $1`; }
+    if (seesAll) {
+      const companyId = req.query.company_id ? parseInt(req.query.company_id) : null;
+      if (companyId) { params.push(companyId); where = `WHERE u.company_id = $1`; }
+    } else {
+      const own = Number(u.companyId);
+      if (!(Number.isFinite(own) && own > 0)) return res.json({ ok: true, users: [] });
+      params.push(own);
+      where = `WHERE u.company_id = $1 AND u.is_super_admin = false`;
+    }
 
     const q = await pool.query(
       `SELECT u.id, u.username, u.display_name, u.permissions, u.crud_perms, u.employees, u.allowed_branches,
@@ -355,7 +386,7 @@ app.get("/api/app-users", strict, async (req, res) => {
 });
 
 /* POST /api/app-users  { username, displayName, password, permissions, crudPerms, employees, isAdmin } */
-app.post("/api/app-users", strict, async (req, res) => {
+app.post("/api/app-users", strict, superOnly, async (req, res) => {
   try {
     const username       = normText(req.body?.username);
     const displayName    = normText(req.body?.displayName || req.body?.display_name || username);
@@ -395,7 +426,7 @@ app.post("/api/app-users", strict, async (req, res) => {
 });
 
 /* PUT /api/app-users/:id  { displayName?, password?, permissions?, isAdmin?, isActive? } */
-app.put("/api/app-users/:id", strict, async (req, res) => {
+app.put("/api/app-users/:id", strict, superOnly, async (req, res) => {
   try {
     const { id } = req.params;
     const sets = [];
@@ -465,7 +496,7 @@ app.put("/api/app-users/:id", strict, async (req, res) => {
 });
 
 /* DELETE /api/app-users/:id */
-app.delete("/api/app-users/:id", strict, async (req, res) => {
+app.delete("/api/app-users/:id", strict, superOnly, async (req, res) => {
   try {
     const { id } = req.params;
     const q = await pool.query(`DELETE FROM app_users WHERE id=$1 RETURNING username`, [id]);
@@ -479,7 +510,7 @@ app.delete("/api/app-users/:id", strict, async (req, res) => {
 });
 
 /* GET /api/activity-log?limit=50&username=xxx */
-app.get("/api/activity-log", strict, async (req, res) => {
+app.get("/api/activity-log", strict, superOnly, async (req, res) => {
   try {
     const limit = clampInt(req.query?.limit, 100, 1, 500);
     const usernameFilter = normText(req.query?.username || "");
@@ -508,7 +539,7 @@ app.get("/api/activity-log", strict, async (req, res) => {
 
 /* ─── Failed Logins Monitor — security audit ─── */
 /* Returns the last N failed login attempts + per-IP aggregation for the past hour. */
-app.get("/api/security/failed-logins", strict, async (req, res) => {
+app.get("/api/security/failed-logins", strict, superOnly, async (req, res) => {
   try {
     const limit = clampInt(req.query?.limit, 50, 1, 200);
     const recent = await pool.query(
