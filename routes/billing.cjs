@@ -1,6 +1,7 @@
 module.exports = function registerBillingRoutes(app, deps = {}) {
   const { pool, requireAuthStrict, requireSuperAdmin, verifyToken, tokenFromReq } = deps;
 
+  const { markCompanyDisabled } = require("../utils/companyGate.cjs");
   const noGate = (_req, _res, next) => next();
   const strict = typeof requireAuthStrict === "function" ? requireAuthStrict : noGate;
 
@@ -122,8 +123,6 @@ app.get("/api/companies", strict, async (req, res) => {
   try {
     const u = req.user || {};
     const seesAll = !!u.isSuperAdmin || !process.env.AUTH_SECRET;
-    // Archived companies are hidden unless the super-admin asks for them.
-    const withArchived = seesAll && String(req.query?.archived || "") === "1";
     const ownId = Number(u.companyId);
     if (!seesAll && !(Number.isFinite(ownId) && ownId > 0)) {
       return res.json({ ok: true, companies: [] });
@@ -134,7 +133,7 @@ app.get("/api/companies", strict, async (req, res) => {
               to_char(c.end_date,   'YYYY-MM-DD') AS end_date
          FROM companies c
          LEFT JOIN plans p ON p.id = c.plan_id
-        ${seesAll ? (withArchived ? "" : "WHERE c.archived_at IS NULL") : "WHERE c.id = $1"}
+        ${seesAll ? "" : "WHERE c.id = $1"}
         ORDER BY c.created_at ASC`,
       seesAll ? [] : [ownId]
     );
@@ -225,42 +224,49 @@ app.put("/api/companies/:id", strict, superOnly, async (req, res) => {
   }
 });
 
-/* "Delete" = ARCHIVE. A hard DELETE used to null the company on every
-   account and report it owned, and the boot backfill then filed all of it
-   under the primary company (see db/schema.cjs). Archiving suspends the
-   company (its accounts can no longer log in), hides it from the list, and
-   keeps every row where it was, so it can be restored. The primary company
-   (id 1) cannot be archived. */
-app.delete("/api/companies/:id", strict, superOnly, async (req, res) => {
+/* There is NO delete. A company is only DISABLED and RE-ENABLED.
+   (A hard DELETE used to null company_id on every account and report it
+   owned, and the boot backfill then filed all of it under the primary
+   company — see db/schema.cjs.)
+
+   Disabled = disabled_at set. Its accounts cannot log in (routes/admin.cjs)
+   and any session already open is answered 401 on its next request
+   (utils/companyGate.cjs), so it is signed out. Only the super-admin can
+   still enter it. Stored status/dates are left as they were, so re-enabling
+   brings the company back exactly as it stood. The primary company (id 1)
+   cannot be disabled. */
+app.post("/api/companies/:id/disable", strict, superOnly, async (req, res) => {
   try {
     const id = Number(req.params.id);
     if (!(Number.isInteger(id) && id > 0)) return res.status(400).json({ ok: false, error: "bad_id" });
     if (id === 1) return res.status(400).json({ ok: false, error: "primary_company" });
     const upd = await pool.query(
-      `UPDATE companies SET archived_at = COALESCE(archived_at, now()), status = 'suspended', updated_at = now()
-        WHERE id = $1 RETURNING id`,
+      `UPDATE companies SET disabled_at = COALESCE(disabled_at, now()), updated_at = now()
+        WHERE id = $1 RETURNING id, disabled_at`,
       [id]
     );
     if (!upd.rowCount) return res.status(404).json({ ok: false, error: "not_found" });
-    res.json({ ok: true, archived: true });
+    markCompanyDisabled(id, true);
+    res.json({ ok: true, company: upd.rows[0] });
   } catch (e) {
-    console.error("DELETE /api/companies/:id ERROR:", e);
+    console.error("POST /api/companies/:id/disable ERROR:", e);
     res.status(500).json({ ok: false, error: "server_error" });
   }
 });
 
-/* Undo an archive. Status stays 'suspended' — reactivating is a deliberate
-   second step through PUT /api/companies/:id. */
-app.post("/api/companies/:id/restore", strict, superOnly, async (req, res) => {
+app.post("/api/companies/:id/enable", strict, superOnly, async (req, res) => {
   try {
+    const id = Number(req.params.id);
+    if (!(Number.isInteger(id) && id > 0)) return res.status(400).json({ ok: false, error: "bad_id" });
     const upd = await pool.query(
-      `UPDATE companies SET archived_at = NULL, updated_at = now() WHERE id = $1 RETURNING id`,
-      [req.params.id]
+      `UPDATE companies SET disabled_at = NULL, updated_at = now() WHERE id = $1 RETURNING id`,
+      [id]
     );
     if (!upd.rowCount) return res.status(404).json({ ok: false, error: "not_found" });
+    markCompanyDisabled(id, false);
     res.json({ ok: true });
   } catch (e) {
-    console.error("DELETE /api/companies/:id ERROR:", e);
+    console.error("POST /api/companies/:id/enable ERROR:", e);
     res.status(500).json({ ok: false, error: "server_error" });
   }
 });
@@ -278,6 +284,7 @@ app.post("/api/companies/:id/restore", strict, superOnly, async (req, res) => {
    expired — the same rule the login lock applies. */
 const EFFECTIVE_STATUS_SQL = `
   CASE
+    WHEN c.disabled_at IS NOT NULL THEN 'suspended'
     WHEN c.status IN ('expired','suspended') THEN c.status
     WHEN c.end_date IS NOT NULL AND c.end_date < CURRENT_DATE THEN 'expired'
     ELSE c.status

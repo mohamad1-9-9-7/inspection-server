@@ -1,4 +1,11 @@
-const { verifyToken, tokenFromReq } = require("./token.cjs");
+const { verifyTokenRaw, tokenFromReq } = require("./token.cjs");
+const { tokenBlocked } = require("./companyGate.cjs");
+
+/* A valid token whose company is DISABLED: 401 even in audit mode, so the
+   frontend (authFetch) signs that session out on its next request. */
+function companyDisabled(res) {
+  return res.status(401).json({ ok: false, error: "company_disabled" });
+}
 
 /* ============================================================
    requireAuth middleware factory
@@ -26,8 +33,9 @@ function isEnforcing() {
 
 function requireAuth(req, res, next) {
   const raw = tokenFromReq(req);
-  const payload = raw ? verifyToken(raw) : null;
+  const payload = raw ? verifyTokenRaw(raw) : null;
 
+  if (payload && tokenBlocked(payload)) return companyDisabled(res);
   if (payload) {
     req.user = payload;
     return next();
@@ -77,8 +85,9 @@ let warnedNoSecret = 0;
 
 function requireAuthStrict(req, res, next) {
   const raw = tokenFromReq(req);
-  const payload = raw ? verifyToken(raw) : null;
+  const payload = raw ? verifyTokenRaw(raw) : null;
 
+  if (payload && tokenBlocked(payload)) return companyDisabled(res);
   if (payload) {
     req.user = payload;
     return next();

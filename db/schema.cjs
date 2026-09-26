@@ -379,16 +379,17 @@ module.exports = async function ensureSchema({ pool, genSalt, hashPw }) {
   `);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_reports_company_id ON reports(company_id)`);
 
-  /* ── A company is never hard-deleted — it is ARCHIVED ──
+  /* ── A company is never deleted — only DISABLED / re-enabled ──
      The FKs above were ON DELETE SET NULL, so DELETE FROM companies turned
      that customer's accounts and reports into company_id NULL — and the two
      backfills above then moved them ALL into the primary company (Al
      Mawashi) on the next boot. Even before a reboot, a NULL-company account
-     logged in and read company 1's data. Now: DELETE /api/companies/:id only
-     stamps archived_at, and the FKs are RESTRICT so a raw DELETE on a company
-     that still owns rows fails instead of scattering them. */
+     logged in and read company 1's data. Now there is no delete route at
+     all: disabling stamps disabled_at (see utils/companyGate.cjs), and the
+     FKs are RESTRICT so a raw DELETE on a company that still owns rows
+     fails instead of scattering them. */
   try {
-    await pool.query(`ALTER TABLE companies ADD COLUMN IF NOT EXISTS archived_at TIMESTAMPTZ`);
+    await pool.query(`ALTER TABLE companies ADD COLUMN IF NOT EXISTS disabled_at TIMESTAMPTZ`);
     for (const table of ["app_users", "reports"]) {
       const fk = await pool.query(
         `SELECT conname, confdeltype FROM pg_constraint
@@ -407,7 +408,7 @@ module.exports = async function ensureSchema({ pool, genSalt, hashPw }) {
       }
     }
   } catch (e) {
-    console.warn("[schema] company archive / FK RESTRICT step skipped:", e?.message || e);
+    console.warn("[schema] company disable / FK RESTRICT step skipped:", e?.message || e);
   }
 
   /* Widen the one-report-per-(type,reportDate) rule to per-company.

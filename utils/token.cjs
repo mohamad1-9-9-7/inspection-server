@@ -58,7 +58,7 @@ function signToken(payload = {}, ttlSeconds = DEFAULT_TTL_SECONDS) {
  * Verify a token. Returns the decoded payload object on success,
  * or null if the token is missing/malformed/tampered/expired.
  */
-function verifyToken(token) {
+function verifyTokenRaw(token) {
   if (!SECRET || !token || typeof token !== "string") return null;
   const parts = token.split(".");
   if (parts.length !== 3) return null;
@@ -92,4 +92,13 @@ function tokenFromReq(req) {
   return m ? m[1].trim() : "";
 }
 
-module.exports = { signToken, verifyToken, tokenFromReq, DEFAULT_TTL_SECONDS };
+/* Every caller outside the auth middleware gets the GATED check: a token of
+   a disabled company (utils/companyGate.cjs) is simply not valid. The
+   middleware uses verifyTokenRaw so it can answer "company_disabled". */
+const { tokenBlocked } = require("./companyGate.cjs");
+function verifyToken(token) {
+  const payload = verifyTokenRaw(token);
+  return payload && tokenBlocked(payload) ? null : payload;
+}
+
+module.exports = { signToken, verifyToken, verifyTokenRaw, tokenFromReq, DEFAULT_TTL_SECONDS };

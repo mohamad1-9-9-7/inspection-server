@@ -209,7 +209,7 @@ app.post("/api/auth/login", async (req, res) => {
     let company = null;
     if (user.company_id) {
       const cq = await pool.query(
-        `SELECT c.id, c.name, c.status, c.start_date, c.end_date, c.industry, c.archived_at,
+        `SELECT c.id, c.name, c.status, c.start_date, c.end_date, c.industry, c.disabled_at,
                 p.name AS plan_name
            FROM companies c
            LEFT JOIN plans p ON p.id = c.plan_id
@@ -217,14 +217,15 @@ app.post("/api/auth/login", async (req, res) => {
         [user.company_id]
       );
       company = cq.rows[0] || null;
-      /* The account points at a company that is gone or archived: refuse,
-         never fall through to the primary company's data. */
-      if (!user.is_super_admin && (!company || company.archived_at)) {
-        await logFailed("company_archived");
+      /* The account points at a company that is gone or DISABLED: refuse,
+         never fall through to the primary company's data. Only the
+         super-admin may still enter a disabled company. */
+      if (!user.is_super_admin && (!company || company.disabled_at)) {
+        await logFailed("company_disabled");
         return res.status(403).json({
           ok: false,
-          error: "subscription_lapsed",
-          company: company ? { name: company.name, status: "suspended", end_date: company.end_date } : null,
+          error: "company_disabled",
+          company: company ? { name: company.name, status: "disabled", end_date: company.end_date } : null,
         });
       }
     }

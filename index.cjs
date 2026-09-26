@@ -5,6 +5,7 @@ const cors = require("cors");
 
 const { pool, rollbackQuietly, sendDbError } = require("./db/pool.cjs");
 const ensureSchema = require("./db/schema.cjs");
+const { loadDisabledCompanies } = require("./utils/companyGate.cjs");
 const common = require("./utils/common.cjs");
 const password = require("./utils/password.cjs");
 const rateLimit = require("./utils/rateLimit.cjs");
@@ -142,6 +143,7 @@ ensureSchema({ pool, genSalt: password.genSalt, hashPw: password.hashPw })
   .catch((err) => {
     console.error("DB init had a problem (continuing to start anyway):", err);
   })
+  .then(() => loadDisabledCompanies(pool))
   .finally(() => {
     app.listen(PORT, () => {
       console.log(`API running on :${PORT} (FULL public access: read/write/delete enabled)`);
