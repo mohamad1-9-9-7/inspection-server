@@ -509,6 +509,71 @@ app.delete("/api/app-users/:id", strict, superOnly, async (req, res) => {
   }
 });
 
+/* ============================================================
+   SECURITY CONTROLS — platform-wide (delete switches, read-only mode,
+   session timeout, idle lock, who may open Settings).
+
+   Used to live ONLY in each browser's localStorage, so a switch flipped by
+   the owner applied to the owner's own browser and nobody else's. Now the
+   server row (platform_settings key 'security_controls') is the truth and
+   the browser keeps a cache. Every signed-in account READS it (the app
+   enforces it everywhere); only the super-admin WRITES it.
+============================================================ */
+const SECURITY_KEY = "security_controls";
+
+function sanitizeSecurity(v) {
+  const b = v && typeof v === "object" && !Array.isArray(v) ? v : {};
+  const num = (x, lo, hi, dflt) => {
+    const n = Number(x);
+    return Number.isFinite(n) ? Math.min(hi, Math.max(lo, n)) : dflt;
+  };
+  const overrides = {};
+  const ov = b.deleteBranchOverrides;
+  if (ov && typeof ov === "object" && !Array.isArray(ov)) {
+    for (const [k, val] of Object.entries(ov)) {
+      if (typeof k === "string" && k.length <= 60) overrides[k] = val === true;
+    }
+  }
+  return {
+    allowDeleteRecords:    b.allowDeleteRecords === true,
+    deleteBranchOverrides: overrides,
+    requireDeleteConfirm:  b.requireDeleteConfirm !== false,
+    readOnlyMode:          b.readOnlyMode === true,
+    adminOnlySettings:     b.adminOnlySettings !== false,
+    sessionTimeoutHours:   num(b.sessionTimeoutHours, 0, 720, 8),
+    lockScreenMinutes:     num(b.lockScreenMinutes, 0, 1440, 0),
+  };
+}
+
+app.get("/api/security-settings", strict, async (_req, res) => {
+  try {
+    const q = await pool.query(`SELECT value, updated_at FROM platform_settings WHERE key = $1`, [SECURITY_KEY]);
+    const row = q.rows[0];
+    // null value = never saved on the server: the client keeps its defaults.
+    res.json({ ok: true, value: row ? sanitizeSecurity(row.value) : null, updated_at: row?.updated_at || null });
+  } catch (e) {
+    console.error("GET /api/security-settings ERROR:", e);
+    res.status(500).json({ ok: false, error: "server_error" });
+  }
+});
+
+app.put("/api/security-settings", strict, superOnly, async (req, res) => {
+  try {
+    const value = sanitizeSecurity(req.body?.value);
+    const q = await pool.query(
+      `INSERT INTO platform_settings (key, value, updated_by, updated_at)
+       VALUES ($1, $2, $3, now())
+       ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_by = EXCLUDED.updated_by, updated_at = now()
+       RETURNING value, updated_at`,
+      [SECURITY_KEY, value, String(req.user?.username || "")]
+    );
+    res.json({ ok: true, value: q.rows[0].value, updated_at: q.rows[0].updated_at });
+  } catch (e) {
+    console.error("PUT /api/security-settings ERROR:", e);
+    res.status(500).json({ ok: false, error: "server_error" });
+  }
+});
+
 /* GET /api/activity-log?limit=50&username=xxx */
 app.get("/api/activity-log", strict, superOnly, async (req, res) => {
   try {
