@@ -3,6 +3,9 @@ const cloudinary = require("cloudinary").v2;
 module.exports = function registerReportsRoutes(app, deps = {}) {
   const { pool, clampInt, normText, isObj, requireAuth, requireAuthStrict, makeLimiter } = deps;
 
+  // What each line of business adds on top of the shared core — see industries/index.cjs.
+  const industries = require("../industries/index.cjs").forReports(pool);
+
   // Fallback no-op if the middleware wasn't wired in (keeps routes working
   // on an older deps shape); real enforcement comes from utils/requireAuth.
   const auth = typeof requireAuth === "function" ? requireAuth : (_req, _res, next) => next();
@@ -32,56 +35,21 @@ module.exports = function registerReportsRoutes(app, deps = {}) {
   };
 
 /* ============================================================
-   Reference numbers  (AM-CND-000142)
+   Reference numbers
    ------------------------------------------------------------
-   One continuous counter per report type, never reset, so a
-   reference identifies a record for all time. The counter is
-   bumped with a single atomic UPSERT, which means two concurrent
-   saves can never be handed the same number.
+   One continuous counter per rule, never reset, so a reference
+   identifies a record for all time. The counter is bumped with a
+   single atomic UPSERT, which means two concurrent saves can never
+   be handed the same number.
 
-   Add a type here and it starts getting references — nothing
-   else in the app needs to change.
+   WHICH types get a reference, and in what shape, is owned by each
+   industry (industries/<name>/refs.cjs) — the core only allocates:
+     global  → "<mark>-<prefix>-000087"   one counter per type
+     scoped  → "POS 10 — 00001"           one counter per branch
+     company → "<prefix>-000001"          one counter per company
 ============================================================ */
-const REF_PREFIX = {
-  destruction_record:     "CND",
-  returns:                "RET",
-  returns_customers:      "CRT",
-  // NC numbers used to be typed by hand ("NC-001"), so two people raising a
-  // finding on the same morning wrote the same number. Each NCR type keeps its
-  // own counter: QCS and POS 19 store their reports separately and must not
-  // share a sequence.
-  qcs_non_conformance:    "NCR",
-  pos19_non_conformance:  "NCP",
-  sweets_non_conformance: "NCR",
-  // شكاوي الجودة (فروع وموردين) — كل شكوى تحمل مرجعًا مستقلًا (AM-CMP-000123)
-  qa_complaint:           "CMP",
-};
-
+const { REF_RULES } = industries;
 const REF_PAD = 6;
-
-/* Branch-scoped references: instead of one global counter per type, these keep
-   a separate counter per branch and lead the number with the branch code —
-   e.g. the butcher's cutting log reads "POS 10 — 00001", counting from 1 for
-   every branch on its own. The counter row key is `<type>:<branch>`, so no
-   schema change is needed (report_counters.type is just text).
-
-   scopeOf() pulls the branch out of the payload; a record without a branch is
-   left unnumbered rather than sharing some catch-all counter. */
-const REF_SCOPED = {
-  butcher_cut_log: {
-    pad: 5,
-    scopeOf: (p) => normText(p?.branch || ""),
-    format: (scope, n, pad) => `${scope} — ${String(n).padStart(pad, "0")}`,
-  },
-};
-
-/* Company-scoped references for the generic-industry tenants (sweets …).
-   These carry NO "AM-" prefix — that is the meat company's mark — and count
-   per company, so two tenants on the same template never share a sequence:
-   the counter key is `<type>:c<companyId>` → "NCR-000001". */
-const REF_COMPANY = {
-  sweets_non_conformance: "NCR",
-};
 
 function hasRef(payload) {
   return !!(payload && typeof payload.refNo === "string" && payload.refNo.trim());
@@ -102,14 +70,14 @@ async function bumpCounter(q, key) {
 }
 
 async function allocRef(q, type, payload, companyId = null) {
-  const companyPrefix = REF_COMPANY[type];
+  const companyPrefix = REF_RULES.company[type];
   if (companyPrefix) {
     const n = await bumpCounter(q, `${type}:c${companyId || "0"}`);
     return `${companyPrefix}-${String(n).padStart(REF_PAD, "0")}`;
   }
 
   // Branch-scoped types count per branch: "POS 10 — 00001".
-  const scoped = REF_SCOPED[type];
+  const scoped = REF_RULES.scoped[type];
   if (scoped) {
     const scope = scoped.scopeOf(payload);
     if (!scope) return null;                       // no branch → no number
@@ -117,17 +85,21 @@ async function allocRef(q, type, payload, companyId = null) {
     return scoped.format(scope, n, scoped.pad);
   }
 
-  const prefix = REF_PREFIX[type];
-  if (!prefix) return null;
+  const rule = REF_RULES.global[type];
+  if (!rule) return null;
 
   const n = await bumpCounter(q, type);
-  return `AM-${prefix}-${String(n).padStart(REF_PAD, "0")}`;
+  return `${rule.mark}-${rule.prefix}-${String(n).padStart(REF_PAD, "0")}`;
 }
+
+/** Is this type reference-tracked by any industry? */
+const isRefTracked = (type) =>
+  !!(REF_RULES.global[type] || REF_RULES.scoped[type] || REF_RULES.company[type]);
 
 /** Stamp a reference onto a payload that is about to be INSERTed.
  *  Never overwrites one the caller already supplied (restore / import). */
 async function stampRef(q, type, payload, companyId = null) {
-  if ((!REF_PREFIX[type] && !REF_SCOPED[type] && !REF_COMPANY[type]) || hasRef(payload)) return payload;
+  if (!isRefTracked(type) || hasRef(payload)) return payload;
   const refNo = await allocRef(q, type, payload, companyId);
   return refNo ? { ...payload, refNo } : payload;
 }
@@ -263,76 +235,9 @@ async function fetchOldById(id) {
   }
 }
 
-/* ============================================================
-   نطاق سجلات التقطيع حسب الملحمة (butcher_cut_log)
-
-   المتصفّح عم يحصر لوحة المشرف على ملاحمه، بس حصر الواجهة بيتجاوزه أي حدا
-   بيفتح /api/reports بنفسه. هون منفرضه على السيرفر.
-
-   القاعدة مقصودة ضيّقة، حتى ما تكسر ولا شاشة من مئات الشاشات اللي بتضرب
-   /api/reports:
-
-     • بتنطبق على نوع واحد فقط: butcher_cut_log.
-     • ما بتنطبق إذا ما عرفنا مين المستخدم (توكن غايب أو AUTH_SECRET مش
-       مضبوط) — نفس فلسفة requireAuth بوضع التدقيق: ما منكسر شي هلق،
-       ومنفرض لحظة ما تنضبط البيئة.
-     • ما بتنطبق على الأدمن — هو اللي بيراقب كل الملاحم.
-     • ما بتنطبق على حساب مش مربوط بموظف نشط بالقوى العاملة.
-
-   المصدر: نفس سجل workforce_config اللي بتقرأه الواجهة، مخبّأ دقيقة
-   بالذاكرة — استعلام مع كل طلب بيوقظ Neon من السبات بلا داعٍ.
-============================================================ */
-const WF_TYPE = "workforce_config";
-const WF_TTL_MS = 60_000;
-let wfCache = { at: 0, people: [] };
-
-async function workforcePeople() {
-  if (Date.now() - wfCache.at < WF_TTL_MS) return wfCache.people;
-  try {
-    const { rows } = await pool.query(
-      `SELECT payload FROM reports
-         WHERE type = $1
-         ORDER BY updated_at DESC NULLS LAST, created_at DESC
-         LIMIT 1`,
-      [WF_TYPE]
-    );
-    const people = Array.isArray(rows?.[0]?.payload?.people) ? rows[0].payload.people : [];
-    wfCache = { at: Date.now(), people };
-  } catch (e) {
-    /* السجل مش موجود أو القراءة فشلت → بلا حصر. الفشل هون ما بيجوز يقفل
-       شاشة على حدا؛ الحصر ميزة فوق، مش شرط تشغيل. */
-    console.warn("[cut-scope] workforce_config read failed:", e?.message || e);
-    wfCache = { at: Date.now(), people: [] };
-  }
-  return wfCache.people;
-}
-
-/** أكواد ملاحم صاحب الطلب، أو null = بلا حصر. */
-async function cutScopeSites(req, type) {
-  if (type !== "butcher_cut_log") return null;
-
-  const u = req.user;
-  if (!u || u.isAdmin) return null;
-
-  const key = String(u.username || "").trim().toLowerCase();
-  if (!key) return null;
-
-  const people = await workforcePeople();
-  const me = people.find(
-    (x) => String(x?.username || "").trim().toLowerCase() === key
-  );
-  if (!me || me.status !== "active") return null;
-
-  /* «مسؤول المخزون» صلاحياته داخل المخزون كاملة متل الأدمن — بيشوف كل
-     الملاحم. لازم يضل مطابق للواجهة، وإلا بتوريه اللوحة كل شي والسيرفر
-     بيرجّعله ملحمته وبس. */
-  if (me.role === "inventoryOfficer") return null;
-
-  const sites = Array.isArray(me.sites) && me.sites.length
-    ? me.sites
-    : (me.site ? [me.site] : []);
-  return sites.length ? sites.map(String) : null;
-}
+/* Branch narrowing for list reads (meat: a butcher sees only his own shops)
+   is decided by the industry — see industries/meat/cutScope.cjs. */
+const cutScopeSites = industries.branchScopeFor;
 
 /** فلترة صفوف بتحمل payload على الملاحم المسموحة. */
 const scopeRows = (rows, sites) =>
@@ -602,151 +507,6 @@ app.get("/api/reports", pingBypass, readLimiter, auth, async (req, res) => {
   }
 });
 
-/** تاريخ عملية التقطيع — نفس أول ثلاث مفاتيح من BUSINESS_DATE. */
-const BUTCHER_DATE = `
-  COALESCE(
-    NULLIF(payload->>'cutDate', ''),
-    NULLIF(payload->>'date', ''),
-    NULLIF(LEFT(payload->>'reportDate', 10), '')
-  )`;
-
-/* ============================================================
-   GET /api/reports/butcher-stats?from=YYYY-MM-DD&to=YYYY-MM-DD
-
-   سطر مجمَّع لكل جزار — لشاشة «أدائي» بكرت الجزار (ترتيب داخل ملحمته
-   وعلى مستوى كل الملاحم).
-
-   ليش مسار لحاله بدل ما الشاشة تحسب لحالها: القائمة بدها أرقام **كل**
-   الجزارين. لو حسبناها بالمتصفّح، كل جزار بيفتح الصفحة بينزّل سجلات كل
-   الملاحم بالـpayload كامل (١٫٥ كيلوبايت للعملية) — نفس السحب اللي شلناه
-   من هالصفحة بالضبط. هون الحساب بالـSQL جوّا القاعدة، والجواب سطر لكل
-   جزار: بضع كيلوبايتات مهما كبر التاريخ.
-
-   الأرقام حقائق فقط — **النتيجة والترتيب بينحسبوا بالواجهة**، حتى تتعدّل
-   الأوزان بلا نشرة سيرفر.
-
-   بلا حصر ملاحم عن قصد (بعكس قراءة السجلات): المطلوب مقارنة مع كل
-   الجزارين، والراجع مجاميع بلا أي تفصيل عملية.
-
-   قواعد الحساب مطابقة لـnormalizeRecord بالواجهة:
-     • الملغى (changeRequest.status = approved) برّا كل رقم.
-     • النواتج = أسطر kind=product ، الهدر = الباقي + wasteBoneKg.
-     • الأساس = وزن الخام، وإذا مش موجود فمجموع الداخل.
-     • المطابقة = العملية اللي كل أسطرها المعيارية ضمن التسامح.
-============================================================ */
-app.get("/api/reports/butcher-stats", pingBypass, readLimiter, auth, async (req, res) => {
-  try {
-    const isDay = (v) => /^\d{4}-\d{2}-\d{2}$/.test(v);
-    const to = isDay(req.query?.to) ? req.query.to : new Date().toISOString().slice(0, 10);
-    const from = isDay(req.query?.from)
-      ? req.query.from
-      : new Date(Date.now() - 89 * 864e5).toISOString().slice(0, 10);
-
-    const D = BUTCHER_DATE;
-    const N = (e) => `NULLIF(${e}, '')::numeric`;
-
-    // null = بلا حصر شركة (سوبر أدمن بلا اختيار). غير هيك، أرقام كل شركة
-    // منفصلة عن التانية — جزار شركة ما بيظهر بترتيب جزارين شركة تانية.
-    const companyScope = companyIdOf(req);
-    const statsParams = [from, to];
-    let companyWhere = "";
-    if (companyScope != null) { statsParams.push(companyScope); companyWhere = ` AND r.company_id = $${statsParams.length}`; }
-
-    const sql = `
-      WITH ops AS (
-        SELECT
-          r.id,
-          NULLIF(TRIM(r.payload->>'employeeNo'), '')           AS emp,
-          COALESCE(NULLIF(r.payload->>'butcherName', ''), '')  AS name,
-          COALESCE(NULLIF(r.payload->>'branch', ''), '')       AS branch,
-          ${D}                                                 AS day,
-          COALESCE(${N("r.payload->>'carcassWeightKg'")}, 0)   AS raw,
-          (r.payload->>'stdYieldOn' = 'true')                  AS std_on,
-          COALESCE(ABS(${N("r.payload->>'stdTolPct'")}), 0)     AS tol,
-          COALESCE(${N("r.payload->>'durationMin'")}, 0)        AS dur,
-          r.payload->'cuts'                                    AS cuts
-        FROM reports r
-        WHERE r.type = 'butcher_cut_log'
-          AND COALESCE(r.payload->'changeRequest'->>'status', '') <> 'approved'
-          AND ${D} >= $1
-          AND ${D} <= $2${companyWhere}
-      ),
-      sums AS (
-        SELECT
-          o.id,
-          COALESCE(SUM(CASE WHEN COALESCE(c->>'kind', 'product') = 'product'
-                            THEN COALESCE(${N("c->>'weightKg'")}, 0) ELSE 0 END), 0) AS products,
-          COALESCE(SUM(CASE WHEN COALESCE(c->>'kind', 'product') <> 'product'
-                            THEN COALESCE(${N("c->>'weightKg'")}, 0) ELSE 0 END), 0)
-          + COALESCE(SUM(COALESCE(${N("c->>'wasteBoneKg'")}, 0)), 0)                 AS waste
-        FROM ops o
-        LEFT JOIN LATERAL jsonb_array_elements(o.cuts) c ON TRUE
-        GROUP BY o.id
-      ),
-      calc AS (
-        SELECT o.*, s.products, s.waste,
-               CASE WHEN o.raw > 0 THEN o.raw ELSE s.products + s.waste END AS base
-        FROM ops o JOIN sums s USING (id)
-      ),
-      std AS (
-        SELECT
-          k.id,
-          COUNT(*) FILTER (
-            WHERE COALESCE(${N("c->>'stdPct'")}, 0) > 0
-              AND COALESCE(${N("c->>'weightKg'")}, 0) > 0
-          ) AS lines_checked,
-          COUNT(*) FILTER (
-            WHERE COALESCE(${N("c->>'stdPct'")}, 0) > 0
-              AND COALESCE(${N("c->>'weightKg'")}, 0) > 0
-              AND k.base > 0
-              AND ABS(COALESCE(${N("c->>'weightKg'")}, 0) / k.base * 100
-                      - COALESCE(${N("c->>'stdPct'")}, 0)) > k.tol
-          ) AS lines_off
-        FROM calc k
-        LEFT JOIN LATERAL jsonb_array_elements(k.cuts) c ON TRUE
-        GROUP BY k.id
-      ),
-      per_op AS (
-        SELECT k.*, st.lines_checked, st.lines_off,
-               CASE WHEN k.base > 0 THEN k.products / k.base * 100 END AS yield_pct,
-               (k.std_on AND st.lines_checked > 0)                      AS std_checked,
-               (k.std_on AND st.lines_checked > 0 AND st.lines_off = 0) AS std_pass
-        FROM calc k JOIN std st USING (id)
-      )
-      SELECT
-        emp                                                        AS "empNo",
-        (ARRAY_AGG(name ORDER BY day DESC, id DESC)
-           FILTER (WHERE name <> ''))[1]                           AS "name",
-        (ARRAY_AGG(branch ORDER BY day DESC, id DESC)
-           FILTER (WHERE branch <> ''))[1]                         AS "branch",
-        ARRAY_REMOVE(ARRAY_AGG(DISTINCT NULLIF(branch, '')), NULL) AS "branches",
-        COUNT(*)::int                                              AS "ops",
-        ROUND(SUM(raw)::numeric, 3)::float8                        AS "rawKg",
-        ROUND(SUM(products)::numeric, 3)::float8                   AS "productsKg",
-        ROUND(SUM(waste)::numeric, 3)::float8                      AS "wasteKg",
-        ROUND(SUM(base)::numeric, 3)::float8                       AS "baseKg",
-        ROUND(AVG(yield_pct)::numeric, 2)::float8                  AS "avgYieldPct",
-        ROUND(STDDEV_SAMP(yield_pct)::numeric, 2)::float8          AS "yieldSd",
-        COUNT(*) FILTER (WHERE yield_pct IS NOT NULL)::int         AS "yieldOps",
-        ROUND(SUM(dur)::numeric, 1)::float8                        AS "durMin",
-        COUNT(*) FILTER (WHERE dur > 0)::int                       AS "durOps",
-        ROUND(SUM(base) FILTER (WHERE dur > 0)::numeric, 3)::float8 AS "durBaseKg",
-        COUNT(*) FILTER (WHERE std_checked)::int                   AS "stdOps",
-        COUNT(*) FILTER (WHERE std_pass)::int                      AS "stdPassOps",
-        MAX(day)                                                   AS "lastDay"
-      FROM per_op
-      WHERE emp IS NOT NULL
-      GROUP BY emp
-      ORDER BY "ops" DESC`;
-
-    const { rows } = await pool.query(sql, statsParams);
-    res.json({ ok: true, from, to, data: rows });
-  } catch (e) {
-    console.error("[butcher-stats]", e);
-    res.status(500).json({ ok: false, error: "stats failed" });
-  }
-});
-
 app.post("/api/reports", auth, async (req, res) => {
   try {
     const reporter = normText(req.body?.reporter || "anonymous");
@@ -849,105 +609,13 @@ app.put("/api/reports", auth, async (req, res) => {
   }
 });
 
-app.put("/api/reports/returns", auth, async (req, res) => {
-  try {
-    const reportDate = String(req.query.reportDate || "");
-    const { items = [], _clientSavedAt } = req.body || {};
-
-    if (!reportDate) return res.status(400).json({ ok: false, error: "reportDate query required" });
-
-    const payload = {
-      reportDate,
-      items: Array.isArray(items) ? items : [],
-      _clientSavedAt: _clientSavedAt || Date.now(),
-    };
-
-    const companyId = companyIdForWrite(req);
-    const old = await fetchOldByTypeDate("returns", reportDate, companyId);
-
-    const upd = await pool.query(
-      `UPDATE reports
-          SET reporter = COALESCE(reporter,'anonymous'),
-              payload=${KEEP_REF("$1")},
-              updated_at=now()
-        WHERE type='returns' AND payload->>'reportDate'=$2 AND company_id=$3
-        RETURNING *`,
-      [payload, reportDate, companyId]
-    );
-
-    if (upd.rowCount > 0) {
-      auditWrite(req, {
-        action: "update",
-        reportId: upd.rows[0].id,
-        reportType: "returns",
-        oldPayload: old?.payload ?? null,
-        newPayload: upd.rows[0].payload,
-      });
-      return res.json({ ok: true, report: upd.rows[0], method: "update" });
-    }
-
-    const ins = await pool.query(
-      `INSERT INTO reports (reporter,type,payload,company_id)
-       VALUES ('anonymous','returns',$1::jsonb,$2)
-       RETURNING *`,
-      [await stampRef(pool, "returns", payload), companyId]
-    );
-
-    auditCreate(req, ins.rows[0]);
-    return res.status(201).json({ ok: true, report: ins.rows[0], method: "insert" });
-  } catch (e) {
-    console.error("PUT /api/reports/returns ERROR =", e);
-    return res.status(500).json({ ok: false, error: String(e?.message || e) });
-  }
-});
-
-app.put("/api/reports/qcs", auth, async (req, res) => {
-  try {
-    const reportDate = String(req.query.reportDate || "");
-    const { details = {}, _clientSavedAt } = req.body || {};
-    if (!reportDate) return res.status(400).json({ ok: false, error: "reportDate query required" });
-
-    const payload = {
-      reportDate,
-      details: isObj(details) ? details : {},
-      _clientSavedAt: _clientSavedAt || Date.now(),
-    };
-
-    const companyId = companyIdForWrite(req);
-    const old = await fetchOldByTypeDate("qcs", reportDate, companyId);
-
-    const upd = await pool.query(
-      `UPDATE reports
-          SET reporter = COALESCE(reporter,'anonymous'),
-              payload=${KEEP_REF("$1")},
-              updated_at=now()
-        WHERE type='qcs' AND payload->>'reportDate'=$2 AND company_id=$3
-        RETURNING *`,
-      [payload, reportDate, companyId]
-    );
-    if (upd.rowCount > 0) {
-      auditWrite(req, {
-        action: "update",
-        reportId: upd.rows[0].id,
-        reportType: "qcs",
-        oldPayload: old?.payload ?? null,
-        newPayload: upd.rows[0].payload,
-      });
-      return res.json({ ok: true, report: upd.rows[0], method: "update" });
-    }
-
-    const ins = await pool.query(
-      `INSERT INTO reports (reporter,type,payload,company_id)
-       VALUES ('anonymous','qcs',$1::jsonb,$2)
-       RETURNING *`,
-      [await stampRef(pool, "qcs", payload), companyId]
-    );
-    auditCreate(req, ins.rows[0]);
-    return res.status(201).json({ ok: true, report: ins.rows[0], method: "insert" });
-  } catch (e) {
-    console.error("PUT /api/reports/qcs ERROR =", e);
-    return res.status(500).json({ ok: false, error: String(e?.message || e) });
-  }
+/* Industry-owned routes (meat: PUT /api/reports/returns, PUT /api/reports/qcs,
+   GET /api/reports/butcher-stats) — mounted HERE, before the generic
+   PUT /api/reports/:type below, which would otherwise swallow them. */
+industries.registerReportRoutes(app, {
+  pool, isObj, auth, pingBypass, readLimiter,
+  companyIdOf, companyIdForWrite, fetchOldByTypeDate,
+  KEEP_REF, auditWrite, auditCreate, stampRef,
 });
 
 app.put("/api/reports/:type([A-Za-z_][A-Za-z0-9_-]*)", auth, async (req, res) => {
@@ -1032,11 +700,14 @@ app.post("/api/reports/backfill-refs", auth, async (req, res) => {
   const dryRun = truthy(req.query?.dryRun ?? req.body?.dryRun);
 
   if (!type) return res.status(400).json({ ok: false, error: "type required" });
-  if (!REF_PREFIX[type]) {
+  // Counter-per-type rules only; branch-scoped numbers cannot be backfilled
+  // without a branch on every old row.
+  const backfillable = { ...REF_RULES.global, ...REF_RULES.company };
+  if (!backfillable[type]) {
     return res.status(400).json({
       ok: false,
       error: "TYPE_NOT_REF_TRACKED",
-      message: `'${type}' has no reference prefix. Known: ${Object.keys(REF_PREFIX).join(", ")}`,
+      message: `'${type}' has no reference prefix. Known: ${Object.keys(backfillable).join(", ")}`,
     });
   }
 

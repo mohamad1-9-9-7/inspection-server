@@ -164,6 +164,38 @@ Includes:
 - `DELETE /api/reports`
 - `DELETE /api/reports/:id`
 
+This is **core**: it must never name an industry's report type. Reference
+numbers, branch narrowing and industry-only routes come from `industries/`.
+
+## Core vs Industries (multi-tenant)
+
+One codebase serves every company. Companies are isolated by **data**
+(`company_id` on every row, fixed by the token) and **config** — never by
+copying code per company. Code is split by line of business instead:
+
+```text
+industries
+  index.cjs            the ONLY door between core and industries
+  meat                 Al Mawashi (and any future meat company)
+    refs.cjs           AM-RET / AM-NCR / … numbers, butcher "POS 10 — 00001"
+    cutScope.cjs       a butcher reads only his own shops' cutting logs
+    reportRoutes.cjs   GET /api/reports/butcher-stats,
+                       PUT /api/reports/returns, PUT /api/reports/qcs
+  sweets
+    refs.cjs           per-company "NCR-000001"
+```
+
+Rules:
+
+- Editing `industries/sweets/*` cannot change meat behaviour, and the other
+  way round. Shared behaviour (auth, tenant scope, audit, storage) stays in
+  the core and is handed to industry routes through `ctx`.
+- A report type belongs to ONE industry. Claiming it twice throws at boot.
+- New industry = a folder + one entry in `INDUSTRIES` in `industries/index.cjs`.
+- Industry routes under `/api/reports/<word>` must be registered through
+  `registerReportRoutes`, which the core mounts before the generic
+  `PUT /api/reports/:type`.
+
 ### `routes/supplierPublic.cjs`
 
 Supplier/public self-assessment links.
