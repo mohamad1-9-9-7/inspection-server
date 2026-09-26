@@ -379,6 +379,37 @@ module.exports = async function ensureSchema({ pool, genSalt, hashPw }) {
   `);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_reports_company_id ON reports(company_id)`);
 
+  /* ── A company is never hard-deleted — it is ARCHIVED ──
+     The FKs above were ON DELETE SET NULL, so DELETE FROM companies turned
+     that customer's accounts and reports into company_id NULL — and the two
+     backfills above then moved them ALL into the primary company (Al
+     Mawashi) on the next boot. Even before a reboot, a NULL-company account
+     logged in and read company 1's data. Now: DELETE /api/companies/:id only
+     stamps archived_at, and the FKs are RESTRICT so a raw DELETE on a company
+     that still owns rows fails instead of scattering them. */
+  try {
+    await pool.query(`ALTER TABLE companies ADD COLUMN IF NOT EXISTS archived_at TIMESTAMPTZ`);
+    for (const table of ["app_users", "reports"]) {
+      const fk = await pool.query(
+        `SELECT conname, confdeltype FROM pg_constraint
+          WHERE conrelid = $1::regclass AND contype = 'f'
+            AND confrelid = 'companies'::regclass`,
+        [table]
+      );
+      for (const row of fk.rows) {
+        if (row.confdeltype === "r") continue; // already RESTRICT
+        // One statement = atomic: never a window with no FK at all.
+        await pool.query(
+          `ALTER TABLE ${table} DROP CONSTRAINT "${row.conname}",
+             ADD CONSTRAINT "${row.conname}"
+             FOREIGN KEY (company_id) REFERENCES companies(id) ON DELETE RESTRICT`
+        );
+      }
+    }
+  } catch (e) {
+    console.warn("[schema] company archive / FK RESTRICT step skipped:", e?.message || e);
+  }
+
   /* Widen the one-report-per-(type,reportDate) rule to per-company.
      Done from plain JS, not a dynamic-SQL DO block: a first attempt at this
      used a plpgsql EXCEPTION handler around the same logic and it still took
