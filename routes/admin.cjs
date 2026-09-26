@@ -1,6 +1,7 @@
 module.exports = function registerAdminRoutes(app, deps = {}) {
   const { pool, clampInt, normText, rlCheck, rlReset, genSalt, hashPw, verifyPw, signToken,
-          requireAuthStrict, requireSuperAdmin, verifyToken, tokenFromReq } = deps;
+          requireAuthStrict, requireSuperAdmin, verifyToken, tokenFromReq,
+          userLocked = () => 0, userFailed = () => {}, userReset = () => {} } = deps;
   const SCRYPT_PFX = "scrypt:";
 
   const noLimit = (_req, _res, next) => next();
@@ -181,6 +182,16 @@ app.post("/api/auth/login", async (req, res) => {
     if (!username || !password)
       return res.status(400).json({ ok: false, error: "username and password required" });
 
+    const lockedFor = userLocked(username);
+    if (lockedFor) {
+      res.setHeader("Retry-After", String(lockedFor));
+      return res.status(429).json({
+        ok: false,
+        error: "too_many_attempts",
+        message: `Too many wrong passwords for this account. Try again in ${Math.ceil(lockedFor / 60)} minute(s).`,
+      });
+    }
+
     const q = await pool.query(
       `SELECT id, username, display_name, password_hash, salt,
               permissions, crud_perms, employees, allowed_branches, is_active, is_admin, is_super_admin, last_login,
@@ -212,12 +223,14 @@ app.post("/api/auth/login", async (req, res) => {
     }
 
     if (!verifyPw(password, user.salt, user.password_hash)) {
+      userFailed(username);
       await logFailed("wrong_password");
       return res.status(401).json({ ok: false, error: "invalid_credentials" });
     }
 
     /* ── On success: reset rate limit + auto-upgrade legacy HMAC hash → scrypt ── */
     rlReset(ip);
+    userReset(username);
     if (!user.salt.startsWith(SCRYPT_PFX)) {
       const newSalt = genSalt();
       const newHash = hashPw(password, newSalt);
@@ -428,7 +441,8 @@ app.post("/api/app-users", strict, superOnly, async (req, res) => {
 /* PUT /api/app-users/:id  { displayName?, password?, permissions?, isAdmin?, isActive? } */
 app.put("/api/app-users/:id", strict, superOnly, async (req, res) => {
   try {
-    const { id } = req.params;
+    const id = parseInt(req.params.id, 10);
+    if (!Number.isInteger(id) || id <= 0) return res.status(400).json({ ok: false, error: "bad_id" });
     const sets = [];
     const vals = [];
     let idx = 1;
@@ -498,7 +512,8 @@ app.put("/api/app-users/:id", strict, superOnly, async (req, res) => {
 /* DELETE /api/app-users/:id */
 app.delete("/api/app-users/:id", strict, superOnly, async (req, res) => {
   try {
-    const { id } = req.params;
+    const id = parseInt(req.params.id, 10);
+    if (!Number.isInteger(id) || id <= 0) return res.status(400).json({ ok: false, error: "bad_id" });
     const q = await pool.query(`DELETE FROM app_users WHERE id=$1 RETURNING username`, [id]);
     if (!q.rowCount)
       return res.status(404).json({ ok: false, error: "user_not_found" });

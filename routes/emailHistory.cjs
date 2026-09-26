@@ -229,7 +229,16 @@ app.get("/api/email-history/stats", strict, async (req, res) => {
 /* Delete a single log entry (admin housekeeping). */
 app.delete("/api/email-history/:id", strict, async (req, res) => {
   try {
-    await pool.query(`DELETE FROM email_history WHERE id=$1`, [req.params.id]);
+    const id = parseInt(req.params.id, 10);
+    if (!Number.isInteger(id) || id <= 0) return res.status(400).json({ ok: false, error: "bad_id" });
+    /* Was unscoped: any signed-in account of any company could delete any
+       company's send log by id. The super-admin with no company picked keeps
+       platform-wide reach (scope null). */
+    const scope = companyScopeOf(req);
+    const q = scope != null
+      ? await pool.query(`DELETE FROM email_history WHERE id=$1 AND company_id=$2`, [id, scope])
+      : await pool.query(`DELETE FROM email_history WHERE id=$1`, [id]);
+    if (!q.rowCount) return res.status(404).json({ ok: false, error: "not_found" });
     res.json({ ok: true });
   } catch (e) {
     console.error("DELETE /api/email-history/:id ERROR:", e);
@@ -240,9 +249,18 @@ app.delete("/api/email-history/:id", strict, async (req, res) => {
 /* Bulk cleanup: delete entries older than `before` (YYYY-MM-DD). Manual only. */
 app.delete("/api/email-history", strict, async (req, res) => {
   try {
-    const before = req.query.before;
-    if (!before) return res.status(400).json({ ok: false, error: "before_required" });
-    const q = await pool.query(`DELETE FROM email_history WHERE sent_at < $1::timestamptz`, [before]);
+    /* Bulk purge wiped EVERY company's log older than the date, for any
+       signed-in account. Now: an admin, and only their own company. */
+    const u = req.user || {};
+    if (process.env.AUTH_SECRET && !u.isAdmin && !u.isSuperAdmin) {
+      return res.status(403).json({ ok: false, error: "admin_required" });
+    }
+    const before = String(req.query.before || "");
+    if (!/^\d{4}-\d{2}-\d{2}/.test(before)) return res.status(400).json({ ok: false, error: "before_required" });
+    const scope = companyScopeOf(req);
+    const q = scope != null
+      ? await pool.query(`DELETE FROM email_history WHERE sent_at < $1::timestamptz AND company_id = $2`, [before, scope])
+      : await pool.query(`DELETE FROM email_history WHERE sent_at < $1::timestamptz`, [before]);
     res.json({ ok: true, deleted: q.rowCount });
   } catch (e) {
     console.error("DELETE /api/email-history ERROR:", e);

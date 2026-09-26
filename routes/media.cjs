@@ -13,6 +13,10 @@ module.exports = function registerMediaRoutes(app, deps = {}) {
      being turned into free Cloudinary storage: 30 files/minute is far
      above any real form and far below a script. */
   const uploadLimiter = mk({ max: 30, windowMs: 60_000, name: "upload" });
+  /* The public-id lookup calls Cloudinary's ADMIN API, which is capped per
+     hour for the whole account — unmetered, one script could spend the quota
+     and break every legitimate lookup until the hour rolls over. */
+  const lookupLimiter = mk({ max: 30, windowMs: 60_000, name: "cloudinary-lookup" });
 
 /* --------- Cloudinary config (robust) --------- */
 (function configureCloudinary() {
@@ -44,7 +48,7 @@ module.exports = function registerMediaRoutes(app, deps = {}) {
 ============================================================ */
 
 /** GET cloudinary url by publicId (works when you stored only public_id / filename) */
-app.get("/api/files/cloudinary/:publicId", async (req, res) => {
+app.get("/api/files/cloudinary/:publicId", lookupLimiter, async (req, res) => {
   try {
     const cfg = cloudinary.config();
     const missing = ["cloud_name", "api_key", "api_secret"].filter((k) => !cfg[k]);
@@ -61,7 +65,15 @@ app.get("/api/files/cloudinary/:publicId", async (req, res) => {
     try {
       r = await cloudinary.api.resource(publicId, { resource_type: "raw" });
     } catch (e1) {
-      r = await cloudinary.api.resource(publicId, { resource_type: "image" });
+      try {
+        r = await cloudinary.api.resource(publicId, { resource_type: "image" });
+      } catch (e2) {
+        // Unknown id is a 404, not a server fault.
+        if (e2?.error?.http_code === 404 || e2?.http_code === 404) {
+          return res.status(404).json({ ok: false, error: "NOT_FOUND" });
+        }
+        throw e2;
+      }
     }
 
     const url = r?.secure_url || r?.url;

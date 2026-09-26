@@ -36,7 +36,6 @@ D:\inspection-server
     supplierPublic.cjs
     trainingSessions.cjs
     catalog.cjs
-    trainingLinks.cjs
     media.cjs
     admin.cjs
     billing.cjs
@@ -227,15 +226,9 @@ Includes:
 - `/api/items`
 - `/api/product-catalog`
 
-### `routes/trainingLinks.cjs`
+### Retired: `routes/trainingLinks.cjs`
 
-UUID based training links.
-
-Includes:
-
-- `POST /api/training-links`
-- `GET /api/training-links/:token`
-- `POST /api/training-links/:token/submit`
+Removed Sep 2026 — no screen used it, `training_links` never held a row, and its submit trusted the browser-reported score. Public quizzes use `routes/trainingSessions.cjs` (graded server-side). The table is left in place.
 
 ### `routes/media.cjs`
 

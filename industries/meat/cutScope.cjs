@@ -21,27 +21,31 @@ const WF_TYPE = "workforce_config";
 const WF_TTL_MS = 60_000;
 
 module.exports = function makeCutScope(pool) {
-  let wfCache = { at: 0, people: [] };
+  /* كاش لكل شركة: كان سجل واحد لكل المنصّة (آخر workforce_config انحفظ من أي
+     شركة)، فلو شركة تانية حفظت قواها العاملة، جزارين المواشي بيطلعوا «مش
+     موجودين» وبينشال الحصر عنهم. هلق كل شركة بتقرأ سجلها هي. */
+  const wfCache = new Map(); // companyId → { at, people }
 
-  async function workforcePeople() {
-    if (Date.now() - wfCache.at < WF_TTL_MS) return wfCache.people;
+  async function workforcePeople(companyId) {
+    const hit = wfCache.get(companyId);
+    if (hit && Date.now() - hit.at < WF_TTL_MS) return hit.people;
+    let people = [];
     try {
       const { rows } = await pool.query(
         `SELECT payload FROM reports
-           WHERE type = $1
+           WHERE type = $1 AND company_id = $2
            ORDER BY updated_at DESC NULLS LAST, created_at DESC
            LIMIT 1`,
-        [WF_TYPE]
+        [WF_TYPE, companyId]
       );
-      const people = Array.isArray(rows?.[0]?.payload?.people) ? rows[0].payload.people : [];
-      wfCache = { at: Date.now(), people };
+      people = Array.isArray(rows?.[0]?.payload?.people) ? rows[0].payload.people : [];
     } catch (e) {
       /* السجل مش موجود أو القراءة فشلت → بلا حصر. الفشل هون ما بيجوز يقفل
          شاشة على حدا؛ الحصر ميزة فوق، مش شرط تشغيل. */
       console.warn("[cut-scope] workforce_config read failed:", e?.message || e);
-      wfCache = { at: Date.now(), people: [] };
     }
-    return wfCache.people;
+    wfCache.set(companyId, { at: Date.now(), people });
+    return people;
   }
 
   /** أكواد ملاحم صاحب الطلب، أو null = بلا حصر. */
@@ -54,7 +58,11 @@ module.exports = function makeCutScope(pool) {
     const key = String(u.username || "").trim().toLowerCase();
     if (!key) return null;
 
-    const people = await workforcePeople();
+    // حساب الشركة دايمًا عنده companyId بالتوكن؛ بلا شركة = بلا حصر.
+    const companyId = Number(u.companyId);
+    if (!(Number.isFinite(companyId) && companyId > 0)) return null;
+
+    const people = await workforcePeople(companyId);
     const me = people.find(
       (x) => String(x?.username || "").trim().toLowerCase() === key
     );

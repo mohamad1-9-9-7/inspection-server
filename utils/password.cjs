@@ -15,8 +15,12 @@ function hashPw(password, salt) {
   return crypto.createHmac("sha256", salt).update(String(password)).digest("hex");
 }
 
+/* Constant-time: a plain === leaks, through timing, how many leading
+   characters of the stored hash a guess matched. */
 function verifyPw(password, salt, hash) {
-  return hashPw(password, salt) === hash;
+  const a = Buffer.from(String(hashPw(password, salt)));
+  const b = Buffer.from(String(hash || ""));
+  return a.length === b.length && crypto.timingSafeEqual(a, b);
 }
 
 module.exports = {

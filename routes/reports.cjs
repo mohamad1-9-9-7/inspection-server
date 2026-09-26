@@ -14,6 +14,21 @@ module.exports = function registerReportsRoutes(app, deps = {}) {
   const authStrict =
     typeof requireAuthStrict === "function" ? requireAuthStrict : auth;
 
+  /* Maintenance routes rewrite many rows at once, so a valid session is not
+     enough: the company's admin (own company only) or the platform owner.
+     Same no-AUTH_SECRET escape hatch as requireAuthStrict (local dev only). */
+  const adminOnly = (req, res, next) => {
+    if (!process.env.AUTH_SECRET) return next();
+    const u = req.user || {};
+    if (u.isAdmin || u.isSuperAdmin) return next();
+    return res.status(403).json({ ok: false, error: "admin_required" });
+  };
+  const superOnly = (req, res, next) => {
+    if (!process.env.AUTH_SECRET) return next();
+    if (req.user && req.user.isSuperAdmin) return next();
+    return res.status(403).json({ ok: false, error: "super_admin_required" });
+  };
+
   /* A single `?type=X&limit=5000` read can return several MB, so this is by
      far the most expensive route to leave unmetered — one scraper looping it
      is enough to blow through a month of bandwidth. The cap is per IP and
@@ -694,7 +709,7 @@ app.put("/api/reports/:type([A-Za-z_][A-Za-z0-9_-]*)", auth, async (req, res) =>
    and do not consume a number. `dryRun=1` reports exactly what
    would be written without touching anything.
 ============================================================ */
-app.post("/api/reports/backfill-refs", auth, async (req, res) => {
+app.post("/api/reports/backfill-refs", authStrict, adminOnly, async (req, res) => {
   const type = normText(req.query?.type || req.body?.type || "");
   const truthy = (v) => ["1", "true", "yes"].includes(String(v || "").toLowerCase());
   const dryRun = truthy(req.query?.dryRun ?? req.body?.dryRun);
@@ -711,17 +726,25 @@ app.post("/api/reports/backfill-refs", auth, async (req, res) => {
     });
   }
 
-  const client = await pool.connect();
+  /* One company per run — the caller's own; the super-admin names one with
+     ?company_id (else the primary company). Company-counter types number
+     each company separately, so mixing companies here would hand company B
+     numbers out of company A's sequence. */
+  const companyId = companyIdForWrite(req);
+  const counterKey = REF_RULES.company[type] ? `${type}:c${companyId}` : type;
+
+  let client;
   try {
+    client = await pool.connect();
     await client.query("BEGIN");
 
     // Lock the counter row first so a concurrent save can't interleave.
     await client.query(
       `INSERT INTO report_counters (type, last) VALUES ($1, 0)
        ON CONFLICT (type) DO NOTHING`,
-      [type]
+      [counterKey]
     );
-    await client.query(`SELECT last FROM report_counters WHERE type=$1 FOR UPDATE`, [type]);
+    await client.query(`SELECT last FROM report_counters WHERE type=$1 FOR UPDATE`, [counterKey]);
 
     const { rows } = await client.query(
       `SELECT id,
@@ -729,16 +752,16 @@ app.post("/api/reports/backfill-refs", auth, async (req, res) => {
               payload->>'reportDate' AS "reportDate",
               payload->>'refNo'      AS "refNo"
          FROM reports
-        WHERE type = $1
+        WHERE type = $1 AND company_id = $2
         ORDER BY created_at ASC, id ASC`,
-      [type]
+      [type, companyId]
     );
 
     const pending = rows.filter((r) => !r.refNo);
     const assigned = [];
 
     for (const row of pending) {
-      const refNo = await allocRef(client, type);
+      const refNo = await allocRef(client, type, null, companyId);
       assigned.push({ id: row.id, reportDate: row.reportDate, refNo });
 
       if (!dryRun) {
@@ -758,6 +781,7 @@ app.post("/api/reports/backfill-refs", auth, async (req, res) => {
     return res.json({
       ok: true,
       type,
+      companyId,
       dryRun,
       total: rows.length,
       alreadyHadRef: rows.length - pending.length,
@@ -765,11 +789,11 @@ app.post("/api/reports/backfill-refs", auth, async (req, res) => {
       preview: assigned.slice(0, 200),
     });
   } catch (e) {
-    await client.query("ROLLBACK").catch(() => {});
+    if (client) await client.query("ROLLBACK").catch(() => {});
     console.error("POST /api/reports/backfill-refs ERROR =", e);
     return res.status(500).json({ ok: false, error: String(e?.message || e) });
   } finally {
-    client.release();
+    if (client) client.release();
   }
 });
 
@@ -791,7 +815,7 @@ app.post("/api/reports/backfill-refs", auth, async (req, res) => {
    old and new payloads, so logging this would copy every blob
    straight back into another table.
 ============================================================ */
-app.post("/api/reports/migrate-base64", authStrict, async (req, res) => {
+app.post("/api/reports/migrate-base64", authStrict, superOnly, async (req, res) => {
   const truthy = (v) => ["1", "true", "yes"].includes(String(v || "").toLowerCase());
   const dryRun = truthy(req.query?.dryRun ?? req.body?.dryRun);
   const type = normText(req.query?.type || req.body?.type || "");

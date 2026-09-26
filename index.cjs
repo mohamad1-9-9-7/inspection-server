@@ -3,7 +3,7 @@ require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
 
-const { pool, rollbackQuietly, sendDbError } = require("./db/pool.cjs");
+const { pool, rollbackQuietly, sendDbError, isDbConnectivityError } = require("./db/pool.cjs");
 const ensureSchema = require("./db/schema.cjs");
 const { loadDisabledCompanies } = require("./utils/companyGate.cjs");
 const common = require("./utils/common.cjs");
@@ -17,7 +17,6 @@ const registerReportsRoutes = require("./routes/reports.cjs");
 const registerSupplierPublicRoutes = require("./routes/supplierPublic.cjs");
 const registerTrainingSessionRoutes = require("./routes/trainingSessions.cjs");
 const registerCatalogRoutes = require("./routes/catalog.cjs");
-const registerTrainingLinkRoutes = require("./routes/trainingLinks.cjs");
 const registerMediaRoutes = require("./routes/media.cjs");
 const registerAdminRoutes = require("./routes/admin.cjs");
 const registerBillingRoutes = require("./routes/billing.cjs");
@@ -29,6 +28,35 @@ const registerDemoRequestRoutes = require("./routes/demoRequests.cjs");
 
 const app = express();
 const PORT = process.env.PORT || 5000;
+
+app.disable("x-powered-by");
+
+/* Express 4 does not catch a rejected promise from an async handler: the
+   request hangs until the client times out, and on Node 18 the unhandled
+   rejection takes the WHOLE process down — every company's session with it.
+   Every route here is async, so each handler is wrapped once, centrally:
+   a throw or rejection goes to next(err) and is answered by the JSON error
+   handler at the bottom. Routes that already try/catch behave exactly as
+   before. app.get(name) with a single string is Express's settings getter. */
+function asyncSafe(fn) {
+  if (typeof fn !== "function" || fn.length >= 4) return fn; // error handlers keep their arity
+  return function safeHandler(req, res, next) {
+    try {
+      const out = fn(req, res, next);
+      if (out && typeof out.catch === "function") out.catch(next);
+      return out;
+    } catch (e) {
+      return next(e);
+    }
+  };
+}
+for (const m of ["get", "post", "put", "patch", "delete", "all", "use"]) {
+  const orig = app[m].bind(app);
+  app[m] = (...args) => {
+    if (m === "get" && args.length === 1 && typeof args[0] === "string") return orig(...args);
+    return orig(...args.map((a) => (Array.isArray(a) ? a.map(asyncSafe) : asyncSafe(a))));
+  };
+}
 
 console.log("DEPLOY VERSION:", new Date().toISOString());
 console.log("NODE_ENV:", process.env.NODE_ENV || "undefined");
@@ -121,7 +149,10 @@ registerReportsRoutes(app, deps);
 registerSupplierPublicRoutes(app, deps);
 registerTrainingSessionRoutes(app, deps);
 registerCatalogRoutes(app, deps);
-registerTrainingLinkRoutes(app, deps);
+/* routes/trainingLinks.cjs retired (Sep 2026): no screen called it, the
+   training_links table never held a row, and its submit trusted the score
+   and PASS/FAIL sent by the browser. Public quizzes run through
+   routes/trainingSessions.cjs, which grades on the server. */
 registerMediaRoutes(app, deps);
 registerAdminRoutes(app, deps);
 registerBillingRoutes(app, deps);
@@ -141,14 +172,72 @@ registerDemoRequestRoutes(app, deps);
 // it turns one bad row somewhere into a full outage. Log loudly and start
 // serving traffic regardless — a half-applied migration can be retried on
 // the next boot once the underlying data or code issue is fixed.
+/* Unknown /api path → JSON 404 (was Express's HTML page, which the app
+   cannot parse and reported as a network failure). */
+app.use("/api", (req, res) => {
+  res.status(404).json({ ok: false, error: "not_found", path: req.path });
+});
+
+/* One JSON answer for everything a route did not handle itself: malformed
+   JSON bodies (were an HTML "Bad Request" page), oversize bodies, and any
+   throw that reached next(err) through asyncSafe. Internals are logged,
+   never sent — a DB error message can name tables and columns. */
+// eslint-disable-next-line no-unused-vars
+app.use((err, req, res, next) => {
+  if (res.headersSent) return;
+  if (err && err.type === "entity.parse.failed") {
+    return res.status(400).json({ ok: false, error: "bad_json" });
+  }
+  if (err && err.type === "entity.too.large") {
+    return res.status(413).json({ ok: false, error: "payload_too_large" });
+  }
+  if (err && err.code === "LIMIT_FILE_SIZE") {
+    return res.status(413).json({ ok: false, error: "file_too_large" });
+  }
+  console.error(`[error] ${req.method} ${req.originalUrl}:`, err);
+  if (isDbConnectivityError(err)) {
+    return res.status(503).json({ ok: false, error: "DB_CONNECTION_FAILED" });
+  }
+  return res.status(500).json({ ok: false, error: "server_error" });
+});
+
+/* Last line of defence. A stray rejection is one request's problem: log it
+   and keep serving. An uncaught exception leaves the process in an unknown
+   state, so it exits and Render restarts it cleanly within seconds. */
+process.on("unhandledRejection", (reason) => {
+  console.error("[process] unhandledRejection:", reason);
+});
+process.on("uncaughtException", (err) => {
+  console.error("[process] uncaughtException — exiting for a clean restart:", err);
+  process.exit(1);
+});
+
+let server = null;
+/* Render sends SIGTERM on every deploy and restart. Let the requests in
+   flight (saves included) finish and close the DB pool, instead of cutting
+   them mid-write. Forced exit after 10 s so a stuck socket can't block it. */
+function shutdown(signal) {
+  console.log(`[process] ${signal} received — draining connections`);
+  const force = setTimeout(() => process.exit(0), 10_000);
+  force.unref();
+  (server ? new Promise((r) => server.close(r)) : Promise.resolve())
+    .then(() => pool.end().catch(() => {}))
+    .finally(() => process.exit(0));
+}
+process.on("SIGTERM", () => shutdown("SIGTERM"));
+process.on("SIGINT", () => shutdown("SIGINT"));
+
 ensureSchema({ pool, genSalt: password.genSalt, hashPw: password.hashPw })
   .catch((err) => {
     console.error("DB init had a problem (continuing to start anyway):", err);
   })
   .then(() => loadDisabledCompanies(pool))
   .finally(() => {
-    app.listen(PORT, () => {
-      console.log(`API running on :${PORT} (FULL public access: read/write/delete enabled)`);
+    server = app.listen(PORT, () => {
+      console.log(
+        `API running on :${PORT} — REQUIRE_AUTH=${String(process.env.REQUIRE_AUTH || "audit")}, ` +
+          `AUTH_SECRET ${process.env.AUTH_SECRET ? "set" : "MISSING"}`
+      );
       console.log("STARTED AT:", new Date().toISOString());
     });
   });

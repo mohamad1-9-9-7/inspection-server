@@ -17,12 +17,45 @@ function rlReset(ip) {
   _loginAttempts.delete(ip);
 }
 
-setInterval(() => {
+/* Per-ACCOUNT failure throttle. The per-IP bucket above keys on the first
+   X-Forwarded-For hop, which the caller writes — a script rotating that
+   header gets unlimited guesses at one password. This one keys on the
+   username instead, so it holds whatever the header says: 8 wrong
+   passwords lock that account's logins for 15 minutes. Only failures count,
+   and a successful login clears it, so staff typing slowly are unaffected. */
+const _userFails = new Map();
+const USER_FAIL_MAX = 8;
+const USER_FAIL_WIN_MS = 15 * 60_000;
+
+function userLocked(username) {
+  const rec = _userFails.get(String(username || "").toLowerCase());
+  if (!rec) return 0;
+  if (Date.now() > rec.resetAt) { _userFails.delete(String(username).toLowerCase()); return 0; }
+  return rec.count >= USER_FAIL_MAX ? Math.ceil((rec.resetAt - Date.now()) / 1000) : 0;
+}
+function userFailed(username) {
+  const k = String(username || "").toLowerCase();
+  if (!k) return;
+  const now = Date.now();
+  let rec = _userFails.get(k);
+  if (!rec || now > rec.resetAt) rec = { count: 0, resetAt: now + USER_FAIL_WIN_MS };
+  rec.count += 1;
+  _userFails.set(k, rec);
+}
+function userReset(username) {
+  _userFails.delete(String(username || "").toLowerCase());
+}
+
+const _loginSweep = setInterval(() => {
   const now = Date.now();
   for (const [ip, rec] of _loginAttempts) {
     if (now > rec.resetAt) _loginAttempts.delete(ip);
   }
+  for (const [k, rec] of _userFails) {
+    if (now > rec.resetAt) _userFails.delete(k);
+  }
 }, 5 * 60_000);
+if (typeof _loginSweep.unref === "function") _loginSweep.unref();
 
 /* ============================================================
    Generic per-IP limiter factory
@@ -81,6 +114,9 @@ function makeLimiter({ max = 60, windowMs = 60_000, name = "rl" } = {}) {
 module.exports = {
   rlCheck,
   rlReset,
+  userLocked,
+  userFailed,
+  userReset,
   makeLimiter,
   clientIp,
 };

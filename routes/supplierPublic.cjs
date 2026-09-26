@@ -12,6 +12,17 @@ module.exports = function registerSupplierPublicRoutes(app, deps = {}) {
      making enumeration of the token space pointless. */
   const publicLimiter = mk({ max: 40, windowMs: 60_000, name: "public-token" });
 
+  /* supplier_links.token is a UUID column: anything else made Postgres throw
+     22P02 and the link page showed "server error" instead of "invalid link". */
+  const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+  /* The caller's company from the verified token (strict has run), or null
+     for the platform owner / a setup without AUTH_SECRET. */
+  const callerCompany = (req) => {
+    const n = Number(req.user?.companyId);
+    return Number.isFinite(n) && n > 0 ? n : null;
+  };
+
 /* ======================================================================
    Supplier Links API (UUID token system)
 ====================================================================== */
@@ -178,10 +189,16 @@ app.post("/api/supplier-links", strict, async (req, res) => {
       return res.status(400).json({ ok: false, error: "reportId required" });
     }
 
-    const r = await pool.query(`SELECT id, type, payload FROM reports WHERE id=$1`, [reportId]);
+    const r = await pool.query(`SELECT id, type, payload, company_id FROM reports WHERE id=$1`, [reportId]);
     if (!r.rowCount) return res.status(404).json({ ok: false, error: "report not found" });
 
     const report = r.rows[0];
+    /* Another company's report is "not found" to this caller — minting a
+       public link to it would hand that company's form to a stranger. */
+    const own = callerCompany(req);
+    if (own != null && Number(report.company_id) !== own) {
+      return res.status(404).json({ ok: false, error: "report not found" });
+    }
     if (String(report.type) !== SUPPLIER_TYPE) {
       return res.status(400).json({ ok: false, error: "WRONG_REPORT_TYPE", expected: SUPPLIER_TYPE, got: report.type });
     }
@@ -210,6 +227,7 @@ app.get("/api/supplier-links/:token", publicLimiter, async (req, res) => {
   try {
     const token = normText(req.params.token);
     if (!token) return res.status(400).json({ ok: false, error: "token required" });
+    if (!UUID_RE.test(token)) return res.status(404).json({ ok: false, error: "invalid token" });
 
     const q = await pool.query(
       `SELECT token, report_id, supplier_name, created_at, expires_at, used_at, meta
@@ -274,9 +292,10 @@ app.get("/api/supplier-links/:token", publicLimiter, async (req, res) => {
 app.post("/api/supplier-links/:token/submit", publicLimiter, async (req, res) => {
   let client;
   try {
-    client = await pool.connect();
     const token = normText(req.params.token);
     if (!token) return res.status(400).json({ ok: false, error: "token required" });
+    if (!UUID_RE.test(token)) return res.status(404).json({ ok: false, error: "invalid token" });
+    client = await pool.connect();
 
     const body = isObj(req.body) ? req.body : {};
     const recordDate = normText(body.recordDate || "");
@@ -406,13 +425,23 @@ app.post("/api/supplier-links/:token/submit", publicLimiter, async (req, res) =>
 
    token is UUID in supplier_links; compare as text so an arbitrary string is
    a clean miss instead of an invalid-input error. */
-async function tokenWasMinted(client, token) {
+/* false = not a token we issued. Otherwise the company of the report the
+   link was minted for (1 if that report is gone). The auto-created form row
+   must land in THAT company: it used to be inserted with no company_id, and
+   the boot backfill then filed every such row under the primary company —
+   a sweets supplier's answers ended up inside Al Mawashi. */
+async function mintedLinkCompany(client, token) {
   if (INSPECTION_TOKEN_RE.test(token)) return false;
   const minted = await client.query(
-    `SELECT 1 FROM supplier_links WHERE token::text = $1 LIMIT 1`,
+    `SELECT r.company_id
+       FROM supplier_links l
+       LEFT JOIN reports r ON r.id = l.report_id
+      WHERE l.token::text = $1
+      LIMIT 1`,
     [token]
   );
-  return minted.rowCount > 0;
+  if (!minted.rowCount) return false;
+  return Number(minted.rows[0].company_id) || 1;
 }
 
 /* Supplier twin of inspectionLinkProblem: null when the link is usable,
@@ -469,7 +498,8 @@ app.get("/api/reports/public/:token", publicLimiter, async (req, res) => {
     /* An inspection token that resolves to nothing is a dead link (report
        deleted, token rotated, or a typo), and any other unminted token is a
        made-up URL. Either way, nothing gets created. */
-    if (!(await tokenWasMinted(client, token))) {
+    const linkCompany = await mintedLinkCompany(client, token);
+    if (linkCompany === false) {
       return res.status(404).json({ ok: false, error: "LINK_NOT_FOUND" });
     }
 
@@ -506,10 +536,10 @@ app.get("/api/reports/public/:token", publicLimiter, async (req, res) => {
     };
 
     const ins = await client.query(
-      `INSERT INTO reports (reporter, type, payload)
-       VALUES ($1, $2, $3::jsonb)
+      `INSERT INTO reports (reporter, type, payload, company_id)
+       VALUES ($1, $2, $3::jsonb, $4)
        RETURNING *`,
-      ["public", "supplier_self_assessment_form", JSON.stringify(payload)]
+      ["public", "supplier_self_assessment_form", JSON.stringify(payload), linkCompany]
     );
 
     await client.query("COMMIT");
@@ -826,11 +856,12 @@ app.post("/api/reports/public/:token/submit", publicLimiter, async (req, res) =>
         return res.status(409).json({ ok: false, error: "ALREADY_SUBMITTED" });
       }
     } else {
-      /* Same gate as the GET — see tokenWasMinted. This branch INSERTs from an
+      /* Same gate as the GET — see mintedLinkCompany. This branch INSERTs from an
          unauthenticated POST and then stamps the row submitted, so an unminted
          token here is how a stranger manufactured a finished-looking, empty
          supplier evaluation. */
-      if (!(await tokenWasMinted(client, token))) {
+      const linkCompany = await mintedLinkCompany(client, token);
+      if (linkCompany === false) {
         await client.query("ROLLBACK");
         return res.status(404).json({ ok: false, error: "LINK_NOT_FOUND" });
       }
@@ -853,10 +884,10 @@ app.post("/api/reports/public/:token/submit", publicLimiter, async (req, res) =>
       };
 
       const ins = await client.query(
-        `INSERT INTO reports (reporter, type, payload)
-         VALUES ($1, $2, $3::jsonb)
+        `INSERT INTO reports (reporter, type, payload, company_id)
+         VALUES ($1, $2, $3::jsonb, $4)
          RETURNING id, payload`,
-        ["public", "supplier_self_assessment_form", JSON.stringify(payload)]
+        ["public", "supplier_self_assessment_form", JSON.stringify(payload), linkCompany]
       );
 
       reportId = ins.rows[0].id;

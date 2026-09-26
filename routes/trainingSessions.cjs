@@ -107,7 +107,15 @@ app.get("/api/training-session/by-token/:token", publicLimiter, async (req, res)
       quiz: {
         module: quiz.module,
         passMark: quiz.passMark,
-        questions: quiz.questions,
+        /* The trainee's page is public — the answer key used to travel with
+           the questions, one DevTools tab away. Grading happens server-side
+           on submit (which still reads the stored key), so the page never
+           needs it. */
+        questions: quiz.questions.map((qq) => {
+          if (!qq || typeof qq !== "object") return qq;
+          const { correct, correctIndex, correctAnswer, ...rest } = qq;
+          return rest;
+        }),
       },
       alreadySubmitted: !!existing,
       lastSubmittedAt: existing?.submittedAt || existing?.submitted_at || null,

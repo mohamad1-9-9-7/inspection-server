@@ -72,11 +72,19 @@ module.exports = async function ensureSchema({ pool, genSalt, hashPw }) {
   await pool.query(`
     DO $$
     BEGIN
-      CREATE UNIQUE INDEX IF NOT EXISTS ux_reports_ref_no
-        ON reports ((payload->>'refNo'))
+      /* Per company: company-counter types ("NCR-000001", sweets) restart at
+         1 in every company, so the old platform-wide ux_reports_ref_no made
+         the SECOND company's first number a duplicate — its save failed with
+         a 409. Meat numbers carry the AM mark / branch code, so nothing that
+         exists today collides under the narrower key. The new index is built
+         first; the old one is dropped only once it exists, so references are
+         never left without a uniqueness guard. */
+      CREATE UNIQUE INDEX IF NOT EXISTS ux_reports_company_ref_no
+        ON reports (COALESCE(company_id, 1), (payload->>'refNo'))
         WHERE payload->>'refNo' IS NOT NULL;
+      DROP INDEX IF EXISTS ux_reports_ref_no;
     EXCEPTION WHEN OTHERS THEN
-      RAISE WARNING 'ux_reports_ref_no not created: %', SQLERRM;
+      RAISE WARNING 'ux_reports_company_ref_no not created: %', SQLERRM;
     END $$;
   `);
 
