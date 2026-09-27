@@ -6,6 +6,14 @@
      PATCH  /api/demo-requests/:id    super-admin — { status?, notes? }
      DELETE /api/demo-requests/:id    super-admin — spam / duplicates
 
+     GET    /api/demo-config          PUBLIC  { whatsapp } for the /demo page
+     PUT    /api/demo-config          super-admin — { whatsapp } ("" hides it)
+     POST   /api/demo-requests/wa-click  PUBLIC  count a WhatsApp tap per ?src=
+
+   The WhatsApp number and the tap counts live in platform_settings
+   (keys 'demo_page' and 'demo_wa_clicks'); the counts come back with GET
+   /api/demo-requests as `waClicks` so the owner sees which link gets chats.
+
    Platform-owned like quotations: the table (db/schema.cjs) has no company
    scope, and only the platform owner can read it.
 
@@ -29,7 +37,20 @@ module.exports = function registerDemoRequestRoutes(app, deps = {}) {
     ? makeLimiter({ max: 5, windowMs: 60 * 60_000, name: "demo-requests" })
     : (_req, _res, next) => next();
 
+  // A tap is cheap to fake; this only keeps a script from inflating the counts.
+  const clickLimiter = typeof makeLimiter === "function"
+    ? makeLimiter({ max: 30, windowMs: 60 * 60_000, name: "demo-wa-click" })
+    : (_req, _res, next) => next();
+
   const STATUSES = new Set(["new", "contacted", "demo_done", "trial", "won", "lost"]);
+  const CONFIG_KEY = "demo_page";
+  const CLICKS_KEY = "demo_wa_clicks";
+  const srcSlug = (v) => String(v || "").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 60) || "direct";
+
+  async function readSetting(key) {
+    const { rows } = await pool.query(`SELECT value FROM platform_settings WHERE key = $1`, [key]);
+    return rows[0]?.value || {};
+  }
 
   // body field -> [column, max length]
   const FIELDS = {
@@ -112,13 +133,68 @@ module.exports = function registerDemoRequestRoutes(app, deps = {}) {
     }
   });
 
+  /* ---------- PUBLIC: WhatsApp button ---------- */
+  app.get("/api/demo-config", async (_req, res) => {
+    try {
+      const v = await readSetting(CONFIG_KEY);
+      res.json({ ok: true, whatsapp: String(v.whatsapp || "") });
+    } catch (e) {
+      // No button is better than a broken page.
+      console.error("GET /api/demo-config ERROR:", e?.message || e);
+      res.json({ ok: true, whatsapp: "" });
+    }
+  });
+
+  app.post("/api/demo-requests/wa-click", clickLimiter, async (req, res) => {
+    try {
+      const src = srcSlug(req.body?.source);
+      // One statement, so two taps at once both count.
+      await pool.query(
+        `INSERT INTO platform_settings (key, value, updated_by, updated_at)
+         VALUES ($1, jsonb_build_object($2::text, 1), 'public', now())
+         ON CONFLICT (key) DO UPDATE
+           SET value = platform_settings.value
+                       || jsonb_build_object($2::text, COALESCE((platform_settings.value->>$2)::int, 0) + 1),
+               updated_at = now()`,
+        [CLICKS_KEY, src]
+      );
+      res.json({ ok: true });
+    } catch (e) {
+      console.error("POST /api/demo-requests/wa-click ERROR:", e?.message || e);
+      res.json({ ok: false });
+    }
+  });
+
   /* ---------- super-admin ---------- */
+  app.put("/api/demo-config", ...gate, async (req, res) => {
+    try {
+      let d = String(req.body?.whatsapp || "").replace(/\D/g, "");
+      if (d.startsWith("00")) d = d.slice(2);
+      else if (d.startsWith("0")) d = "971" + d.slice(1); // local UAE number
+      if (d && (d.length < 8 || d.length > 15)) return res.status(400).json({ ok: false, error: "invalid_whatsapp" });
+      const prev = await readSetting(CONFIG_KEY);
+      const who = String(req.user?.username || "").slice(0, 120);
+      await pool.query(
+        `INSERT INTO platform_settings (key, value, updated_by, updated_at)
+         VALUES ($1, $2::jsonb, $3, now())
+         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_by = EXCLUDED.updated_by, updated_at = now()`,
+        [CONFIG_KEY, JSON.stringify({ ...prev, whatsapp: d }), who]
+      );
+      res.json({ ok: true, whatsapp: d });
+    } catch (e) {
+      console.error("PUT /api/demo-config ERROR:", e?.message || e);
+      res.status(500).json({ ok: false, error: "save_failed" });
+    }
+  });
+
   app.get("/api/demo-requests", ...gate, async (_req, res) => {
     try {
       const { rows } = await pool.query(
         `SELECT * FROM demo_requests ORDER BY created_at DESC LIMIT 2000`
       );
-      res.json({ ok: true, requests: rows });
+      const waClicks = await readSetting(CLICKS_KEY).catch(() => ({}));
+      const config = await readSetting(CONFIG_KEY).catch(() => ({}));
+      res.json({ ok: true, requests: rows, waClicks, whatsapp: String(config.whatsapp || "") });
     } catch (e) {
       console.error("GET /api/demo-requests ERROR:", e?.message || e);
       res.status(500).json({ ok: false, error: "load_failed" });
