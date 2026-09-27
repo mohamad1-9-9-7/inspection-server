@@ -9,6 +9,13 @@
      GET    /api/demo-config          PUBLIC  { whatsapp } for the /demo page
      PUT    /api/demo-config          super-admin — { whatsapp } ("" hides it)
      POST   /api/demo-requests/wa-click  PUBLIC  count a WhatsApp tap per ?src=
+     POST   /api/demo-requests/quiz-event PUBLIC { event: start|done, source }
+
+   Readiness check (/readiness): a finished check that asks for its full
+   report POSTs to /api/demo-requests like any lead, plus quizScore (0-100)
+   and quizAnswers ({ questionId: optionIndex }). Starts and finishes are
+   counted per ?src= under 'demo_quiz_stats' ("start:<src>", "done:<src>"),
+   so the owner sees the funnel: opened → finished → left their number.
 
    The WhatsApp number and the tap counts live in platform_settings
    (keys 'demo_page' and 'demo_wa_clicks'); the counts come back with GET
@@ -45,11 +52,36 @@ module.exports = function registerDemoRequestRoutes(app, deps = {}) {
   const STATUSES = new Set(["new", "contacted", "demo_done", "trial", "won", "lost"]);
   const CONFIG_KEY = "demo_page";
   const CLICKS_KEY = "demo_wa_clicks";
+  const QUIZ_KEY = "demo_quiz_stats";
+  const QUIZ_EVENTS = new Set(["start", "done"]);
   const srcSlug = (v) => String(v || "").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 60) || "direct";
 
   async function readSetting(key) {
     const { rows } = await pool.query(`SELECT value FROM platform_settings WHERE key = $1`, [key]);
     return rows[0]?.value || {};
+  }
+
+  // +1 on one field of a counter record. One statement, so two hits at once both count.
+  function bump(key, field) {
+    return pool.query(
+      `INSERT INTO platform_settings (key, value, updated_by, updated_at)
+       VALUES ($1, jsonb_build_object($2::text, 1), 'public', now())
+       ON CONFLICT (key) DO UPDATE
+         SET value = platform_settings.value
+                     || jsonb_build_object($2::text, COALESCE((platform_settings.value->>$2)::int, 0) + 1),
+             updated_at = now()`,
+      [key, field]
+    );
+  }
+
+  /* { q1: 2, q7: 0 } → same shape, ids and indexes only. Anything else is dropped. */
+  function cleanAnswers(v) {
+    if (!v || typeof v !== "object" || Array.isArray(v)) return null;
+    const out = {};
+    for (const [k, i] of Object.entries(v).slice(0, 30)) {
+      if (/^[a-z0-9_]{1,20}$/i.test(k) && Number.isInteger(i) && i >= 0 && i < 10) out[k] = i;
+    }
+    return Object.keys(out).length ? out : null;
   }
 
   // body field -> [column, max length]
@@ -80,13 +112,16 @@ module.exports = function registerDemoRequestRoutes(app, deps = {}) {
     const lines = [
       ["Company", d.companyName], ["Business type", d.activity], ["Branches", d.branches],
       ["Emirate", d.emirate], ["Contact", d.contactName + (d.jobTitle ? ` — ${d.jobTitle}` : "")],
-      ["Phone", d.phone], ["E-mail", d.email], ["Source", d.source], ["Message", d.message],
+      ["Phone", d.phone], ["E-mail", d.email], ["Source", d.source],
+      ["Readiness score", d.quizScore == null ? "" : `${d.quizScore} / 100`], ["Message", d.message],
     ].filter(([, v]) => v);
     const appUrl = String(process.env.APP_PUBLIC_URL || "").trim().replace(/\/$/, "");
     const link = appUrl ? `${appUrl}/select-company?tab=leads` : "";
     sendPlatformMail({
       to,
-      subject: `New demo request: ${d.companyName}${d.branches ? ` (${d.branches} branches)` : ""}`,
+      subject: d.quizScore == null
+        ? `New demo request: ${d.companyName}${d.branches ? ` (${d.branches} branches)` : ""}`
+        : `New readiness lead: ${d.companyName} scored ${d.quizScore}/100`,
       text: lines.map(([k, v]) => `${k}: ${v}`).join("\n") + (link ? `\n\nOpen: ${link}` : ""),
       html:
         `<h2 style="font-family:sans-serif;color:#0f766e">New demo request</h2>` +
@@ -116,9 +151,13 @@ module.exports = function registerDemoRequestRoutes(app, deps = {}) {
       if (d.phone.replace(/\D/g, "").length < 7) return res.status(400).json({ ok: false, error: "invalid_phone" });
       if (d.email && !isEmail(d.email)) return res.status(400).json({ ok: false, error: "invalid_email" });
 
+      const score = Number(body.quizScore);
+      d.quizScore = Number.isInteger(score) && score >= 0 && score <= 100 ? score : null;
+      const answers = d.quizScore == null ? null : cleanAnswers(body.quizAnswers);
+
       const keys = Object.keys(FIELDS);
-      const cols = [...keys.map((k) => FIELDS[k][0]), "ip"];
-      const vals = [...keys.map((k) => d[k]), clean(ipOf(req), 64)];
+      const cols = [...keys.map((k) => FIELDS[k][0]), "ip", "quiz_score", "quiz_answers"];
+      const vals = [...keys.map((k) => d[k]), clean(ipOf(req), 64), d.quizScore, answers ? JSON.stringify(answers) : null];
       const { rows } = await pool.query(
         `INSERT INTO demo_requests (${cols.join(", ")})
          VALUES (${cols.map((_, i) => `$${i + 1}`).join(", ")})
@@ -147,20 +186,22 @@ module.exports = function registerDemoRequestRoutes(app, deps = {}) {
 
   app.post("/api/demo-requests/wa-click", clickLimiter, async (req, res) => {
     try {
-      const src = srcSlug(req.body?.source);
-      // One statement, so two taps at once both count.
-      await pool.query(
-        `INSERT INTO platform_settings (key, value, updated_by, updated_at)
-         VALUES ($1, jsonb_build_object($2::text, 1), 'public', now())
-         ON CONFLICT (key) DO UPDATE
-           SET value = platform_settings.value
-                       || jsonb_build_object($2::text, COALESCE((platform_settings.value->>$2)::int, 0) + 1),
-               updated_at = now()`,
-        [CLICKS_KEY, src]
-      );
+      await bump(CLICKS_KEY, srcSlug(req.body?.source));
       res.json({ ok: true });
     } catch (e) {
       console.error("POST /api/demo-requests/wa-click ERROR:", e?.message || e);
+      res.json({ ok: false });
+    }
+  });
+
+  app.post("/api/demo-requests/quiz-event", clickLimiter, async (req, res) => {
+    try {
+      const ev = String(req.body?.event || "");
+      if (!QUIZ_EVENTS.has(ev)) return res.status(400).json({ ok: false, error: "bad_event" });
+      await bump(QUIZ_KEY, `${ev}:${srcSlug(req.body?.source)}`);
+      res.json({ ok: true });
+    } catch (e) {
+      console.error("POST /api/demo-requests/quiz-event ERROR:", e?.message || e);
       res.json({ ok: false });
     }
   });
@@ -194,7 +235,8 @@ module.exports = function registerDemoRequestRoutes(app, deps = {}) {
       );
       const waClicks = await readSetting(CLICKS_KEY).catch(() => ({}));
       const config = await readSetting(CONFIG_KEY).catch(() => ({}));
-      res.json({ ok: true, requests: rows, waClicks, whatsapp: String(config.whatsapp || "") });
+      const quizStats = await readSetting(QUIZ_KEY).catch(() => ({}));
+      res.json({ ok: true, requests: rows, waClicks, quizStats, whatsapp: String(config.whatsapp || "") });
     } catch (e) {
       console.error("GET /api/demo-requests ERROR:", e?.message || e);
       res.status(500).json({ ok: false, error: "load_failed" });

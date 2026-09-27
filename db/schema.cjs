@@ -819,6 +819,10 @@ module.exports = async function ensureSchema({ pool, genSalt, hashPw }) {
       )
     `);
     await pool.query(`CREATE INDEX IF NOT EXISTS ix_demo_requests_created ON demo_requests(created_at DESC)`);
+    /* Leads from the public readiness check (/readiness) carry their score
+       (0-100) and answers ({ questionId: optionIndex }); plain /demo leads leave them NULL. */
+    await pool.query(`ALTER TABLE demo_requests ADD COLUMN IF NOT EXISTS quiz_score INT`);
+    await pool.query(`ALTER TABLE demo_requests ADD COLUMN IF NOT EXISTS quiz_answers JSONB`);
   } catch (e) {
     console.warn("[schema] demo_requests table step skipped:", e?.message || e);
   }
