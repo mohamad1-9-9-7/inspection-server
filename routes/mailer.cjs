@@ -220,6 +220,23 @@ function cleanList(v, cap = MAX_RECIPIENTS) {
   return out;
 }
 
+/* ── Which companies may use the configured mailbox ──
+   The mailbox (MAIL_USER) belongs to ONE company — today Al Mawashi
+   (mail.almawashi.ae). Every other company used to send through it too, so
+   a sweets report went out signed by Al Mawashi's address. Until a company
+   has its own mailbox, direct sending is OFF for it: /api/email/status says
+   configured:false (the app then falls back to the user's own Outlook) and
+   verify/send answer 403.
+   MAIL_COMPANY_IDS = comma-separated company ids that own the mailbox;
+   unset = "1". */
+const { companyOf } = require("../utils/tenant.cjs");
+
+function mailCompanies() {
+  const raw = String(process.env.MAIL_COMPANY_IDS || "1");
+  return new Set(raw.split(",").map((x) => Number(x.trim())).filter((n) => Number.isFinite(n) && n > 0));
+}
+const companyHasMailbox = (req) => mailCompanies().has(companyOf(req));
+
 module.exports = function registerMailerRoutes(app, deps = {}) {
   const { requireAuth, requireAuthStrict } = deps;
   const auth = typeof requireAuth === "function" ? requireAuth : (req, res, next) => next();
@@ -237,20 +254,32 @@ module.exports = function registerMailerRoutes(app, deps = {}) {
   /* Is direct sending available? Never exposes the password. */
   app.get("/api/email/status", (req, res) => {
     const cfg = smtpConfig();
+    const ownMailbox = companyHasMailbox(req);
     res.json({
       ok: true,
-      configured: cfg.configured,
+      configured: cfg.configured && ownMailbox,
+      reason: ownMailbox ? undefined : "no_mailbox_for_company",
       nodemailer: Boolean(nodemailer),
-      host: cfg.host || null,
-      port: cfg.port,
-      secure: cfg.secure,
-      from: cfg.user || null,
-      fromName: cfg.fromName || null,
+      // Another company never learns which mailbox this is.
+      host: ownMailbox ? cfg.host || null : null,
+      port: ownMailbox ? cfg.port : null,
+      secure: ownMailbox ? cfg.secure : null,
+      from: ownMailbox ? cfg.user || null : null,
+      fromName: ownMailbox ? cfg.fromName || null : null,
     });
   });
 
   /* Handshake check — proves host/port/credentials before anyone sends. */
+  const noMailbox = (res) =>
+    res.status(403).json({
+      ok: false,
+      error: "not_configured",
+      reason: "no_mailbox_for_company",
+      message: "Direct e-mail sending is not set up for this company yet.",
+    });
+
   app.post("/api/email/verify", strict, async (req, res) => {
+    if (!companyHasMailbox(req)) return noMailbox(res);
     const cfg = smtpConfig();
     if (!cfg.configured) {
       return res.status(503).json({ ok: false, error: "not_configured" });
@@ -267,6 +296,7 @@ module.exports = function registerMailerRoutes(app, deps = {}) {
   /* Send. Attachments arrive as base64 so the same payload the .eml builder
      already produces on the client can be reused unchanged. */
   app.post("/api/email/send", strict, async (req, res) => {
+    if (!companyHasMailbox(req)) return noMailbox(res);
     const cfg = smtpConfig();
     if (!cfg.configured) {
       return res.status(503).json({ ok: false, error: "not_configured" });

@@ -8,6 +8,12 @@ module.exports = function registerCatalogRoutes(app, deps = {}) {
      could empty the catalogue every branch form depends on. */
   const strict = typeof requireAuthStrict === "function" ? requireAuthStrict : noGate;
 
+  /* Every company has its OWN catalogue (product_catalog.company_id). The
+     table used to be one list for the whole platform, so a sweets account
+     could read, rename or delete Al Mawashi's product codes. Reads stay
+     open (pickers call them everywhere) but are scoped the same way. */
+  const { companyOf } = require("../utils/tenant.cjs");
+
 /* ============================================================
    Product Catalog API
 ============================================================ */
@@ -57,10 +63,10 @@ async function listCatalogProducts(req, res, fallbackScope = "returns_items") {
     const { rows } = await pool.query(
       `SELECT scope, code, name, created_at, updated_at
          FROM product_catalog
-        WHERE scope = $1
+        WHERE scope = $1 AND company_id = $3
         ORDER BY code ASC
         LIMIT $2`,
-      [scope, limit]
+      [scope, limit, companyOf(req)]
     );
 
     const items = rows.map(catalogRowToClient);
@@ -84,12 +90,12 @@ async function upsertCatalogProduct(req, res, fallbackScope = "returns_items") {
     }
 
     const { rows } = await pool.query(
-      `INSERT INTO product_catalog (scope, code, name)
-       VALUES ($1, $2, $3)
-       ON CONFLICT (scope, code)
+      `INSERT INTO product_catalog (scope, code, name, company_id)
+       VALUES ($1, $2, $3, $4)
+       ON CONFLICT (company_id, scope, code)
        DO UPDATE SET name = EXCLUDED.name, updated_at = now()
        RETURNING scope, code, name, created_at, updated_at`,
-      [scope, code, name]
+      [scope, code, name, companyOf(req)]
     );
 
     return res.json({ ok: true, item: catalogRowToClient(rows[0]) });
@@ -119,28 +125,28 @@ async function updateCatalogProduct(req, res, fallbackScope = "returns_items") {
     let result;
     if (oldCode === code) {
       result = await client.query(
-        `INSERT INTO product_catalog (scope, code, name)
-         VALUES ($1, $2, $3)
-         ON CONFLICT (scope, code)
+        `INSERT INTO product_catalog (scope, code, name, company_id)
+         VALUES ($1, $2, $3, $4)
+         ON CONFLICT (company_id, scope, code)
          DO UPDATE SET name = EXCLUDED.name, updated_at = now()
          RETURNING scope, code, name, created_at, updated_at`,
-        [scope, code, name]
+        [scope, code, name, companyOf(req)]
       );
     } else {
       result = await client.query(
         `UPDATE product_catalog
             SET code = $3, name = $4, updated_at = now()
-          WHERE scope = $1 AND code = $2
+          WHERE scope = $1 AND code = $2 AND company_id = $5
           RETURNING scope, code, name, created_at, updated_at`,
-        [scope, oldCode, code, name]
+        [scope, oldCode, code, name, companyOf(req)]
       );
 
       if (result.rowCount === 0) {
         result = await client.query(
-          `INSERT INTO product_catalog (scope, code, name)
-           VALUES ($1, $2, $3)
+          `INSERT INTO product_catalog (scope, code, name, company_id)
+           VALUES ($1, $2, $3, $4)
            RETURNING scope, code, name, created_at, updated_at`,
-          [scope, code, name]
+          [scope, code, name, companyOf(req)]
         );
       }
     }
@@ -176,9 +182,9 @@ async function deleteCatalogProduct(req, res, fallbackScope = "returns_items") {
 
     const { rows } = await pool.query(
       `DELETE FROM product_catalog
-        WHERE scope = $1 AND code = $2
+        WHERE scope = $1 AND code = $2 AND company_id = $3
         RETURNING scope, code, name, created_at, updated_at`,
-      [scope, code]
+      [scope, code, companyOf(req)]
     );
 
     return res.json({
@@ -216,10 +222,10 @@ app.get("/api/product-catalog", async (req, res) => {
     const { rows } = await pool.query(
       `SELECT scope, code, name, created_at, updated_at
          FROM product_catalog
-        WHERE scope = $1
+        WHERE scope = $1 AND company_id = $3
         ORDER BY code ASC
         LIMIT $2`,
-      [scope, limit]
+      [scope, limit, companyOf(req)]
     );
 
     const map = {};
@@ -243,10 +249,10 @@ app.post("/api/product-catalog", strict, async (req, res) => {
     }
 
     const { rows } = await pool.query(
-      `INSERT INTO product_catalog (scope, code, name)
-       VALUES ($1, $2, $3)
+      `INSERT INTO product_catalog (scope, code, name, company_id)
+       VALUES ($1, $2, $3, $4)
        RETURNING scope, code, name, created_at, updated_at`,
-      [scope, code, name]
+      [scope, code, name, companyOf(req)]
     );
 
     return res.status(201).json({ ok: true, item: rows[0] });

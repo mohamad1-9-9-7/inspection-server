@@ -129,13 +129,47 @@ module.exports = async function ensureSchema({ pool, genSalt, hashPw }) {
   await pool.query(`
     DO $$
     BEGIN
-      IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE schemaname='public' AND indexname='ux_product_catalog_scope_code') THEN
+      IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE schemaname='public' AND indexname='ux_product_catalog_scope_code')
+         AND NOT EXISTS (SELECT 1 FROM pg_indexes WHERE schemaname='public' AND indexname='ux_product_catalog_company_scope_code') THEN
         EXECUTE 'CREATE UNIQUE INDEX ux_product_catalog_scope_code ON product_catalog (scope, code)';
       END IF;
     END $$;
   `);
 
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_product_catalog_scope ON product_catalog (scope);`);
+
+  /* ── One catalogue PER COMPANY ──
+     product_catalog was a single platform-wide list. Every existing row was
+     Al Mawashi's (the only company that ever used the catalogue), so they
+     move to company 1; a new company starts with an empty catalogue.
+     No DEFAULT on purpose: a write that forgets the company fails loudly
+     instead of quietly landing in company 1 — the way supplier rows once did.
+     The per-company unique index is built BEFORE the old platform-wide one is
+     dropped, so codes are never left without a uniqueness guard. Wrapped so
+     one failed step can't stop boot (see index.cjs). */
+  try {
+    await pool.query(`ALTER TABLE product_catalog ADD COLUMN IF NOT EXISTS company_id INT`);
+    await pool.query(`UPDATE product_catalog SET company_id = 1 WHERE company_id IS NULL`);
+    await pool.query(`ALTER TABLE product_catalog ALTER COLUMN company_id DROP DEFAULT`);
+    await pool.query(`ALTER TABLE product_catalog ALTER COLUMN company_id SET NOT NULL`);
+    await pool.query(`
+      DO $$
+      BEGIN
+        IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_product_catalog_company') THEN
+          ALTER TABLE product_catalog
+            ADD CONSTRAINT fk_product_catalog_company
+            FOREIGN KEY (company_id) REFERENCES companies(id) ON DELETE RESTRICT;
+        END IF;
+      END $$;
+    `);
+    await pool.query(
+      `CREATE UNIQUE INDEX IF NOT EXISTS ux_product_catalog_company_scope_code
+         ON product_catalog (company_id, scope, code)`
+    );
+    await pool.query(`DROP INDEX IF EXISTS ux_product_catalog_scope_code`);
+  } catch (e) {
+    console.warn("[schema] product_catalog company_id step skipped:", e?.message || e);
+  }
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS training_links (
