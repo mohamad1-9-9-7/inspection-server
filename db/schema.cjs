@@ -751,6 +751,36 @@ module.exports = async function ensureSchema({ pool, genSalt, hashPw }) {
     console.warn("[schema] platform_quotations tables step skipped:", e?.message || e);
   }
 
+  /* Leads from the public "Request a demo" page (/demo). Platform-owned like
+     quotations: no company scope, super-admin only (routes/demoRequests.cjs). */
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS demo_requests (
+        id            SERIAL      PRIMARY KEY,
+        status        TEXT        NOT NULL DEFAULT 'new',
+        notes         TEXT        NOT NULL DEFAULT '',
+        company_name  TEXT        NOT NULL,
+        activity      TEXT        NOT NULL DEFAULT '',
+        branches      TEXT        NOT NULL DEFAULT '',
+        contact_name  TEXT        NOT NULL,
+        job_title     TEXT        NOT NULL DEFAULT '',
+        phone         TEXT        NOT NULL,
+        email         TEXT        NOT NULL DEFAULT '',
+        emirate       TEXT        NOT NULL DEFAULT '',
+        message       TEXT        NOT NULL DEFAULT '',
+        source        TEXT        NOT NULL DEFAULT '',
+        referrer      TEXT        NOT NULL DEFAULT '',
+        lang          TEXT        NOT NULL DEFAULT '',
+        ip            TEXT        NOT NULL DEFAULT '',
+        created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+        updated_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+      )
+    `);
+    await pool.query(`CREATE INDEX IF NOT EXISTS ix_demo_requests_created ON demo_requests(created_at DESC)`);
+  } catch (e) {
+    console.warn("[schema] demo_requests table step skipped:", e?.message || e);
+  }
+
   /* invoices → issued BY INSPECT PRO TO a company. Each invoice now knows
      which company it bills (company_id), freezes the seller as it was on
      the day (seller JSONB — later profile edits never rewrite an issued
