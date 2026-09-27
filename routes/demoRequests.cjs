@@ -6,8 +6,12 @@
      PATCH  /api/demo-requests/:id    super-admin — { status?, notes? }
      DELETE /api/demo-requests/:id    super-admin — spam / duplicates
 
-     GET    /api/demo-config          PUBLIC  { whatsapp } for the /demo page
-     PUT    /api/demo-config          super-admin — { whatsapp } ("" hides it)
+     GET    /api/demo-config          PUBLIC  { whatsapp, offer, referral, story } for /demo + /readiness
+     PUT    /api/demo-config          super-admin — any of { whatsapp, offer, referral, story }
+
+   The public GET only returns what is switched on: an offer past its end
+   date, or a story with no text, is simply absent, so the pages never show
+   an expired deadline.
      POST   /api/demo-requests/wa-click  PUBLIC  count a WhatsApp tap per ?src=
      POST   /api/demo-requests/quiz-event PUBLIC { event: start|done, source }
 
@@ -61,6 +65,51 @@ module.exports = function registerDemoRequestRoutes(app, deps = {}) {
     return rows[0]?.value || {};
   }
 
+  const todayDubai = () => new Date(Date.now() + 4 * 3600_000).toISOString().slice(0, 10);
+  const isDate = (s) => /^\d{4}-\d{2}-\d{2}$/.test(String(s || ""));
+
+  /* Stored config → what visitors may see. */
+  function publicConfig(v = {}) {
+    const out = { whatsapp: String(v.whatsapp || "") };
+    const o = v.offer || {};
+    if (o.on && isDate(o.endsAt) && o.endsAt >= todayDubai()) out.offer = { endsAt: o.endsAt };
+    const r = v.referral || {};
+    if (r.on && Number(r.pct) > 0) out.referral = { pct: Number(r.pct), months: Number(r.months) || 12 };
+    const st = v.story || {};
+    if (st.on && (st.ar || st.en)) out.story = { ar: String(st.ar || ""), en: String(st.en || "") };
+    return out;
+  }
+
+  /* PUT body → the parts to change; a missing part is left as it is. */
+  function parseConfig(body = {}) {
+    const bad = (msg) => Object.assign(new Error(msg), { status: 400 });
+    const next = {};
+    if (body.whatsapp !== undefined) {
+      let d = String(body.whatsapp || "").replace(/\D/g, "");
+      if (d.startsWith("00")) d = d.slice(2);
+      else if (d.startsWith("0")) d = "971" + d.slice(1); // local UAE number
+      if (d && (d.length < 8 || d.length > 15)) throw bad("invalid_whatsapp");
+      next.whatsapp = d;
+    }
+    if (body.offer !== undefined) {
+      const o = body.offer || {};
+      if (o.on && !isDate(o.endsAt)) throw bad("invalid_offer_date");
+      next.offer = { on: !!o.on, endsAt: isDate(o.endsAt) ? o.endsAt : "" };
+    }
+    if (body.referral !== undefined) {
+      const r = body.referral || {};
+      const pct = Math.round(Number(r.pct));
+      const months = Math.round(Number(r.months));
+      if (r.on && !(pct >= 1 && pct <= 100)) throw bad("invalid_referral_pct");
+      next.referral = { on: !!r.on, pct: pct >= 1 && pct <= 100 ? pct : 20, months: months >= 1 && months <= 60 ? months : 12 };
+    }
+    if (body.story !== undefined) {
+      const st = body.story || {};
+      next.story = { on: !!st.on, ar: clean(st.ar, 600), en: clean(st.en, 600) };
+    }
+    return next;
+  }
+
   // +1 on one field of a counter record. One statement, so two hits at once both count.
   function bump(key, field) {
     return pool.query(
@@ -96,6 +145,7 @@ module.exports = function registerDemoRequestRoutes(app, deps = {}) {
     emirate: ["emirate", 40],
     message: ["message", 2000],
     source: ["source", 60],
+    referredBy: ["referred_by", 150],
     referrer: ["referrer", 300],
     lang: ["lang", 5],
   };
@@ -112,7 +162,7 @@ module.exports = function registerDemoRequestRoutes(app, deps = {}) {
     const lines = [
       ["Company", d.companyName], ["Business type", d.activity], ["Branches", d.branches],
       ["Emirate", d.emirate], ["Contact", d.contactName + (d.jobTitle ? ` — ${d.jobTitle}` : "")],
-      ["Phone", d.phone], ["E-mail", d.email], ["Source", d.source],
+      ["Phone", d.phone], ["E-mail", d.email], ["Source", d.source], ["Referred by", d.referredBy],
       ["Readiness score", d.quizScore == null ? "" : `${d.quizScore} / 100`], ["Message", d.message],
     ].filter(([, v]) => v);
     const appUrl = String(process.env.APP_PUBLIC_URL || "").trim().replace(/\/$/, "");
@@ -175,8 +225,7 @@ module.exports = function registerDemoRequestRoutes(app, deps = {}) {
   /* ---------- PUBLIC: WhatsApp button ---------- */
   app.get("/api/demo-config", async (_req, res) => {
     try {
-      const v = await readSetting(CONFIG_KEY);
-      res.json({ ok: true, whatsapp: String(v.whatsapp || "") });
+      res.json({ ok: true, ...publicConfig(await readSetting(CONFIG_KEY)) });
     } catch (e) {
       // No button is better than a broken page.
       console.error("GET /api/demo-config ERROR:", e?.message || e);
@@ -209,19 +258,19 @@ module.exports = function registerDemoRequestRoutes(app, deps = {}) {
   /* ---------- super-admin ---------- */
   app.put("/api/demo-config", ...gate, async (req, res) => {
     try {
-      let d = String(req.body?.whatsapp || "").replace(/\D/g, "");
-      if (d.startsWith("00")) d = d.slice(2);
-      else if (d.startsWith("0")) d = "971" + d.slice(1); // local UAE number
-      if (d && (d.length < 8 || d.length > 15)) return res.status(400).json({ ok: false, error: "invalid_whatsapp" });
+      let next;
+      try { next = parseConfig(req.body || {}); }
+      catch (err) { return res.status(err.status || 400).json({ ok: false, error: err.message }); }
       const prev = await readSetting(CONFIG_KEY);
+      const merged = { ...prev, ...next };
       const who = String(req.user?.username || "").slice(0, 120);
       await pool.query(
         `INSERT INTO platform_settings (key, value, updated_by, updated_at)
          VALUES ($1, $2::jsonb, $3, now())
          ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_by = EXCLUDED.updated_by, updated_at = now()`,
-        [CONFIG_KEY, JSON.stringify({ ...prev, whatsapp: d }), who]
+        [CONFIG_KEY, JSON.stringify(merged), who]
       );
-      res.json({ ok: true, whatsapp: d });
+      res.json({ ok: true, config: merged, whatsapp: String(merged.whatsapp || "") });
     } catch (e) {
       console.error("PUT /api/demo-config ERROR:", e?.message || e);
       res.status(500).json({ ok: false, error: "save_failed" });
@@ -236,7 +285,7 @@ module.exports = function registerDemoRequestRoutes(app, deps = {}) {
       const waClicks = await readSetting(CLICKS_KEY).catch(() => ({}));
       const config = await readSetting(CONFIG_KEY).catch(() => ({}));
       const quizStats = await readSetting(QUIZ_KEY).catch(() => ({}));
-      res.json({ ok: true, requests: rows, waClicks, quizStats, whatsapp: String(config.whatsapp || "") });
+      res.json({ ok: true, requests: rows, waClicks, quizStats, config, whatsapp: String(config.whatsapp || "") });
     } catch (e) {
       console.error("GET /api/demo-requests ERROR:", e?.message || e);
       res.status(500).json({ ok: false, error: "load_failed" });
