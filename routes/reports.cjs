@@ -534,6 +534,40 @@ app.post("/api/reports", auth, async (req, res) => {
     }
 
     const companyId = companyIdForWrite(req);
+
+    /* Offline outbox (frontend utils/reportOutbox.js): a create saved without
+       a connection carries payload._outboxId and may reach us twice — the
+       first request can land while its answer is lost. The same id means the
+       same record, so the second one updates it instead of inserting a copy. */
+    const outboxId =
+      typeof payload._outboxId === "string" && payload._outboxId.length <= 80 ? payload._outboxId : "";
+    if (outboxId) {
+      const old = await pool.query(
+        `SELECT id, payload FROM reports
+          WHERE COALESCE(company_id, 1) = COALESCE($1::int, 1) AND type = $2 AND payload->>'_outboxId' = $3
+          ORDER BY id LIMIT 1`,
+        [companyId, type, outboxId]
+      );
+      if (old.rowCount) {
+        const upd = await pool.query(
+          `UPDATE reports
+              SET payload=${KEEP_REF("$1")},
+                  updated_at=now()
+            WHERE id=$2
+            RETURNING *`,
+          [JSON.stringify(payload), old.rows[0].id]
+        );
+        auditWrite(req, {
+          action: "update",
+          reportId: old.rows[0].id,
+          reportType: type,
+          oldPayload: old.rows[0].payload,
+          newPayload: upd.rows[0].payload,
+        });
+        return res.json({ ok: true, report: upd.rows[0], method: "update" });
+      }
+    }
+
     const stamped = await stampRef(pool, type, payload, companyId);
 
     const ins = await pool.query(
