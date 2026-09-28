@@ -1,8 +1,51 @@
 const multer = require("multer");
 const cloudinary = require("cloudinary").v2;
+const { companyOf, PRIMARY_COMPANY_ID } = require("../utils/tenant.cjs");
 
 module.exports = function registerMediaRoutes(app, deps = {}) {
   const { pool, makeLimiter, requireAuthStrict } = deps;
+
+  /* ------------------------------------------------------------
+     Storage separation — every company's files in its own folder
+     ------------------------------------------------------------
+     Al Mawashi (the primary company) keeps the folder it has always used,
+     so nothing changes for it. Every other company uploads into
+       <base>/companies/<industry>/c<companyId>
+     e.g. qcs/companies/restaurant/c7 — one place per category, one folder
+     per company, never mixed with anyone else's files.
+
+     The company comes from the caller's token (or the super-admin's
+     ?company_id, see utils/tenant.cjs); a caller with no token — the public
+     token pages — keeps the primary folder exactly as before. The industry
+     is read once per company and cached for 10 minutes: uploads are rare,
+     and a lookup per file would be a needless database round trip. */
+  const BASE_FOLDER = process.env.CLOUDINARY_FOLDER || "qcs";
+  const INDUSTRY_TTL_MS = 10 * 60 * 1000;
+  const industryCache = new Map(); // companyId → { industry, at }
+
+  const safeSegment = (s) => String(s || "").toLowerCase().replace(/[^a-z0-9_-]/g, "") || "other";
+
+  async function industryOf(companyId) {
+    const hit = industryCache.get(companyId);
+    if (hit && Date.now() - hit.at < INDUSTRY_TTL_MS) return hit.industry;
+    let industry = "other";
+    try {
+      const r = await pool.query("SELECT industry FROM companies WHERE id = $1", [companyId]);
+      industry = r.rows[0]?.industry || "other";
+    } catch (e) {
+      // Never block an upload on this: the file still lands in the company's
+      // own folder, just under "other" instead of its category.
+      console.warn("[media] industry lookup failed:", e?.message || e);
+    }
+    industryCache.set(companyId, { industry, at: Date.now() });
+    return industry;
+  }
+
+  async function folderFor(req) {
+    const companyId = companyOf(req);
+    if (companyId === PRIMARY_COMPANY_ID) return BASE_FOLDER;
+    return `${BASE_FOLDER}/companies/${safeSegment(await industryOf(companyId))}/c${companyId}`;
+  }
 
   const noLimit = (_req, _res, next) => next();
   const mk = typeof makeLimiter === "function" ? makeLimiter : () => noLimit;
@@ -150,13 +193,14 @@ app.post("/api/images", uploadLimiter, uploadAny.any(), async (req, res) => {
 
     const f = (req.files && req.files[0]) || req.file;
     const dataUrl = req.body?.data;
+    const folder = await folderFor(req);
 
     let up;
     if (f?.buffer) {
-      up = await uploadBufferToCloudinary(f.buffer, { resource_type: "auto" });
+      up = await uploadBufferToCloudinary(f.buffer, { resource_type: "auto", folder });
     } else if (typeof dataUrl === "string" && dataUrl.startsWith("data:")) {
       up = await cloudinary.uploader.upload(dataUrl, {
-        folder: process.env.CLOUDINARY_FOLDER || "qcs",
+        folder,
         transformation: [{ width: 1280, height: 1280, crop: "limit", quality: "80" }],
       });
     } else {
@@ -253,6 +297,21 @@ app.delete("/api/images", strict, async (req, res) => {
     const overrideResource = req.body?.resourceType;
     const overrideDelivery = req.body?.deliveryType;
 
+    /* A company may never delete a file inside ANOTHER company's folder
+       (<base>/companies/…). Files outside that tree — everything uploaded
+       before the per-company folders existed — stay deletable exactly as
+       before, so no current screen loses a delete it had. The platform
+       super-admin is not restricted. */
+    const tenantRoot = `${BASE_FOLDER}/companies/`;
+    const ownPrefix = req.user?.isSuperAdmin ? null : `${await folderFor(req)}/`;
+    const mayDelete = (publicId) => {
+      const id = String(publicId || "");
+      if (!ownPrefix || !id.startsWith(tenantRoot)) return true;
+      // inside the per-company tree: only the caller's own company folder
+      return ownPrefix.startsWith(tenantRoot) && id.startsWith(ownPrefix);
+    };
+    const refuse = () => Promise.reject(new Error("NOT_YOUR_COMPANY_FILE"));
+
     const jobs = [];
 
     const allUrls = []
@@ -262,8 +321,10 @@ app.delete("/api/images", strict, async (req, res) => {
       .filter(Boolean);
 
     for (const u of [...new Set(allUrls)]) {
+      const parsed = parseCloudinaryUrl(u);
+      if (parsed && !mayDelete(parsed.public_id)) { jobs.push(refuse()); continue; }
       if (overrideResource || overrideDelivery) {
-        const info = parseCloudinaryUrl(u);
+        const info = parsed;
         if (!info) jobs.push(Promise.reject(new Error("BAD_CLOUDINARY_URL")));
         else {
           jobs.push(
@@ -286,6 +347,7 @@ app.delete("/api/images", strict, async (req, res) => {
       .filter(Boolean);
 
     for (const pid of [...new Set(allPublicIds)]) {
+      if (!mayDelete(pid)) { jobs.push(refuse()); continue; }
       jobs.push(
         destroyOne({
           public_id: pid,
