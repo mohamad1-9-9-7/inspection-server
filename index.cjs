@@ -3,8 +3,10 @@ require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
 
-const { pool, rollbackQuietly, sendDbError, isDbConnectivityError } = require("./db/pool.cjs");
+const { pool, rollbackQuietly, sendDbError, isDbConnectivityError, setTenantRlsReady } = require("./db/pool.cjs");
 const ensureSchema = require("./db/schema.cjs");
+const { ensureTenantRls } = require("./db/tenantRls.cjs");
+const { tenantMiddleware, tenantRlsEnabled } = require("./utils/tenantContext.cjs");
 const { loadDisabledCompanies } = require("./utils/companyGate.cjs");
 const common = require("./utils/common.cjs");
 const password = require("./utils/password.cjs");
@@ -82,10 +84,22 @@ if (!ALLOWED_ORIGINS.length) {
   );
 }
 
+/* An entry may name every company site at once with ONE leading wildcard
+   label: "https://*.example.com" matches https://exaltis.example.com (one
+   label only, never the bare domain or a deeper name), so a new company's
+   own frontend needs no server change. */
+const ORIGIN_PATTERNS = ALLOWED_ORIGINS.filter((o) => o.includes("*")).map((o) => {
+  const m = /^(https?):\/\/\*\.([a-z0-9.-]+(?::\d+)?)$/i.exec(o);
+  if (!m) { console.warn(`[cors] ignored pattern "${o}" — use https://*.domain.tld`); return null; }
+  const esc = m[2].replace(/[.]/g, "\\.");
+  return new RegExp(`^${m[1]}://[a-z0-9-]+\\.${esc}$`, "i");
+}).filter(Boolean);
+
 function originAllowed(origin) {
   if (!origin) return true;
   if (!ALLOWED_ORIGINS.length) return true;
-  return ALLOWED_ORIGINS.includes(String(origin).replace(/\/$/, ""));
+  const o = String(origin).replace(/\/$/, "");
+  return ALLOWED_ORIGINS.includes(o) || ORIGIN_PATTERNS.some((re) => re.test(o));
 }
 
 app.use(
@@ -111,6 +125,10 @@ app.use((req, res, next) => {
 });
 
 app.use(express.json({ limit: "20mb" }));
+
+/* Company accounts' requests run confined to their company inside the
+   database (TENANT_RLS=on) — see db/tenantRls.cjs. Before every route. */
+app.use(tenantMiddleware);
 
 /* No file may be stored inside a report payload — see utils/noBase64.cjs for
    the measurements behind this. Mounted here rather than on each route so it
@@ -232,6 +250,12 @@ ensureSchema({ pool, genSalt: password.genSalt, hashPw: password.hashPw })
     console.error("DB init had a problem (continuing to start anyway):", err);
   })
   .then(() => loadDisabledCompanies(pool))
+  .then(() => ensureTenantRls(pool))
+  .then((ready) => {
+    const on = !!ready && tenantRlsEnabled();
+    setTenantRlsReady(on);
+    console.log(`[rls] database tenant isolation: ${on ? "ON" : "off"} (TENANT_RLS=${process.env.TENANT_RLS || "unset"}, policies ${ready ? "ready" : "MISSING"})`);
+  })
   .finally(() => {
     server = app.listen(PORT, () => {
       console.log(
