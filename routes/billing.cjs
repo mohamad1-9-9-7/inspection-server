@@ -277,6 +277,138 @@ app.post("/api/companies/:id/enable", strict, superOnly, async (req, res) => {
 });
 
 /* ============================================================
+   DELETE A COMPANY — for good, with everything it owns.
+
+   Disable (above) stays the everyday switch; this is the owner's explicit
+   "remove this customer" (a test company, one added by mistake, a customer
+   who left and asked for their data to be erased). Guard rails:
+     • platform super-admin only, and the request must carry the
+       super-admin's OWN password (re-checked here) and the company's exact
+       name — a stolen session or a mis-click cannot erase a customer;
+     • 5 wrong passwords → locked for 15 minutes (per account);
+     • the primary company (id 1, Al Mawashi) can never be deleted;
+     • ONE transaction: every row goes, or none does.
+
+   What goes, in order (children before the company, whose FKs RESTRICT):
+   report_audit, email_history, invoices, subscription, product_catalog,
+   the accounts' activity_log and the accounts themselves, the reports
+   (training_links / supplier_links cascade with them), the company's
+   reference counters, then the company row. Platform quotations keep their
+   copy of the client's name (their FK is ON DELETE SET NULL).
+   The company's upload folder on Cloudinary is emptied afterwards, best
+   effort — a storage hiccup never undoes a finished delete.
+============================================================ */
+const DELETE_COUNTS_SQL = `
+  SELECT
+    (SELECT COUNT(*)::int FROM reports       WHERE company_id = $1) AS reports,
+    (SELECT COUNT(*)::int FROM app_users     WHERE company_id = $1) AS accounts,
+    (SELECT COUNT(*)::int FROM report_audit  WHERE company_id = $1) AS audit_rows,
+    (SELECT COUNT(*)::int FROM email_history WHERE company_id = $1) AS emails,
+    (SELECT COUNT(*)::int FROM invoices      WHERE company_id = $1) AS invoices,
+    (SELECT COUNT(*)::int FROM product_catalog WHERE company_id = $1) AS catalog_items`;
+
+const pwFails = new Map(); // uid → { n, until }
+const PW_MAX = 5;
+const PW_LOCK_MS = 15 * 60 * 1000;
+
+app.get("/api/companies/:id/delete-preview", strict, superOnly, async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    if (!(Number.isInteger(id) && id > 0)) return res.status(400).json({ ok: false, error: "bad_id" });
+    if (id === 1) return res.status(400).json({ ok: false, error: "primary_company" });
+    const c = await pool.query(`SELECT id, name FROM companies WHERE id = $1`, [id]);
+    if (!c.rowCount) return res.status(404).json({ ok: false, error: "not_found" });
+    const counts = (await pool.query(DELETE_COUNTS_SQL, [id])).rows[0];
+    res.json({ ok: true, company: c.rows[0], counts });
+  } catch (e) {
+    console.error("GET /api/companies/:id/delete-preview ERROR:", e);
+    res.status(500).json({ ok: false, error: "server_error" });
+  }
+});
+
+app.post("/api/companies/:id/delete", strict, superOnly, async (req, res) => {
+  const id = Number(req.params.id);
+  if (!(Number.isInteger(id) && id > 0)) return res.status(400).json({ ok: false, error: "bad_id" });
+  if (id === 1) return res.status(400).json({ ok: false, error: "primary_company" });
+
+  const { verifyPw } = require("../utils/password.cjs");
+  const uid = req.user?.uid;
+  const now = Date.now();
+  const fail = pwFails.get(uid);
+  if (fail && fail.until > now) {
+    return res.status(429).json({ ok: false, error: "too_many_attempts", retryInSec: Math.ceil((fail.until - now) / 1000) });
+  }
+
+  let client;
+  try {
+    /* The caller's own password, checked against the database — the token
+       alone proves a session, not that the owner is at the keyboard. */
+    const me = uid
+      ? (await pool.query(`SELECT password_hash, salt, is_super_admin FROM app_users WHERE id = $1`, [uid])).rows[0]
+      : null;
+    if (!me || !me.is_super_admin || !verifyPw(String(req.body?.password || ""), me.salt, me.password_hash)) {
+      const n = (fail && fail.until <= now ? 0 : fail?.n || 0) + 1;
+      pwFails.set(uid, { n, until: n >= PW_MAX ? now + PW_LOCK_MS : 0 });
+      return res.status(403).json({ ok: false, error: "wrong_password", attemptsLeft: Math.max(0, PW_MAX - n) });
+    }
+    pwFails.delete(uid);
+
+    const company = (await pool.query(`SELECT id, name, industry, logo_url FROM companies WHERE id = $1`, [id])).rows[0];
+    if (!company) return res.status(404).json({ ok: false, error: "not_found" });
+    if (String(req.body?.confirmName || "").trim() !== String(company.name).trim()) {
+      return res.status(400).json({ ok: false, error: "name_mismatch" });
+    }
+
+    client = await pool.connect();
+    await client.query("BEGIN");
+    const counts = (await client.query(DELETE_COUNTS_SQL, [id])).rows[0];
+    await client.query(`DELETE FROM report_audit    WHERE company_id = $1`, [id]);
+    await client.query(`DELETE FROM email_history   WHERE company_id = $1`, [id]);
+    await client.query(`DELETE FROM invoices        WHERE company_id = $1`, [id]);
+    await client.query(`DELETE FROM subscription    WHERE company_id = $1`, [id]);
+    await client.query(`DELETE FROM product_catalog WHERE company_id = $1`, [id]);
+    await client.query(`DELETE FROM activity_log WHERE user_id IN (SELECT id FROM app_users WHERE company_id = $1)`, [id]);
+    await client.query(`DELETE FROM app_users       WHERE company_id = $1`, [id]);
+    await client.query(`DELETE FROM reports         WHERE company_id = $1`, [id]);
+    await client.query(`DELETE FROM report_counters WHERE type LIKE $1`, [`%:c${id}`]);
+    await client.query(`DELETE FROM companies       WHERE id = $1`, [id]);
+    await client.query("COMMIT");
+    markCompanyDisabled(id, false);
+
+    console.warn(`[companies] company ${id} "${company.name}" DELETED by ${req.user?.username || "?"}:`, counts);
+    res.json({ ok: true, deleted: { id, name: company.name, ...counts } });
+
+    // After the answer: empty its storage folder (and its card picture).
+    purgeCompanyFiles(company).catch((e) => console.warn("[companies] file purge:", e?.message || e));
+  } catch (e) {
+    if (client) { try { await client.query("ROLLBACK"); } catch { /* already gone */ } }
+    console.error("POST /api/companies/:id/delete ERROR:", e);
+    if (!res.headersSent) res.status(500).json({ ok: false, error: "server_error" });
+  } finally {
+    if (client) client.release();
+  }
+});
+
+/* Same folder rule as routes/media.cjs folderFor(): <base>/companies/<industry>/c<id>. */
+async function purgeCompanyFiles(company) {
+  const cloudinary = require("cloudinary").v2;
+  const cfg = cloudinary.config();
+  if (!cfg.cloud_name || !cfg.api_key || !cfg.api_secret) return;
+  const base = process.env.CLOUDINARY_FOLDER || "qcs";
+  const seg = String(company.industry || "other").toLowerCase().replace(/[^a-z0-9_-]/g, "") || "other";
+  const prefix = `${base}/companies/${seg}/c${company.id}/`;
+  for (const resource_type of ["image", "raw", "video"]) {
+    for (let i = 0; i < 20; i++) { // 1000 per call; 20 rounds = far beyond any real company
+      const out = await cloudinary.api.delete_resources_by_prefix(prefix, { resource_type });
+      if (!out?.partial) break;
+    }
+  }
+  // The card picture was uploaded from the Platform Center, outside that folder.
+  const m = /\/upload\/(?:[^/]+\/)*v\d+\/(.+)\.[a-z0-9]+$/i.exec(String(company.logo_url || ""));
+  if (m) await cloudinary.uploader.destroy(m[1], { invalidate: true });
+}
+
+/* ============================================================
    SUBSCRIPTION — read-only view of the company row.
 
    The company row in `companies` is the ONE answer to "what plan, what
