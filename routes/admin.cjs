@@ -228,6 +228,19 @@ app.post("/api/auth/login", async (req, res) => {
       return res.status(401).json({ ok: false, error: "invalid_credentials" });
     }
 
+    /* ── A company's own site signs in only that company's accounts ──
+       Each company gets its own frontend app, which sends its company id
+       with the login. An account of another company is refused with the
+       same answer as a wrong password (no hint that the account exists).
+       The platform super-admin may sign in anywhere. No companyId in the
+       body = the shared app of today: unchanged. */
+    const appCompany = Number(req.body?.companyId);
+    if (Number.isInteger(appCompany) && appCompany > 0 && !user.is_super_admin
+        && Number(user.company_id) !== appCompany) {
+      await logFailed("wrong_company_site");
+      return res.status(401).json({ ok: false, error: "invalid_credentials" });
+    }
+
     /* ── On success: reset rate limit + auto-upgrade legacy HMAC hash → scrypt ── */
     rlReset(ip);
     userReset(username);
