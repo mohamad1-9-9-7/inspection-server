@@ -203,7 +203,7 @@ app.put("/api/reports/returns", auth, async (req, res) => {
       `INSERT INTO reports (reporter,type,payload,company_id)
        VALUES ('anonymous','returns',$1::jsonb,$2)
        RETURNING *`,
-      [await stampRef(pool, "returns", payload), companyId]
+      [await stampRef(pool, "returns", payload, companyId), companyId]
     );
 
     auditCreate(req, ins.rows[0]);
@@ -253,7 +253,7 @@ app.put("/api/reports/qcs", auth, async (req, res) => {
       `INSERT INTO reports (reporter,type,payload,company_id)
        VALUES ('anonymous','qcs',$1::jsonb,$2)
        RETURNING *`,
-      [await stampRef(pool, "qcs", payload), companyId]
+      [await stampRef(pool, "qcs", payload, companyId), companyId]
     );
     auditCreate(req, ins.rows[0]);
     return res.status(201).json({ ok: true, report: ins.rows[0], method: "insert" });

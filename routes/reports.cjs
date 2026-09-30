@@ -84,10 +84,26 @@ async function bumpCounter(q, key) {
   return rows[0].last;
 }
 
+/* Every counter belongs to ONE company. The primary company (Al Mawashi,
+   id 1) keeps the keys it has always used, so none of its running
+   sequences restarts or jumps. Any other company counts on its own key
+   ("<type>:c<id>", "<type>:c<id>:<branch>") — a second meat company used to
+   draw from Al Mawashi's AM-RET-… sequence and carry its "AM" mark. */
+const PRIMARY_COMPANY = 1;
+const isPrimary = (companyId) => companyId == null || Number(companyId) === PRIMARY_COMPANY;
+
+/** The report_counters key for (type, company[, branch]). Exported for the
+ *  backfill route, which must lock the exact row allocRef bumps. */
+function counterKeyFor(type, companyId, scope = null) {
+  if (REF_RULES.company[type]) return `${type}:c${companyId || "0"}`;
+  if (scope != null) return isPrimary(companyId) ? `${type}:${scope}` : `${type}:c${companyId}:${scope}`;
+  return isPrimary(companyId) ? type : `${type}:c${companyId}`;
+}
+
 async function allocRef(q, type, payload, companyId = null) {
   const companyPrefix = REF_RULES.company[type];
   if (companyPrefix) {
-    const n = await bumpCounter(q, `${type}:c${companyId || "0"}`);
+    const n = await bumpCounter(q, counterKeyFor(type, companyId));
     return `${companyPrefix}-${String(n).padStart(REF_PAD, "0")}`;
   }
 
@@ -96,15 +112,18 @@ async function allocRef(q, type, payload, companyId = null) {
   if (scoped) {
     const scope = scoped.scopeOf(payload);
     if (!scope) return null;                       // no branch → no number
-    const n = await bumpCounter(q, `${type}:${scope}`);
+    const n = await bumpCounter(q, counterKeyFor(type, companyId, scope));
     return scoped.format(scope, n, scoped.pad);
   }
 
   const rule = REF_RULES.global[type];
   if (!rule) return null;
 
-  const n = await bumpCounter(q, type);
-  return `${rule.mark}-${rule.prefix}-${String(n).padStart(REF_PAD, "0")}`;
+  const n = await bumpCounter(q, counterKeyFor(type, companyId));
+  // The industry's mark (e.g. "AM") is the primary company's brand — other
+  // companies get the plain "<prefix>-000001".
+  const lead = isPrimary(companyId) ? `${rule.mark}-${rule.prefix}` : rule.prefix;
+  return `${lead}-${String(n).padStart(REF_PAD, "0")}`;
 }
 
 /** Is this type reference-tracked by any industry? */
@@ -769,7 +788,7 @@ app.post("/api/reports/backfill-refs", authStrict, adminOnly, async (req, res) =
      each company separately, so mixing companies here would hand company B
      numbers out of company A's sequence. */
   const companyId = companyIdForWrite(req);
-  const counterKey = REF_RULES.company[type] ? `${type}:c${companyId}` : type;
+  const counterKey = counterKeyFor(type, companyId);
 
   let client;
   try {
