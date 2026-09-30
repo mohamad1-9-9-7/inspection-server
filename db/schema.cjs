@@ -900,6 +900,16 @@ module.exports = async function ensureSchema({ pool, genSalt, hashPw }) {
     await pool.query(`ALTER TABLE companies ADD COLUMN IF NOT EXISTS currency TEXT`);
     // The picture on the company's card in the Platform Center (a hosted URL).
     await pool.query(`ALTER TABLE companies ADD COLUMN IF NOT EXISTS logo_url TEXT NOT NULL DEFAULT ''`);
+    /* Which code module (src/companies/<module>/ in the frontend) the company
+       runs. Every customer gets its own programmed module; industry only says
+       what KIND of business it is. Backfilled once from the industry:
+       meat → almawashi (the meat system), sweets → exaltis (the confectionery
+       system), any other industry → its starter of the same name. */
+    await pool.query(`ALTER TABLE companies ADD COLUMN IF NOT EXISTS module TEXT NOT NULL DEFAULT ''`);
+    await pool.query(`
+      UPDATE companies
+         SET module = CASE industry WHEN 'meat' THEN 'almawashi' WHEN 'sweets' THEN 'exaltis' ELSE COALESCE(NULLIF(industry, ''), 'almawashi') END
+       WHERE module = ''`);
     const done = await pool.query(`SELECT 1 FROM platform_settings WHERE key = 'migrated_subscription_to_companies'`);
     if (!done.rowCount) {
       /* A price equal to the company's plan price is NOT a custom price —
