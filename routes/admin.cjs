@@ -455,8 +455,9 @@ app.post("/api/app-users", strict, superOnly, async (req, res) => {
 /* PUT /api/app-users/:id  { displayName?, password?, permissions?, isAdmin?, isActive? } */
 app.put("/api/app-users/:id", strict, superOnly, async (req, res) => {
   try {
-    const id = parseInt(req.params.id, 10);
-    if (!Number.isInteger(id) || id <= 0) return res.status(400).json({ ok: false, error: "bad_id" });
+    // app_users.id is a UUID (parseInt broke edit/delete of every account, 26 Sep 2026)
+    const id = String(req.params.id || "");
+    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id)) return res.status(400).json({ ok: false, error: "bad_id" });
     const sets = [];
     const vals = [];
     let idx = 1;
@@ -526,8 +527,9 @@ app.put("/api/app-users/:id", strict, superOnly, async (req, res) => {
 /* DELETE /api/app-users/:id */
 app.delete("/api/app-users/:id", strict, superOnly, async (req, res) => {
   try {
-    const id = parseInt(req.params.id, 10);
-    if (!Number.isInteger(id) || id <= 0) return res.status(400).json({ ok: false, error: "bad_id" });
+    // app_users.id is a UUID (parseInt broke edit/delete of every account, 26 Sep 2026)
+    const id = String(req.params.id || "");
+    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id)) return res.status(400).json({ ok: false, error: "bad_id" });
     const q = await pool.query(`DELETE FROM app_users WHERE id=$1 RETURNING username`, [id]);
     if (!q.rowCount)
       return res.status(404).json({ ok: false, error: "user_not_found" });
