@@ -898,6 +898,8 @@ module.exports = async function ensureSchema({ pool, genSalt, hashPw }) {
   try {
     await pool.query(`ALTER TABLE companies ADD COLUMN IF NOT EXISTS price    NUMERIC(10,2)`);
     await pool.query(`ALTER TABLE companies ADD COLUMN IF NOT EXISTS currency TEXT`);
+    // The picture on the company's card in the Platform Center (a hosted URL).
+    await pool.query(`ALTER TABLE companies ADD COLUMN IF NOT EXISTS logo_url TEXT NOT NULL DEFAULT ''`);
     const done = await pool.query(`SELECT 1 FROM platform_settings WHERE key = 'migrated_subscription_to_companies'`);
     if (!done.rowCount) {
       /* A price equal to the company's plan price is NOT a custom price —

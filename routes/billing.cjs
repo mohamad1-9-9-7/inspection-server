@@ -168,6 +168,9 @@ function companyInput(body) {
     price: b.price === "" || b.price == null ? null : Number(b.price),
     hasCurrency: Object.prototype.hasOwnProperty.call(b, "currency"),
     currency: b.currency ? String(b.currency).toUpperCase() : null,
+    // logo_url: absent → keep what is stored; "" → no picture (initial letter).
+    hasLogo: Object.prototype.hasOwnProperty.call(b, "logo_url"),
+    logo_url: String(b.logo_url || "").trim().slice(0, 500),
   };
   let error = null;
   if (!out.name) error = "name_required";
@@ -175,6 +178,7 @@ function companyInput(body) {
   else if (out.start_date && out.end_date && out.end_date < out.start_date) error = "end_before_start";
   else if (out.price !== null && !(Number.isFinite(out.price) && out.price >= 0)) error = "price_invalid";
   else if (out.currency && !CURRENCIES.has(out.currency)) error = "currency_invalid";
+  else if (out.logo_url && !/^https?:\/\//i.test(out.logo_url)) error = "logo_must_be_hosted_url";
   return { input: out, error };
 }
 
@@ -184,10 +188,10 @@ app.post("/api/companies", strict, superOnly, async (req, res) => {
     if (error) return res.status(400).json({ ok: false, error });
     const q = await pool.query(
       `INSERT INTO companies (name, contact_name, contact_email, contact_phone, plan_id, status,
-                              start_date, end_date, notes, industry, price, currency)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING *`,
+                              start_date, end_date, notes, industry, price, currency, logo_url)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING *`,
       [c.name, c.contact_name, c.contact_email, c.contact_phone, c.plan_id, c.status,
-       c.start_date, c.end_date, c.notes, c.industry || "meat", c.price, c.currency]
+       c.start_date, c.end_date, c.notes, c.industry || "meat", c.price, c.currency, c.logo_url]
     );
     res.json({ ok: true, company: q.rows[0] });
   } catch (e) {
@@ -209,11 +213,12 @@ app.put("/api/companies/:id", strict, superOnly, async (req, res) => {
          industry=COALESCE($10, industry),
          price    = CASE WHEN $12 THEN $11::numeric ELSE price END,
          currency = CASE WHEN $14 THEN $13 ELSE currency END,
+         logo_url = CASE WHEN $16 THEN $17 ELSE logo_url END,
          updated_at=now()
        WHERE id=$15 RETURNING *`,
       [c.name, c.contact_name, c.contact_email, c.contact_phone, c.plan_id, c.status,
        c.start_date, c.end_date, c.notes, c.industry,
-       c.price, c.hasPrice, c.currency, c.hasCurrency, req.params.id]
+       c.price, c.hasPrice, c.currency, c.hasCurrency, req.params.id, c.hasLogo, c.logo_url]
     );
     if (!q.rowCount) return res.status(404).json({ ok: false, error: "not_found" });
     res.json({ ok: true, company: q.rows[0] });
