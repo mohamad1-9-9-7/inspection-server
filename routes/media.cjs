@@ -148,8 +148,15 @@ app.get("/healthz", (_req, res) => {
 
 app.get("/health/db", async (_req, res) => {
   try {
-    await pool.query("SELECT 1");
-    res.json({ ok: true, db: "connected" });
+    // Round-trip time to the database (3 samples): what each extra query in
+    // a request costs — e.g. the tenant-confinement preamble (db/pool.cjs).
+    const ms = [];
+    for (let i = 0; i < 3; i++) {
+      const t = process.hrtime.bigint();
+      await pool.query("SELECT 1");
+      ms.push(Number(process.hrtime.bigint() - t) / 1e6);
+    }
+    res.json({ ok: true, db: "connected", roundTripMs: ms.map((x) => Math.round(x * 10) / 10) });
   } catch (e) {
     res.status(500).json({ ok: false, error: String(e) });
   }
