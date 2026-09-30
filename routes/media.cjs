@@ -302,11 +302,18 @@ app.delete("/api/images", strict, async (req, res) => {
        before the per-company folders existed — stay deletable exactly as
        before, so no current screen loses a delete it had. The platform
        super-admin is not restricted. */
+    /* Everything OUTSIDE <base>/companies/ belongs to the primary company:
+       it is where Al Mawashi uploads (folderFor) and where every file from
+       before the per-company folders lives. So only the primary company may
+       delete there — another company used to be able to delete Al Mawashi's
+       files by URL. */
     const tenantRoot = `${BASE_FOLDER}/companies/`;
     const ownPrefix = req.user?.isSuperAdmin ? null : `${await folderFor(req)}/`;
+    const isPrimary = companyOf(req) === PRIMARY_COMPANY_ID;
     const mayDelete = (publicId) => {
       const id = String(publicId || "");
-      if (!ownPrefix || !id.startsWith(tenantRoot)) return true;
+      if (!ownPrefix) return true; // platform super-admin
+      if (!id.startsWith(tenantRoot)) return isPrimary;
       // inside the per-company tree: only the caller's own company folder
       return ownPrefix.startsWith(tenantRoot) && id.startsWith(ownPrefix);
     };

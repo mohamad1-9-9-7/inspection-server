@@ -178,7 +178,10 @@ function auditIp(req) {
 }
 
 /** Fire-and-forget audit insert. `action` is 'update' | 'delete'. */
-function auditWrite(req, { action, reportId, reportType, oldPayload, newPayload }) {
+/** `companyId`: the company the row really belongs to. Routes that know it
+ *  (by-id edits, creates) pass it, so a super-admin editing another company's
+ *  report is logged under THAT company, not under the one the request names. */
+function auditWrite(req, { action, reportId, reportType, oldPayload, newPayload, companyId = null }) {
   if (action === "update" && samePayload(oldPayload, newPayload)) return;
   pool
     .query(
@@ -194,7 +197,7 @@ function auditWrite(req, { action, reportId, reportType, oldPayload, newPayload 
         newPayload == null ? null : JSON.stringify(newPayload),
         `${req.method} ${req.originalUrl || req.url || ""}`.slice(0, 300),
         auditIp(req),
-        companyIdForWrite(req),
+        companyId ?? companyIdForWrite(req),
       ]
     )
     .catch((e) => console.warn("[audit] insert failed:", e?.message || e));
@@ -220,6 +223,7 @@ function auditCreate(req, row) {
     reportType: row.type,
     oldPayload: null,
     newPayload: { reportDate: p.reportDate ?? null, refNo: p.refNo ?? null },
+    companyId: row.company_id ?? null,
   });
 }
 
@@ -1059,6 +1063,7 @@ app.patch("/api/reports/:id(\\d+)", auth, async (req, res) => {
       reportType: upd.rows[0].type,
       oldPayload: old?.payload ?? null,
       newPayload: upd.rows[0].payload,
+      companyId: upd.rows[0].company_id,
     });
     return res.json({ ok: true, report: upd.rows[0] });
   } catch (e) {
@@ -1104,6 +1109,7 @@ app.put("/api/reports/:id(\\d+)", auth, async (req, res) => {
       reportType: upd.rows[0].type,
       oldPayload: old?.payload ?? null,
       newPayload: upd.rows[0].payload,
+      companyId: upd.rows[0].company_id,
     });
     return res.json({ ok: true, report: upd.rows[0] });
   } catch (e) {
@@ -1164,6 +1170,7 @@ app.delete("/api/reports/:id(\\d+)", auth, async (req, res) => {
       reportType: del.rows[0].type,
       oldPayload: del.rows[0].payload,
       newPayload: null,
+      companyId: companyForFilter,
     });
     res.json({ ok: true, deleted: del.rowCount });
   } catch (e) {

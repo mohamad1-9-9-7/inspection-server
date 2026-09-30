@@ -257,13 +257,19 @@ module.exports = function registerAuditRoutes(app, deps = {}) {
 
   /* GET /api/audit/types — distinct report types present in the trail,
      for the filter dropdown. */
-  app.get("/api/audit/types", requireAdmin, async (_req, res) => {
+  app.get("/api/audit/types", requireAdmin, async (req, res) => {
     try {
+      // Same company scope as the list: a company admin used to see every
+      // company's report types and counts here.
+      const scope = companyScopeOf(req);
+      const scoped = Number.isFinite(Number(scope)) && Number(scope) > 0;
       const q = await pool.query(
         `SELECT report_type, COUNT(*)::int AS n
            FROM report_audit
+          ${scoped ? "WHERE company_id = $1" : ""}
           GROUP BY report_type
-          ORDER BY n DESC, report_type`
+          ORDER BY n DESC, report_type`,
+        scoped ? [Number(scope)] : []
       );
       return res.json({ ok: true, types: q.rows });
     } catch (e) {
