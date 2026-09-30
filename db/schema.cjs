@@ -421,6 +421,21 @@ module.exports = async function ensureSchema({ pool, genSalt, hashPw }) {
   `);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_reports_company_id ON reports(company_id)`);
 
+  /* The common list read is "this company's rows of one type, newest first"
+     (WHERE company_id = $ AND type = $ ORDER BY created_at DESC). With many
+     companies sharing one type (every restaurant writes restaurant_*), the
+     separate company_id / type indexes make Postgres intersect two big sets
+     and sort; this one answers the read straight off the index, in order.
+     Failure must not stop boot. */
+  try {
+    await pool.query(
+      `CREATE INDEX IF NOT EXISTS idx_reports_company_type_created
+         ON reports (company_id, type, created_at DESC)`
+    );
+  } catch (e) {
+    console.warn("[schema] idx_reports_company_type_created skipped:", e?.message || e);
+  }
+
   /* ── A company is never deleted — only DISABLED / re-enabled ──
      The FKs above were ON DELETE SET NULL, so DELETE FROM companies turned
      that customer's accounts and reports into company_id NULL — and the two
