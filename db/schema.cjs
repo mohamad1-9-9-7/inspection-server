@@ -759,6 +759,7 @@ module.exports = async function ensureSchema({ pool, genSalt, hashPw }) {
       "vat_registered    BOOLEAN NOT NULL DEFAULT false",
       "website           TEXT    NOT NULL DEFAULT ''",
       "logo_url          TEXT    NOT NULL DEFAULT ''",
+      "signature_url     TEXT    NOT NULL DEFAULT ''",
       "bank_name         TEXT    NOT NULL DEFAULT ''",
       "account_name      TEXT    NOT NULL DEFAULT ''",
       "iban              TEXT    NOT NULL DEFAULT ''",
