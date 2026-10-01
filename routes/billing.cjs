@@ -479,6 +479,7 @@ app.get("/api/subscription", async (req, res) => {
   const SELLER_FIELDS = {
     company_name:       (v) => String(v ?? "").trim().slice(0, 160),
     owner_name:         (v) => String(v ?? "").trim().slice(0, 160),
+    legal_name:         (v) => String(v ?? "").trim().slice(0, 200),
     company_address:    (v) => String(v ?? "").trim().slice(0, 400),
     contact_email:      (v) => String(v ?? "").trim().slice(0, 160),
     contact_phone:      (v) => String(v ?? "").trim().slice(0, 60),
@@ -600,7 +601,7 @@ const INVOICE_SELECT = `
 /* INSPECT PRO is licensed (Abu Dhabi, 1 Oct 2026): every invoice carries the
    licence line. An empty profile falls back to these — the same values as
    LICENSE_DEFAULTS in the frontend (settings/_shared/sellerProfile.js). */
-const LICENSE_DEFAULTS = { no: "CN-6791275", authority: "Abu Dhabi Registration Authority (ADRA)" };
+const LICENSE_DEFAULTS = { no: "CN-6791275", authority: "Abu Dhabi Registration Authority (ADRA)", legalName: "INSPECT PRO ARTIFICIAL INTELLIGENCE DEVELOPING SERVICES" };
 
 function sellerSnapshot(p) {
   const s = p || {};
@@ -608,6 +609,7 @@ function sellerSnapshot(p) {
   return {
     name: s.company_name || "INSPECT PRO",
     owner_name: s.owner_name || "",
+    legal_name: s.legal_name || LICENSE_DEFAULTS.legalName,
     address: s.company_address || "",
     email: s.contact_email || "",
     phone: s.contact_phone || "",

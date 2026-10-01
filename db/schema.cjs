@@ -751,6 +751,7 @@ module.exports = async function ensureSchema({ pool, genSalt, hashPw }) {
   try {
     const cols = [
       "owner_name        TEXT    NOT NULL DEFAULT ''",
+      "legal_name        TEXT    NOT NULL DEFAULT ''",
       "license_status    TEXT    NOT NULL DEFAULT 'pending'",
       "license_no        TEXT    NOT NULL DEFAULT ''",
       "license_authority TEXT    NOT NULL DEFAULT ''",
