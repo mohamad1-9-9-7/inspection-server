@@ -486,6 +486,7 @@ app.get("/api/subscription", async (req, res) => {
     website:            (v) => String(v ?? "").trim().slice(0, 200),
     logo_url:           (v) => String(v ?? "").trim(),
     signature_url:      (v) => String(v ?? "").trim().slice(0, 500),
+    stamp_url:          (v) => String(v ?? "").trim().slice(0, 500),
     license_no:         (v) => String(v ?? "").trim().slice(0, 80),
     license_authority:  (v) => String(v ?? "").trim().slice(0, 160),
     license_expiry:     (v) => (/^\d{4}-\d{2}-\d{2}$/.test(String(v || "")) ? String(v) : null),
@@ -506,6 +507,7 @@ app.get("/api/subscription", async (req, res) => {
     if (p.vat_registered && !/^\d{15}$/.test(p.tax_id || "")) return "trn_required_15_digits";
     if (p.logo_url && !/^https?:\/\//i.test(p.logo_url)) return "logo_must_be_hosted_url";
     if (p.signature_url && !/^https?:\/\//i.test(p.signature_url)) return "signature_must_be_hosted_url";
+    if (p.stamp_url && !/^https?:\/\//i.test(p.stamp_url)) return "stamp_must_be_hosted_url";
     if (p.iban && !/^[A-Z]{2}\d{2}[A-Z0-9]{10,30}$/.test(p.iban)) return "iban_invalid";
     if (p.contact_email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(p.contact_email)) return "email_invalid";
     return null;
@@ -618,6 +620,7 @@ function sellerSnapshot(p) {
     website: s.website || "",
     logo_url: s.logo_url || "",
     signature_url: s.signature_url || "",
+    stamp_url: s.stamp_url || "",
     license_no: s.license_no || LICENSE_DEFAULTS.no,
     license_authority: s.license_authority || LICENSE_DEFAULTS.authority,
     vat_registered: registered,

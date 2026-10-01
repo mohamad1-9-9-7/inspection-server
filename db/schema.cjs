@@ -760,6 +760,7 @@ module.exports = async function ensureSchema({ pool, genSalt, hashPw }) {
       "website           TEXT    NOT NULL DEFAULT ''",
       "logo_url          TEXT    NOT NULL DEFAULT ''",
       "signature_url     TEXT    NOT NULL DEFAULT ''",
+      "stamp_url         TEXT    NOT NULL DEFAULT ''",
       "bank_name         TEXT    NOT NULL DEFAULT ''",
       "account_name      TEXT    NOT NULL DEFAULT ''",
       "iban              TEXT    NOT NULL DEFAULT ''",
