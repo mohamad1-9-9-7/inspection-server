@@ -484,7 +484,6 @@ app.get("/api/subscription", async (req, res) => {
     contact_phone:      (v) => String(v ?? "").trim().slice(0, 60),
     website:            (v) => String(v ?? "").trim().slice(0, 200),
     logo_url:           (v) => String(v ?? "").trim(),
-    license_status:     (v) => (String(v) === "issued" ? "issued" : "pending"),
     license_no:         (v) => String(v ?? "").trim().slice(0, 80),
     license_authority:  (v) => String(v ?? "").trim().slice(0, 160),
     license_expiry:     (v) => (/^\d{4}-\d{2}-\d{2}$/.test(String(v || "")) ? String(v) : null),
@@ -598,6 +597,11 @@ const INVOICE_SELECT = `
               THEN 'overdue' ELSE i.status END AS display_status
     FROM invoices i`;
 
+/* INSPECT PRO is licensed (Abu Dhabi, 1 Oct 2026): every invoice carries the
+   licence line. An empty profile falls back to these — the same values as
+   LICENSE_DEFAULTS in the frontend (settings/_shared/sellerProfile.js). */
+const LICENSE_DEFAULTS = { no: "CN-6791275", authority: "Abu Dhabi Registration Authority (ADRA)" };
+
 function sellerSnapshot(p) {
   const s = p || {};
   const registered = s.vat_registered === true;
@@ -609,9 +613,8 @@ function sellerSnapshot(p) {
     phone: s.contact_phone || "",
     website: s.website || "",
     logo_url: s.logo_url || "",
-    license_status: s.license_status || "pending",
-    license_no: s.license_status === "issued" ? s.license_no || "" : "",
-    license_authority: s.license_status === "issued" ? s.license_authority || "" : "",
+    license_no: s.license_no || LICENSE_DEFAULTS.no,
+    license_authority: s.license_authority || LICENSE_DEFAULTS.authority,
     vat_registered: registered,
     trn: registered ? s.tax_id || "" : "",
     bank_name: s.bank_name || "",
