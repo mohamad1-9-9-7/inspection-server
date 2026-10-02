@@ -847,6 +847,29 @@ module.exports = async function ensureSchema({ pool, genSalt, hashPw }) {
     console.warn("[schema] demo_requests table step skipped:", e?.message || e);
   }
 
+  /* Visitor stats for the public pages (/demo, /readiness, /): first-party,
+     cookieless, aggregated — one row per day × page × event × source ×
+     country × device × language, holding a count. No IPs, no visitor ids.
+     Written by POST /api/site-stats, read in Platform Center (routes/demoRequests.cjs). */
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS site_stats (
+        day      DATE    NOT NULL,
+        page     TEXT    NOT NULL,
+        event    TEXT    NOT NULL,
+        detail   TEXT    NOT NULL DEFAULT '',
+        source   TEXT    NOT NULL DEFAULT '',
+        country  TEXT    NOT NULL DEFAULT '',
+        device   TEXT    NOT NULL DEFAULT '',
+        lang     TEXT    NOT NULL DEFAULT '',
+        n        INT     NOT NULL DEFAULT 0,
+        PRIMARY KEY (day, page, event, detail, source, country, device, lang)
+      )
+    `);
+  } catch (e) {
+    console.warn("[schema] site_stats table step skipped:", e?.message || e);
+  }
+
   /* invoices → issued BY INSPECT PRO TO a company. Each invoice now knows
      which company it bills (company_id), freezes the seller as it was on
      the day (seller JSONB — later profile edits never rewrite an issued

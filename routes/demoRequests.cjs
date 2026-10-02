@@ -273,7 +273,92 @@ module.exports = function registerDemoRequestRoutes(app, deps = {}) {
     }
   });
 
+  /* ---------- PUBLIC: visitor stats (site_stats) ----------
+     The public pages batch a few events per visit: { page, lang, source,
+     country, device, events: [{ e, d }] }. Everything is whitelisted and
+     folded into daily counters — no IPs, no ids, nothing per person. */
+  const statsLimiter = typeof makeLimiter === "function"
+    ? makeLimiter({ max: 240, windowMs: 60 * 60_000, name: "site-stats" })
+    : (_req, _res, next) => next();
+  const STAT_PAGES = new Set(["demo", "readiness", "login"]);
+  const STAT_EVENTS = new Set(["view", "visit", "reach", "cta", "form_start", "lead", "wa", "lang", "quiz_start", "quiz_done"]);
+  const STAT_DEVICES = new Set(["mobile", "tablet", "desktop"]);
+  const BOT_UA = /bot|crawl|spider|slurp|facebookexternalhit|whatsapp|preview|headless|lighthouse|pingdom|uptime|monitor/i;
+  const statSlug = (v, max) => String(v || "").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, max);
+
+  app.post("/api/site-stats", statsLimiter, async (req, res) => {
+    try {
+      if (BOT_UA.test(String(req.get("user-agent") || ""))) return res.json({ ok: true });
+      const b = req.body || {};
+      if (!STAT_PAGES.has(b.page)) return res.status(400).json({ ok: false, error: "bad_page" });
+      const source = statSlug(b.source, 40) || "direct";
+      const cc = String(b.country || "").toUpperCase();
+      const country = /^[A-Z]{2}$/.test(cc) ? cc : "";
+      const device = STAT_DEVICES.has(b.device) ? b.device : "";
+      const lang = b.lang === "ar" ? "ar" : "en";
+
+      const counts = new Map();
+      for (const x of (Array.isArray(b.events) ? b.events : []).slice(0, 25)) {
+        if (!x || !STAT_EVENTS.has(x.e)) continue;
+        const key = `${x.e}|${statSlug(x.d, 30)}`;
+        counts.set(key, (counts.get(key) || 0) + 1);
+      }
+      if (!counts.size) return res.json({ ok: true });
+
+      const day = todayDubai();
+      const values = [];
+      const params = [];
+      for (const [key, n] of counts) {
+        const [event, detail] = key.split("|");
+        const p = params.length;
+        values.push(`($${p + 1}::date, $${p + 2}, $${p + 3}, $${p + 4}, $${p + 5}, $${p + 6}, $${p + 7}, $${p + 8}, $${p + 9}::int)`);
+        params.push(day, b.page, event, detail, source, country, device, lang, n);
+      }
+      await pool.query(
+        `INSERT INTO site_stats (day, page, event, detail, source, country, device, lang, n)
+         VALUES ${values.join(", ")}
+         ON CONFLICT (day, page, event, detail, source, country, device, lang)
+         DO UPDATE SET n = site_stats.n + EXCLUDED.n`,
+        params
+      );
+      res.json({ ok: true });
+    } catch (e) {
+      // Stats never break a page.
+      console.error("POST /api/site-stats ERROR:", e?.message || e);
+      res.json({ ok: false });
+    }
+  });
+
   /* ---------- super-admin ---------- */
+
+  /* Visitor stats for Platform Center → Demo Requests. ?days=7|30|90 (1-365). */
+  app.get("/api/site-stats", ...gate, async (req, res) => {
+    try {
+      const days = Math.min(365, Math.max(1, Math.round(Number(req.query.days)) || 30));
+      const since = new Date(Date.now() + 4 * 3600_000 - (days - 1) * 864e5).toISOString().slice(0, 10);
+      const q = (sql) => pool.query(sql, [since]).then((r) => r.rows);
+      const [daily, events, sources, countries, devices, langs, leads] = await Promise.all([
+        q(`SELECT to_char(day, 'YYYY-MM-DD') AS day, page, event, SUM(n)::int AS n FROM site_stats
+           WHERE day >= $1 AND event IN ('view', 'visit', 'form_start', 'lead') GROUP BY day, page, event ORDER BY day`),
+        q(`SELECT page, event, detail, SUM(n)::int AS n FROM site_stats WHERE day >= $1 GROUP BY page, event, detail`),
+        q(`SELECT source AS k, event, SUM(n)::int AS n FROM site_stats
+           WHERE day >= $1 AND event IN ('visit', 'form_start', 'lead') GROUP BY source, event`),
+        q(`SELECT country AS k, event, SUM(n)::int AS n FROM site_stats
+           WHERE day >= $1 AND event IN ('visit', 'lead') GROUP BY country, event`),
+        q(`SELECT device AS k, event, SUM(n)::int AS n FROM site_stats
+           WHERE day >= $1 AND event IN ('visit', 'lead') GROUP BY device, event`),
+        q(`SELECT lang AS k, event, SUM(n)::int AS n FROM site_stats
+           WHERE day >= $1 AND event IN ('visit', 'lead') GROUP BY lang, event`),
+        // The leads table is the truth for how many requests actually arrived.
+        q(`SELECT (quiz_score IS NOT NULL) AS quiz, COUNT(*)::int AS n FROM demo_requests
+           WHERE created_at >= ($1::date - interval '4 hours') GROUP BY 1`),
+      ]);
+      res.json({ ok: true, days, since, daily, events, sources, countries, devices, langs, leads });
+    } catch (e) {
+      console.error("GET /api/site-stats ERROR:", e?.message || e);
+      res.status(500).json({ ok: false, error: "stats_failed" });
+    }
+  });
   app.put("/api/demo-config", ...gate, async (req, res) => {
     try {
       let next;
