@@ -6,8 +6,8 @@
      PATCH  /api/demo-requests/:id    super-admin — { status?, notes? }
      DELETE /api/demo-requests/:id    super-admin — spam / duplicates
 
-     GET    /api/demo-config          PUBLIC  { whatsapp, offer, referral, story } for /demo + /readiness
-     PUT    /api/demo-config          super-admin — any of { whatsapp, offer, referral, story }
+     GET    /api/demo-config          PUBLIC  { whatsapp, offer, referral, story, testimonials } for /demo + /readiness
+     PUT    /api/demo-config          super-admin — any of { whatsapp, offer, referral, story, testimonials }
 
    The public GET only returns what is switched on: an offer past its end
    date, or a story with no text, is simply absent, so the pages never show
@@ -77,6 +77,8 @@ module.exports = function registerDemoRequestRoutes(app, deps = {}) {
     if (r.on && Number(r.pct) > 0) out.referral = { pct: Number(r.pct), months: Number(r.months) || 12 };
     const st = v.story || {};
     if (st.on && (st.ar || st.en)) out.story = { ar: String(st.ar || ""), en: String(st.en || "") };
+    const tm = (Array.isArray(v.testimonials) ? v.testimonials : []).filter((x) => x && x.on && x.name && (x.ar || x.en));
+    if (tm.length) out.testimonials = tm.map(({ on, ...x }) => x);
     return out;
   }
 
@@ -106,6 +108,22 @@ module.exports = function registerDemoRequestRoutes(app, deps = {}) {
     if (body.story !== undefined) {
       const st = body.story || {};
       next.story = { on: !!st.on, ar: clean(st.ar, 600), en: clean(st.en, 600) };
+    }
+    if (body.testimonials !== undefined) {
+      // Real customer quotes only (the owner adds them with permission). Max 6.
+      const list = Array.isArray(body.testimonials) ? body.testimonials.slice(0, 6) : [];
+      next.testimonials = list.map((x = {}) => {
+        const stars = Math.round(Number(x.stars));
+        return {
+          on: !!x.on,
+          name: clean(x.name, 80),
+          role: clean(x.role, 80),
+          company: clean(x.company, 100),
+          ar: clean(x.ar, 400),
+          en: clean(x.en, 400),
+          stars: stars >= 1 && stars <= 5 ? stars : 5,
+        };
+      });
     }
     return next;
   }
