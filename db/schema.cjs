@@ -445,6 +445,14 @@ module.exports = async function ensureSchema({ pool, genSalt, hashPw }) {
      all: disabling stamps disabled_at (see utils/companyGate.cjs), and the
      FKs are RESTRICT so a raw DELETE on a company that still owns rows
      fails instead of scattering them. */
+  /* Self-service trial companies (routes/trial.cjs): erased with everything
+     in them a few days after their end date. Own step so a failure here can
+     never skip the FK work below. */
+  try {
+    await pool.query(`ALTER TABLE companies ADD COLUMN IF NOT EXISTS is_trial BOOLEAN NOT NULL DEFAULT false`);
+  } catch (e) {
+    console.warn("[schema] companies.is_trial skipped:", e?.message || e);
+  }
   try {
     await pool.query(`ALTER TABLE companies ADD COLUMN IF NOT EXISTS disabled_at TIMESTAMPTZ`);
     for (const table of ["app_users", "reports"]) {

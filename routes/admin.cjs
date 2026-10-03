@@ -257,7 +257,7 @@ app.post("/api/auth/login", async (req, res) => {
     let company = null;
     if (user.company_id) {
       const cq = await pool.query(
-        `SELECT c.id, c.name, c.status, c.start_date, c.end_date, c.industry, c.module, c.disabled_at,
+        `SELECT c.id, c.name, c.status, c.start_date, c.end_date, c.industry, c.module, c.disabled_at, c.is_trial,
                 p.name AS plan_name
            FROM companies c
            LEFT JOIN plans p ON p.id = c.plan_id
@@ -290,7 +290,7 @@ app.post("/api/auth/login", async (req, res) => {
         return res.status(403).json({
           ok: false,
           error: "subscription_lapsed",
-          company: { name: company.name, status: company.status, end_date: company.end_date },
+          company: { name: company.name, status: company.status, end_date: company.end_date, isTrial: !!company.is_trial },
         });
       }
     }
@@ -342,6 +342,7 @@ app.post("/api/auth/login", async (req, res) => {
           industry:  company.industry || "meat",
           module:    company.module || "",        // code module: src/companies/<module>/
           planName:  company.plan_name || null,
+          isTrial:   !!company.is_trial,              // self-service trial (routes/trial.cjs)
         } : null,
       },
     });

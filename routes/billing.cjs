@@ -324,15 +324,10 @@ app.post("/api/companies/:id/enable", strict, superOnly, async (req, res) => {
    copy of the client's name (their FK is ON DELETE SET NULL).
    The company's upload folder on Cloudinary is emptied afterwards, best
    effort — a storage hiccup never undoes a finished delete.
+   The erase itself lives in utils/deleteCompany.cjs (the trial sweep in
+   routes/trial.cjs uses it too); the guard rails above are checked HERE.
 ============================================================ */
-const DELETE_COUNTS_SQL = `
-  SELECT
-    (SELECT COUNT(*)::int FROM reports       WHERE company_id = $1) AS reports,
-    (SELECT COUNT(*)::int FROM app_users     WHERE company_id = $1) AS accounts,
-    (SELECT COUNT(*)::int FROM report_audit  WHERE company_id = $1) AS audit_rows,
-    (SELECT COUNT(*)::int FROM email_history WHERE company_id = $1) AS emails,
-    (SELECT COUNT(*)::int FROM invoices      WHERE company_id = $1) AS invoices,
-    (SELECT COUNT(*)::int FROM product_catalog WHERE company_id = $1) AS catalog_items`;
+const { eraseCompany, DELETE_COUNTS_SQL } = require("../utils/deleteCompany.cjs");
 
 const pwFails = new Map(); // uid → { n, until }
 const PW_MAX = 5;
@@ -366,7 +361,6 @@ app.post("/api/companies/:id/delete", strict, superOnly, async (req, res) => {
     return res.status(429).json({ ok: false, error: "too_many_attempts", retryInSec: Math.ceil((fail.until - now) / 1000) });
   }
 
-  let client;
   try {
     /* The caller's own password, checked against the database — the token
        alone proves a session, not that the owner is at the keyboard. */
@@ -386,54 +380,18 @@ app.post("/api/companies/:id/delete", strict, superOnly, async (req, res) => {
       return res.status(400).json({ ok: false, error: "name_mismatch" });
     }
 
-    client = await pool.connect();
-    await client.query("BEGIN");
-    const counts = (await client.query(DELETE_COUNTS_SQL, [id])).rows[0];
-    await client.query(`DELETE FROM report_audit    WHERE company_id = $1`, [id]);
-    await client.query(`DELETE FROM email_history   WHERE company_id = $1`, [id]);
-    await client.query(`DELETE FROM invoices        WHERE company_id = $1`, [id]);
-    await client.query(`DELETE FROM subscription    WHERE company_id = $1`, [id]);
-    await client.query(`DELETE FROM product_catalog WHERE company_id = $1`, [id]);
-    await client.query(`DELETE FROM activity_log WHERE user_id IN (SELECT id FROM app_users WHERE company_id = $1)`, [id]);
-    await client.query(`DELETE FROM app_users       WHERE company_id = $1`, [id]);
-    await client.query(`DELETE FROM reports         WHERE company_id = $1`, [id]);
-    await client.query(`DELETE FROM report_counters WHERE type LIKE $1`, [`%:c${id}`]);
-    await client.query(`DELETE FROM companies       WHERE id = $1`, [id]);
-    await client.query("COMMIT");
-    markCompanyDisabled(id, false);
+    // One transaction, then the storage purge — utils/deleteCompany.cjs.
+    const out = await eraseCompany(pool, id);
+    if (!out) return res.status(404).json({ ok: false, error: "not_found" });
+    const { counts } = out;
 
     console.warn(`[companies] company ${id} "${company.name}" DELETED by ${req.user?.username || "?"}:`, counts);
     res.json({ ok: true, deleted: { id, name: company.name, ...counts } });
-
-    // After the answer: empty its storage folder (and its card picture).
-    purgeCompanyFiles(company).catch((e) => console.warn("[companies] file purge:", e?.message || e));
   } catch (e) {
-    if (client) { try { await client.query("ROLLBACK"); } catch { /* already gone */ } }
     console.error("POST /api/companies/:id/delete ERROR:", e);
     if (!res.headersSent) res.status(500).json({ ok: false, error: "server_error" });
-  } finally {
-    if (client) client.release();
   }
 });
-
-/* Same folder rule as routes/media.cjs folderFor(): <base>/companies/<industry>/c<id>. */
-async function purgeCompanyFiles(company) {
-  const cloudinary = require("cloudinary").v2;
-  const cfg = cloudinary.config();
-  if (!cfg.cloud_name || !cfg.api_key || !cfg.api_secret) return;
-  const base = process.env.CLOUDINARY_FOLDER || "qcs";
-  const seg = String(company.industry || "other").toLowerCase().replace(/[^a-z0-9_-]/g, "") || "other";
-  const prefix = `${base}/companies/${seg}/c${company.id}/`;
-  for (const resource_type of ["image", "raw", "video"]) {
-    for (let i = 0; i < 20; i++) { // 1000 per call; 20 rounds = far beyond any real company
-      const out = await cloudinary.api.delete_resources_by_prefix(prefix, { resource_type });
-      if (!out?.partial) break;
-    }
-  }
-  // The card picture was uploaded from the Platform Center, outside that folder.
-  const m = /\/upload\/(?:[^/]+\/)*v\d+\/(.+)\.[a-z0-9]+$/i.exec(String(company.logo_url || ""));
-  if (m) await cloudinary.uploader.destroy(m[1], { invalidate: true });
-}
 
 /* ============================================================
    SUBSCRIPTION — read-only view of the company row.
@@ -469,6 +427,7 @@ app.get("/api/subscription", async (req, res) => {
               to_char(c.end_date,   'YYYY-MM-DD') AS end_date,
               COALESCE(c.price, ${PLAN_PRICE_SQL}) AS price,
               c.branches      AS branches,
+              c.is_trial      AS is_trial,
               COALESCE(NULLIF(c.currency,''), p.currency, 'AED') AS currency,
               c.price         AS custom_price,
               p.setup_fee,
