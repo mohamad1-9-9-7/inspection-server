@@ -48,6 +48,16 @@ module.exports = function registerBillingRoutes(app, deps = {}) {
          admin editing PUT /api/subscription could otherwise extend its own
          end date, and invoices are the owner's books, not the tenant's. */
 
+/* What a company's plan costs a month. A per-branch plan is its price ×
+   the company's branches, less the volume discount where the plan takes it
+   (5+ branches −10 %, 10+ −15 % — same rule as the /demo page). A flat plan
+   is its price. A company's own custom price still wins over this. */
+const PLAN_PRICE_SQL = `CASE WHEN p.per_branch
+    THEN round(p.price * GREATEST(c.branches, 1) *
+         CASE WHEN p.volume_discount AND c.branches >= 10 THEN 0.85
+              WHEN p.volume_discount AND c.branches >= 5  THEN 0.90 ELSE 1 END, 2)
+    ELSE p.price END`;
+
 /* ============================================================
    PLANS — CRUD
 ============================================================ */
@@ -128,7 +138,8 @@ app.get("/api/companies", strict, async (req, res) => {
       return res.json({ ok: true, companies: [] });
     }
     const q = await pool.query(
-      `SELECT c.*, p.name AS plan_name, p.price AS plan_price, p.currency AS plan_currency,
+      `SELECT c.*, p.name AS plan_name, ${PLAN_PRICE_SQL} AS plan_price, p.currency AS plan_currency,
+              p.per_branch AS plan_per_branch, p.price AS plan_unit_price,
               to_char(c.start_date, 'YYYY-MM-DD') AS start_date,
               to_char(c.end_date,   'YYYY-MM-DD') AS end_date
          FROM companies c
@@ -178,6 +189,9 @@ function companyInput(body) {
     // module: absent → keep what is stored (PUT) / derive from the industry (POST).
     hasModule: Object.prototype.hasOwnProperty.call(b, "module"),
     module: String(b.module || "").trim().toLowerCase(),
+    // branches: the billable branch count (per-branch plans). Absent → keep.
+    hasBranches: Object.prototype.hasOwnProperty.call(b, "branches"),
+    branches: Number(b.branches),
   };
   let error = null;
   if (!out.name) error = "name_required";
@@ -187,6 +201,7 @@ function companyInput(body) {
   else if (out.currency && !CURRENCIES.has(out.currency)) error = "currency_invalid";
   else if (out.logo_url && !/^https?:\/\//i.test(out.logo_url)) error = "logo_must_be_hosted_url";
   else if (out.module && !/^[a-z0-9][a-z0-9_-]{0,39}$/.test(out.module)) error = "module_invalid";
+  else if (out.hasBranches && !(Number.isInteger(out.branches) && out.branches >= 1 && out.branches <= 999)) error = "branches_invalid";
   return { input: out, error };
 }
 
@@ -196,11 +211,11 @@ app.post("/api/companies", strict, superOnly, async (req, res) => {
     if (error) return res.status(400).json({ ok: false, error });
     const q = await pool.query(
       `INSERT INTO companies (name, contact_name, contact_email, contact_phone, plan_id, status,
-                              start_date, end_date, notes, industry, price, currency, logo_url, module)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) RETURNING *`,
+                              start_date, end_date, notes, industry, price, currency, logo_url, module, branches)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) RETURNING *`,
       [c.name, c.contact_name, c.contact_email, c.contact_phone, c.plan_id, c.status,
        c.start_date, c.end_date, c.notes, c.industry || "meat", c.price, c.currency, c.logo_url,
-       c.module || defaultModuleFor(c.industry || "meat")]
+       c.module || defaultModuleFor(c.industry || "meat"), c.hasBranches ? c.branches : 1]
     );
     res.json({ ok: true, company: q.rows[0] });
   } catch (e) {
@@ -224,12 +239,13 @@ app.put("/api/companies/:id", strict, superOnly, async (req, res) => {
          currency = CASE WHEN $14 THEN $13 ELSE currency END,
          logo_url = CASE WHEN $16 THEN $17 ELSE logo_url END,
          module   = CASE WHEN $18 AND $19 <> '' THEN $19 ELSE module END,
+         branches = CASE WHEN $20 THEN $21::int ELSE branches END,
          updated_at=now()
        WHERE id=$15 RETURNING *`,
       [c.name, c.contact_name, c.contact_email, c.contact_phone, c.plan_id, c.status,
        c.start_date, c.end_date, c.notes, c.industry,
        c.price, c.hasPrice, c.currency, c.hasCurrency, req.params.id, c.hasLogo, c.logo_url,
-       c.hasModule, c.module]
+       c.hasModule, c.module, c.hasBranches, c.hasBranches ? c.branches : 1]
     );
     if (!q.rowCount) return res.status(404).json({ ok: false, error: "not_found" });
     res.json({ ok: true, company: q.rows[0] });
@@ -451,7 +467,8 @@ app.get("/api/subscription", async (req, res) => {
               c.status        AS stored_status,
               to_char(c.start_date, 'YYYY-MM-DD') AS start_date,
               to_char(c.end_date,   'YYYY-MM-DD') AS end_date,
-              COALESCE(c.price, p.price)                 AS price,
+              COALESCE(c.price, ${PLAN_PRICE_SQL}) AS price,
+              c.branches      AS branches,
               COALESCE(NULLIF(c.currency,''), p.currency, 'AED') AS currency,
               c.price         AS custom_price,
               p.setup_fee,
@@ -694,7 +711,8 @@ app.post("/api/invoices", strict, superOnly, async (req, res) => {
     if (!Number.isInteger(companyId) || companyId <= 0) return res.status(400).json({ ok: false, error: "company_required" });
 
     const cq = await pool.query(
-      `SELECT c.*, p.name AS plan_name, p.price AS plan_price, p.currency AS plan_currency
+      `SELECT c.*, p.name AS plan_name, ${PLAN_PRICE_SQL} AS plan_price, p.currency AS plan_currency,
+              p.per_branch AS plan_per_branch
          FROM companies c LEFT JOIN plans p ON p.id = c.plan_id
         WHERE c.id = $1`,
       [companyId]
@@ -715,9 +733,11 @@ app.post("/api/invoices", strict, superOnly, async (req, res) => {
     let lines;
     if (b.lines === undefined || b.lines === null) {
       // The period is printed in the header; the line just names what is billed.
+      // A per-branch plan (no custom price) bills one line per branch.
+      const qty = company.price == null && company.plan_per_branch ? Math.max(1, Number(company.branches) || 1) : 1;
       lines = [{
-        description: `Subscription — ${company.plan_name || "custom"} plan`,
-        qty: 1, unit_price: round2(price), total: round2(price),
+        description: `Subscription — ${company.plan_name || "custom"} plan${qty > 1 ? " (per branch)" : ""}`,
+        qty, unit_price: round2(price / qty), total: round2(price),
       }];
     } else {
       lines = cleanLines(b.lines);
@@ -746,7 +766,7 @@ app.post("/api/invoices", strict, superOnly, async (req, res) => {
              company_id, status, title, due_date, subtotal, vat_pct, vat_amount,
              lines, seller, buyer_contact, buyer_email
            ) VALUES (
-             $1,$2,$3,$4,$5,'','', $6,$7,0,$8,$9, $10,$11,$12,$13,
+             $1,$2,$3,$4,$5,'','', $6,$7,$24,$8,$9, $10,$11,$12,$13,
              $14,'unpaid',$15,$16,$17,$18,$19,$20,$21,$22,$23
            ) RETURNING id`,
           [
@@ -755,6 +775,7 @@ app.post("/api/invoices", strict, superOnly, async (req, res) => {
             total, currency, String(b.notes || "").slice(0, 2000), String(req.user?.username || "admin"),
             companyId, seller.vat_registered ? "Tax Invoice" : "Invoice", dueDate, subtotal, vatPct, vatAmount,
             JSON.stringify(lines), JSON.stringify(seller), company.contact_name || "", company.contact_email || "",
+            Math.max(1, Number(company.branches) || 1),
           ]
         );
         const out = await pool.query(`${INVOICE_SELECT} WHERE i.id = $1`, [q.rows[0].id]);

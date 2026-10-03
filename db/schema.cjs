@@ -741,6 +741,43 @@ module.exports = async function ensureSchema({ pool, genSalt, hashPw }) {
     console.warn("[schema] plans AED re-price step skipped:", e?.message || e);
   }
 
+  /* Per-branch plans (3 Oct 2026, same numbers as the public /demo page):
+     Essential 350 / Professional 490 / Enterprise 690 AED per branch per
+     month (annual 300 / 420 / 590), setup 1000. Professional and Enterprise
+     take the volume discount (5+ branches −10 %, 10+ −15 %); Essential never
+     does — 300 is the floor. A company's plan price = per-branch price ×
+     companies.branches (see routes/billing.cjs PLAN_PRICE_SQL).
+     The untouched flat seeds are retired: Starter / Growth are switched off
+     (rows kept, a company may still point at them), and the flat Enterprise
+     4000 becomes the per-branch one — after any company sitting on it with
+     no custom price is frozen at its old 4000, so nobody's bill moves. */
+  try {
+    await pool.query(`ALTER TABLE plans ADD COLUMN IF NOT EXISTS per_branch BOOLEAN NOT NULL DEFAULT false`);
+    await pool.query(`ALTER TABLE plans ADD COLUMN IF NOT EXISTS volume_discount BOOLEAN NOT NULL DEFAULT false`);
+    await pool.query(`ALTER TABLE plans ADD COLUMN IF NOT EXISTS annual_price NUMERIC(10,2)`);
+    await pool.query(`ALTER TABLE companies ADD COLUMN IF NOT EXISTS branches INT NOT NULL DEFAULT 1`);
+    await pool.query(`
+      UPDATE companies c SET price = p.price, currency = COALESCE(c.currency, p.currency)
+        FROM plans p
+       WHERE c.plan_id = p.id AND c.price IS NULL AND p.per_branch = false
+         AND p.name = 'Enterprise' AND p.price = 4000 AND p.setup_fee = 6000 AND p.currency = 'AED'`);
+    await pool.query(`
+      UPDATE plans SET price = 690, annual_price = 590, setup_fee = 1000, per_branch = true, volume_discount = true,
+             description = 'Per branch / month — the full quality system', updated_at = now()
+       WHERE name = 'Enterprise' AND price = 4000 AND setup_fee = 6000 AND currency = 'AED' AND per_branch = false`);
+    await pool.query(`
+      INSERT INTO plans (name, price, annual_price, currency, setup_fee, per_branch, volume_discount, description) VALUES
+        ('Essential',    350, 300, 'AED', 1000, true, false, 'Per branch / month — daily food-safety logs'),
+        ('Professional', 490, 420, 'AED', 1000, true, true,  'Per branch / month — every branch on one screen, traceability, suppliers, CAPA')
+      ON CONFLICT (name) DO NOTHING`);
+    await pool.query(`
+      UPDATE plans SET is_active = false, updated_at = now()
+       WHERE is_active = true AND currency = 'AED' AND per_branch = false
+         AND ((name = 'Starter' AND price = 1500 AND setup_fee = 2500) OR (name = 'Growth' AND price = 2500 AND setup_fee = 4000))`);
+  } catch (e) {
+    console.warn("[schema] per-branch plans step skipped:", e?.message || e);
+  }
+
   /* billing_profile → the SELLER: INSPECT PRO, the platform owner, printed
      at the top of every quotation and invoice. It used to be one ambiguous
      row that quotations read as the issuer and invoices read as the buyer.
