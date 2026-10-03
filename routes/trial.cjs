@@ -32,6 +32,7 @@
 ============================================================ */
 const { sendPlatformMail } = require("./mailer.cjs");
 const { eraseCompany } = require("../utils/deleteCompany.cjs");
+const { normalizeMobile } = require("../utils/phone.cjs");
 
 const TRIAL_DAYS = 3;
 const TRIAL_GRACE_DAYS = 3;
@@ -74,24 +75,35 @@ module.exports = function registerTrialRoutes(app, deps = {}) {
       source: clean(b.source, 50),
     };
     const password = String(b.password || "");
-    const digits = d.phone.replace(/\D/g, "");
 
     if (!d.companyName || !d.contactName || !d.phone) return res.status(400).json({ ok: false, error: "required" });
-    if (digits.length < 7 || digits.length > 15) return res.status(400).json({ ok: false, error: "bad_phone" });
+    // A real mobile of the chosen country, in ONE form (utils/phone.cjs), so the
+    // one-trial-per-number rule below cannot be dodged by retyping it.
+    const mobile = normalizeMobile(b.phoneCountry || "AE", d.phone);
+    if (!mobile) return res.status(400).json({ ok: false, error: "bad_phone" });
+    d.phone = mobile.e164;
+    const digits = mobile.digits;
     if (d.email && !isEmail(d.email)) return res.status(400).json({ ok: false, error: "bad_email" });
     if (password.length < 8 || password.length > 100) return res.status(400).json({ ok: false, error: "weak_password" });
     if (!SECTOR_KIT[d.sector]) return res.status(400).json({ ok: false, error: "bad_sector" });
     // The visitor ticked "I understand nothing in a trial is kept".
     if (b.accept !== true) return res.status(400).json({ ok: false, error: "not_accepted" });
 
+    /* Has this number had a trial? Leads outlive the erased company, so they
+       are the record; a live trial company is checked too. */
+    const usedSql = `
+      SELECT 1 FROM demo_requests
+       WHERE source LIKE 'trial%' AND regexp_replace(phone, '\\D', '', 'g') = $1
+      UNION ALL
+      SELECT 1 FROM companies
+       WHERE is_trial AND regexp_replace(contact_phone, '\\D', '', 'g') = $1
+      LIMIT 1`;
+
     let client;
     try {
-      const seen = await pool.query(
-        `SELECT 1 FROM demo_requests
-          WHERE source LIKE 'trial%' AND regexp_replace(phone, '\\D', '', 'g') = $1 LIMIT 1`,
-        [digits]
-      );
-      if (seen.rowCount) return res.status(409).json({ ok: false, error: "trial_used" });
+      if ((await pool.query(usedSql, [digits])).rowCount) {
+        return res.status(409).json({ ok: false, error: "trial_used" });
+      }
 
       if (dailyCap) {
         const today = await pool.query(
@@ -114,6 +126,13 @@ module.exports = function registerTrialRoutes(app, deps = {}) {
 
       client = await pool.connect();
       await client.query("BEGIN");
+      /* Two taps at once with the same number: the second waits here, then
+         sees the first one's lead and is refused. */
+      await client.query(`SELECT pg_advisory_xact_lock(hashtext($1))`, [`trial:${digits}`]);
+      if ((await client.query(usedSql, [digits])).rowCount) {
+        await client.query("ROLLBACK");
+        return res.status(409).json({ ok: false, error: "trial_used" });
+      }
       const company = (await client.query(
         `INSERT INTO companies (name, contact_name, contact_email, contact_phone, status,
                                 start_date, end_date, notes, industry, module, branches, is_trial)
