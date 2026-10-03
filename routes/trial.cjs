@@ -33,7 +33,7 @@
 const { sendPlatformMail } = require("./mailer.cjs");
 const { eraseCompany } = require("../utils/deleteCompany.cjs");
 
-const TRIAL_DAYS = 7;
+const TRIAL_DAYS = 3;
 const TRIAL_GRACE_DAYS = 3;
 const SWEEP_EVERY_MS = 6 * 60 * 60_000;
 
