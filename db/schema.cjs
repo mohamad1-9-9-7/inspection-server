@@ -888,6 +888,27 @@ module.exports = async function ensureSchema({ pool, genSalt, hashPw }) {
     await pool.query(`ALTER TABLE demo_requests ADD COLUMN IF NOT EXISTS quiz_answers JSONB`);
     // "Who recommended us?" — the company that earns the referral discount.
     await pool.query(`ALTER TABLE demo_requests ADD COLUMN IF NOT EXISTS referred_by TEXT NOT NULL DEFAULT ''`);
+    // The promo code the visitor came with (routes/promoCodes.cjs) — who brought this lead.
+    await pool.query(`ALTER TABLE demo_requests ADD COLUMN IF NOT EXISTS promo_code TEXT NOT NULL DEFAULT ''`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS ix_demo_requests_promo ON demo_requests(promo_code) WHERE promo_code <> ''`);
+    /* One code per person who brings customers (routes/promoCodes.cjs). */
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS promo_codes (
+        id           SERIAL        PRIMARY KEY,
+        code         TEXT          NOT NULL UNIQUE,
+        kind         TEXT          NOT NULL DEFAULT 'pct',
+        amount       NUMERIC(10,2) NOT NULL,
+        holder       TEXT          NOT NULL DEFAULT '',
+        holder_phone TEXT          NOT NULL DEFAULT '',
+        notes        TEXT          NOT NULL DEFAULT '',
+        active       BOOLEAN       NOT NULL DEFAULT true,
+        expires_at   DATE,
+        max_uses     INT,
+        created_by   TEXT          NOT NULL DEFAULT '',
+        created_at   TIMESTAMPTZ   NOT NULL DEFAULT now(),
+        updated_at   TIMESTAMPTZ   NOT NULL DEFAULT now()
+      )
+    `);
   } catch (e) {
     console.warn("[schema] demo_requests table step skipped:", e?.message || e);
   }

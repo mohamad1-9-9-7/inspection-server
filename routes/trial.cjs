@@ -33,6 +33,7 @@
 const { sendPlatformMail } = require("./mailer.cjs");
 const { eraseCompany } = require("../utils/deleteCompany.cjs");
 const { normalizeMobile } = require("../utils/phone.cjs");
+const { findUsablePromo } = require("./promoCodes.cjs");
 
 const TRIAL_DAYS = 3;
 const TRIAL_GRACE_DAYS = 3;
@@ -105,6 +106,10 @@ module.exports = function registerTrialRoutes(app, deps = {}) {
         return res.status(409).json({ ok: false, error: "trial_used" });
       }
 
+      // Only a code that is usable right now is kept on the lead.
+      const promo = b.promoCode ? await findUsablePromo(pool, b.promoCode).catch(() => null) : null;
+      d.promoCode = promo ? promo.code : "";
+
       if (dailyCap) {
         const today = await pool.query(
           `SELECT COUNT(*)::int AS n FROM companies WHERE is_trial AND created_at > now() - interval '1 day'`
@@ -151,11 +156,11 @@ module.exports = function registerTrialRoutes(app, deps = {}) {
         [username, d.contactName, hash, salt, company.id]
       )).rows[0];
       await client.query(
-        `INSERT INTO demo_requests (status, company_name, activity, contact_name, phone, email, message, source, lang, ip)
-         VALUES ('trial', $1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+        `INSERT INTO demo_requests (status, company_name, activity, contact_name, phone, email, message, source, lang, ip, promo_code)
+         VALUES ('trial', $1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
         [d.companyName, d.sector, d.contactName, d.phone, d.email,
          `Started a ${TRIAL_DAYS}-day free trial — company #${company.id}, ends ${company.end_date}.`,
-         `trial${d.source ? `:${d.source}` : ""}`.slice(0, 60), d.lang, ipOf(req)]
+         `trial${d.source ? `:${d.source}` : ""}`.slice(0, 60), d.lang, ipOf(req), d.promoCode]
       );
       await client.query("COMMIT");
 
@@ -205,7 +210,7 @@ module.exports = function registerTrialRoutes(app, deps = {}) {
     if (!to) return;
     const lines = [
       ["Company", d.companyName], ["Business type", d.sector], ["Contact", d.contactName],
-      ["Phone", d.phone], ["E-mail", d.email], ["Source", d.source],
+      ["Phone", d.phone], ["E-mail", d.email], ["Source", d.source], ["Promo code", d.promoCode],
       ["Trial", `company #${company.id}, ends ${company.end_date}`],
     ].filter(([, v]) => v);
     sendPlatformMail({

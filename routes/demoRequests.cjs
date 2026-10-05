@@ -33,6 +33,7 @@
    the row is saved, so a mail problem never loses a lead.
 ============================================================ */
 const { sendPlatformMail } = require("./mailer.cjs");
+const { findUsablePromo } = require("./promoCodes.cjs");
 
 module.exports = function registerDemoRequestRoutes(app, deps = {}) {
   const { pool, requireAuthStrict, requireSuperAdmin, makeLimiter, clientIp } = deps;
@@ -180,7 +181,7 @@ module.exports = function registerDemoRequestRoutes(app, deps = {}) {
     const lines = [
       ["Company", d.companyName], ["Business type", d.activity], ["Branches", d.branches],
       ["Emirate", d.emirate], ["Contact", d.contactName + (d.jobTitle ? ` — ${d.jobTitle}` : "")],
-      ["Phone", d.phone], ["E-mail", d.email], ["Source", d.source], ["Referred by", d.referredBy],
+      ["Phone", d.phone], ["E-mail", d.email], ["Source", d.source], ["Referred by", d.referredBy], ["Promo code", d.promoCode],
       ["Readiness score", d.quizScore == null ? "" : `${d.quizScore} / 100`], ["Message", d.message],
     ].filter(([, v]) => v);
     const appUrl = String(process.env.APP_PUBLIC_URL || "").trim().replace(/\/$/, "");
@@ -222,10 +223,13 @@ module.exports = function registerDemoRequestRoutes(app, deps = {}) {
       const score = Number(body.quizScore);
       d.quizScore = Number.isInteger(score) && score >= 0 && score <= 100 ? score : null;
       const answers = d.quizScore == null ? null : cleanAnswers(body.quizAnswers);
+      // Only a code that is usable right now is kept (expired / off / used up = dropped).
+      const promo = body.promoCode ? await findUsablePromo(pool, body.promoCode).catch(() => null) : null;
+      d.promoCode = promo ? promo.code : "";
 
       const keys = Object.keys(FIELDS);
-      const cols = [...keys.map((k) => FIELDS[k][0]), "ip", "quiz_score", "quiz_answers"];
-      const vals = [...keys.map((k) => d[k]), clean(ipOf(req), 64), d.quizScore, answers ? JSON.stringify(answers) : null];
+      const cols = [...keys.map((k) => FIELDS[k][0]), "ip", "quiz_score", "quiz_answers", "promo_code"];
+      const vals = [...keys.map((k) => d[k]), clean(ipOf(req), 64), d.quizScore, answers ? JSON.stringify(answers) : null, d.promoCode];
       const { rows } = await pool.query(
         `INSERT INTO demo_requests (${cols.join(", ")})
          VALUES (${cols.map((_, i) => `$${i + 1}`).join(", ")})
