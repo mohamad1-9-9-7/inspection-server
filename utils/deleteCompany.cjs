@@ -7,7 +7,7 @@
    This function checks nothing about WHO asked: callers must.
 
    ONE transaction: every row goes, or none does. Order = children before
-   the company, whose FKs RESTRICT: report_audit, email_history, invoices,
+   the company, whose FKs RESTRICT: report_audit, email_history, payment_proofs, invoices,
    subscription, product_catalog, the accounts' activity_log and the
    accounts themselves, the reports (training_links / supplier_links
    cascade with them), the company's reference counters, then the company
@@ -40,6 +40,8 @@ async function eraseCompany(pool, id) {
     counts = (await client.query(DELETE_COUNTS_SQL, [id])).rows[0];
     await client.query(`DELETE FROM report_audit    WHERE company_id = $1`, [id]);
     await client.query(`DELETE FROM email_history   WHERE company_id = $1`, [id]);
+    // Payment receipts reference both the company (RESTRICT) and its invoices.
+    await client.query(`DELETE FROM payment_proofs  WHERE company_id = $1`, [id]);
     await client.query(`DELETE FROM invoices        WHERE company_id = $1`, [id]);
     await client.query(`DELETE FROM subscription    WHERE company_id = $1`, [id]);
     await client.query(`DELETE FROM product_catalog WHERE company_id = $1`, [id]);
