@@ -1028,6 +1028,30 @@ module.exports = async function ensureSchema({ pool, genSalt, hashPw }) {
     console.warn("[schema] subscription → companies step skipped:", e?.message || e);
   }
 
+  /* A promo code attached to a paying company, FROZEN at the moment it was
+     attached (later edits to the code never re-price an existing customer).
+     The discount runs for the first year only: promo_until is the last day
+     it applies. Own step: needs nothing but the companies table. */
+  try {
+    await pool.query(`ALTER TABLE companies ADD COLUMN IF NOT EXISTS promo_code   TEXT NOT NULL DEFAULT ''`);
+    await pool.query(`ALTER TABLE companies ADD COLUMN IF NOT EXISTS promo_kind   TEXT NOT NULL DEFAULT ''`);
+    await pool.query(`ALTER TABLE companies ADD COLUMN IF NOT EXISTS promo_amount NUMERIC(10,2)`);
+    await pool.query(`ALTER TABLE companies ADD COLUMN IF NOT EXISTS promo_until  DATE`);
+  } catch (e) {
+    console.warn("[schema] companies promo columns skipped:", e?.message || e);
+  }
+
+  /* Paying an invoice extends the company's subscription to the invoice's
+     period end. What the payment changed is kept on the invoice, so undoing
+     the payment ("it was not paid") can put the company back exactly. */
+  try {
+    await pool.query(`ALTER TABLE invoices ADD COLUMN IF NOT EXISTS extended_to       DATE`);
+    await pool.query(`ALTER TABLE invoices ADD COLUMN IF NOT EXISTS prev_company_end  DATE`);
+    await pool.query(`ALTER TABLE invoices ADD COLUMN IF NOT EXISTS prev_company_status TEXT`);
+  } catch (e) {
+    console.warn("[schema] invoices extension columns skipped:", e?.message || e);
+  }
+
   /* One-time move of the existing quotations out of `reports`. All or
      nothing in one transaction: the rows are copied, then deleted from
      `reports`, so a quotation can never exist in both places or in neither.

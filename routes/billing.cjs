@@ -141,7 +141,8 @@ app.get("/api/companies", strict, async (req, res) => {
       `SELECT c.*, p.name AS plan_name, ${PLAN_PRICE_SQL} AS plan_price, p.currency AS plan_currency,
               p.per_branch AS plan_per_branch, p.price AS plan_unit_price,
               to_char(c.start_date, 'YYYY-MM-DD') AS start_date,
-              to_char(c.end_date,   'YYYY-MM-DD') AS end_date
+              to_char(c.end_date,   'YYYY-MM-DD') AS end_date,
+              to_char(c.promo_until, 'YYYY-MM-DD') AS promo_until
          FROM companies c
          LEFT JOIN plans p ON p.id = c.plan_id
         ${seesAll ? "" : "WHERE c.id = $1"}
@@ -192,6 +193,10 @@ function companyInput(body) {
     // branches: the billable branch count (per-branch plans). Absent → keep.
     hasBranches: Object.prototype.hasOwnProperty.call(b, "branches"),
     branches: Number(b.branches),
+    // promo_code: absent → keep; "" → remove; a code → attach (see applyPromo).
+    hasPromo: Object.prototype.hasOwnProperty.call(b, "promo_code"),
+    promo_code: String(b.promo_code || "").trim().toUpperCase().replace(/\s+/g, ""),
+    promo_until: isoDate(b.promo_until),
   };
   let error = null;
   if (!out.name) error = "name_required";
@@ -202,14 +207,57 @@ function companyInput(body) {
   else if (out.logo_url && !/^https?:\/\//i.test(out.logo_url)) error = "logo_must_be_hosted_url";
   else if (out.module && !/^[a-z0-9][a-z0-9_-]{0,39}$/.test(out.module)) error = "module_invalid";
   else if (out.hasBranches && !(Number.isInteger(out.branches) && out.branches >= 1 && out.branches <= 999)) error = "branches_invalid";
+  else if (out.promo_code && !/^[A-Z0-9][A-Z0-9_-]{2,29}$/.test(out.promo_code)) error = "promo_not_found";
   return { input: out, error };
 }
+
+/* Attach / keep / remove the company's promo code. The discount is copied
+   from the code NOW and frozen on the company, for the first year only:
+   promo_until = start date (else today) + 1 year − 1 day, unless the owner
+   set another last day. The same code re-sent keeps what was frozen (only
+   its last day can move). Any existing code may be attached — an expiry or
+   use limit governs the public /demo page, not the owner's own books.
+   Returns an error code, or null. */
+async function applyPromo(db, companyId, c) {
+  if (!c.hasPromo) return null;
+  if (!c.promo_code) {
+    await db.query(
+      `UPDATE companies SET promo_code='', promo_kind='', promo_amount=NULL, promo_until=NULL WHERE id=$1`,
+      [companyId]
+    );
+    return null;
+  }
+  const cur = (await db.query(`SELECT promo_code FROM companies WHERE id=$1`, [companyId])).rows[0];
+  if (cur && cur.promo_code === c.promo_code) {
+    if (c.promo_until) await db.query(`UPDATE companies SET promo_until=$2 WHERE id=$1`, [companyId, c.promo_until]);
+    return null;
+  }
+  const p = (await db.query(`SELECT kind, amount FROM promo_codes WHERE code=$1`, [c.promo_code])).rows[0];
+  if (!p) return "promo_not_found";
+  await db.query(
+    `UPDATE companies
+        SET promo_code=$2, promo_kind=$3, promo_amount=$4,
+            promo_until=COALESCE($5::date, (COALESCE(start_date, CURRENT_DATE) + INTERVAL '1 year' - INTERVAL '1 day')::date)
+      WHERE id=$1`,
+    [companyId, c.promo_code, p.kind, p.amount, c.promo_until]
+  );
+  return null;
+}
+
+const COMPANY_OUT = `SELECT c.*, to_char(c.start_date, 'YYYY-MM-DD') AS start_date,
+                            to_char(c.end_date, 'YYYY-MM-DD') AS end_date,
+                            to_char(c.promo_until, 'YYYY-MM-DD') AS promo_until
+                       FROM companies c WHERE c.id = $1`;
 
 app.post("/api/companies", strict, superOnly, async (req, res) => {
   try {
     const { input: c, error } = companyInput(req.body);
     if (error) return res.status(400).json({ ok: false, error });
-    const q = await pool.query(
+    const db = await pool.connect();
+    let q;
+    try {
+    await db.query("BEGIN");
+    q = await db.query(
       `INSERT INTO companies (name, contact_name, contact_email, contact_phone, plan_id, status,
                               start_date, end_date, notes, industry, price, currency, logo_url, module, branches)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) RETURNING *`,
@@ -217,6 +265,16 @@ app.post("/api/companies", strict, superOnly, async (req, res) => {
        c.start_date, c.end_date, c.notes, c.industry || "meat", c.price, c.currency, c.logo_url,
        c.module || defaultModuleFor(c.industry || "meat"), c.hasBranches ? c.branches : 1]
     );
+    const promoErr = await applyPromo(db, q.rows[0].id, c);
+    if (promoErr) { await db.query("ROLLBACK"); return res.status(400).json({ ok: false, error: promoErr }); }
+    q = await db.query(COMPANY_OUT, [q.rows[0].id]);
+    await db.query("COMMIT");
+    } catch (e) {
+      await db.query("ROLLBACK").catch(() => {});
+      throw e;
+    } finally {
+      db.release();
+    }
     res.json({ ok: true, company: q.rows[0] });
   } catch (e) {
     if (e.code === "23503") return res.status(400).json({ ok: false, error: "plan_not_found" });
@@ -231,7 +289,11 @@ app.put("/api/companies/:id", strict, superOnly, async (req, res) => {
     if (error) return res.status(400).json({ ok: false, error });
     /* industry / price / currency omitted from the body → keep the stored
        value, so an older client that doesn't know a field can't wipe it. */
-    const q = await pool.query(
+    const db = await pool.connect();
+    let q;
+    try {
+    await db.query("BEGIN");
+    q = await db.query(
       `UPDATE companies SET name=$1, contact_name=$2, contact_email=$3, contact_phone=$4,
          plan_id=$5, status=$6, start_date=$7, end_date=$8, notes=$9,
          industry=COALESCE($10, industry),
@@ -247,7 +309,17 @@ app.put("/api/companies/:id", strict, superOnly, async (req, res) => {
        c.price, c.hasPrice, c.currency, c.hasCurrency, req.params.id, c.hasLogo, c.logo_url,
        c.hasModule, c.module, c.hasBranches, c.hasBranches ? c.branches : 1]
     );
-    if (!q.rowCount) return res.status(404).json({ ok: false, error: "not_found" });
+    if (!q.rowCount) { await db.query("ROLLBACK"); return res.status(404).json({ ok: false, error: "not_found" }); }
+    const promoErr = await applyPromo(db, q.rows[0].id, c);
+    if (promoErr) { await db.query("ROLLBACK"); return res.status(400).json({ ok: false, error: promoErr }); }
+    q = await db.query(COMPANY_OUT, [q.rows[0].id]);
+    await db.query("COMMIT");
+    } catch (e) {
+      await db.query("ROLLBACK").catch(() => {});
+      throw e;
+    } finally {
+      db.release();
+    }
     res.json({ ok: true, company: q.rows[0] });
   } catch (e) {
     if (e.code === "23503") return res.status(400).json({ ok: false, error: "plan_not_found" });
@@ -574,6 +646,8 @@ const INVOICE_SELECT = `
          to_char(i.paid_at,      'YYYY-MM-DD') AS paid_at,
          to_char(i.period_start, 'YYYY-MM-DD') AS period_start,
          to_char(i.period_end,   'YYYY-MM-DD') AS period_end,
+         to_char(i.extended_to,  'YYYY-MM-DD') AS extended_to,
+         to_char(i.prev_company_end, 'YYYY-MM-DD') AS prev_company_end,
          CASE WHEN i.status = 'unpaid' AND i.due_date IS NOT NULL AND i.due_date < CURRENT_DATE
               THEN 'overdue' ELSE i.status END AS display_status
     FROM invoices i`;
@@ -608,7 +682,9 @@ function sellerSnapshot(p) {
   };
 }
 
-/* Lines as sent, cleaned; null when any line is unusable. */
+/* Lines as sent, cleaned; null when any line is unusable. A line may carry a
+   negative price — a discount (the company's promo code, a goodwill credit)
+   printed as its own line — but the lines together never go below zero. */
 function cleanLines(raw) {
   if (!Array.isArray(raw)) return null;
   if (raw.length < 1 || raw.length > 50) return null;
@@ -617,9 +693,10 @@ function cleanLines(raw) {
     const description = String(l?.description || "").trim().slice(0, 300);
     const qty = Number(l?.qty);
     const unit_price = Number(l?.unit_price);
-    if (!description || !(qty > 0) || !(unit_price >= 0)) return null;
+    if (!description || !(qty > 0) || !Number.isFinite(unit_price)) return null;
     out.push({ description, qty: round2(qty), unit_price: round2(unit_price), total: round2(qty * unit_price) });
   }
+  if (out.reduce((sum, l) => sum + l.total, 0) < 0) return null;
   return out;
 }
 
@@ -751,6 +828,47 @@ app.post("/api/invoices", strict, superOnly, async (req, res) => {
   }
 });
 
+/* Paying an invoice keeps the company's subscription running to the end of
+   the period it paid for: end_date moves to the invoice's period_end when
+   that is later, and a company on trial / expired becomes active. Nothing
+   moves backwards, and an invoice with no period (a setup fee, a one-off
+   service) changes nothing. What changed is written on the invoice so an
+   undo can restore it. Returns { from, to, status } or null. */
+async function extendForPayment(db, invoiceId, inv) {
+  if (!inv.company_id || !inv.period_end) return null;
+  const c = (await db.query(
+    `SELECT to_char(end_date, 'YYYY-MM-DD') AS end_date, status FROM companies WHERE id = $1 FOR UPDATE`,
+    [inv.company_id]
+  )).rows[0];
+  if (!c || (c.end_date && c.end_date >= inv.period_end)) return null;
+  const status = ["trial", "expired"].includes(c.status) ? "active" : c.status;
+  await db.query(`UPDATE companies SET end_date=$2, status=$3, updated_at=now() WHERE id=$1`,
+    [inv.company_id, inv.period_end, status]);
+  await db.query(
+    `UPDATE invoices SET extended_to=$2, prev_company_end=$3, prev_company_status=$4 WHERE id=$1`,
+    [invoiceId, inv.period_end, c.end_date || null, c.status]
+  );
+  return { from: c.end_date || null, to: inv.period_end, status };
+}
+
+/* "It was not paid": put the company back as it was before this payment —
+   but only while its end date is still the one this payment set. If a
+   later payment (or the owner by hand) has moved it since, it is left
+   alone. Returns { from, to, status } or null. */
+async function undoPaymentExtension(db, invoiceId, inv) {
+  if (!inv.company_id || !inv.extended_to) return null;
+  await db.query(`UPDATE invoices SET extended_to=NULL, prev_company_end=NULL, prev_company_status=NULL WHERE id=$1`, [invoiceId]);
+  const c = (await db.query(
+    `SELECT to_char(end_date, 'YYYY-MM-DD') AS end_date, status FROM companies WHERE id = $1 FOR UPDATE`,
+    [inv.company_id]
+  )).rows[0];
+  if (!c || c.end_date !== inv.extended_to) return null;
+  const status = inv.prev_company_status || c.status;
+  await db.query(`UPDATE companies SET end_date=$2, status=$3, updated_at=now() WHERE id=$1`,
+    [inv.company_id, inv.prev_company_end || null, status]);
+  return { from: inv.extended_to, to: inv.prev_company_end || null, status };
+}
+
 /* PATCH /api/invoices/:id — payment state only.
    { action: "mark_paid", paid_at?, payment_ref? } | { action: "mark_unpaid" }
    | { action: "void", reason } */
@@ -758,21 +876,42 @@ app.patch("/api/invoices/:id", strict, superOnly, async (req, res) => {
   try {
     const id = parseInt(req.params.id, 10);
     if (!Number.isInteger(id) || id <= 0) return res.status(400).json({ ok: false, error: "bad_id" });
-    const cur = (await pool.query(`SELECT status, issue_date FROM invoices WHERE id = $1`, [id])).rows[0];
+    const cur = (await pool.query(
+      `SELECT status, issue_date, company_id, to_char(period_end, 'YYYY-MM-DD') AS period_end,
+              to_char(extended_to, 'YYYY-MM-DD') AS extended_to,
+              to_char(prev_company_end, 'YYYY-MM-DD') AS prev_company_end, prev_company_status
+         FROM invoices WHERE id = $1`, [id])).rows[0];
     if (!cur) return res.status(404).json({ ok: false, error: "not_found" });
     const b = req.body || {};
 
     let sql;
     let params;
-    if (b.action === "mark_paid") {
-      if (cur.status !== "unpaid") return res.status(409).json({ ok: false, error: "not_unpaid" });
-      const paidAt = asDate(b.paid_at) || new Date().toISOString().slice(0, 10);
-      sql = `UPDATE invoices SET status='paid', paid_at=$2, payment_ref=$3 WHERE id=$1`;
-      params = [id, paidAt, String(b.payment_ref || "").slice(0, 120)];
-    } else if (b.action === "mark_unpaid") {
-      if (cur.status !== "paid") return res.status(409).json({ ok: false, error: "not_paid" });
-      sql = `UPDATE invoices SET status='unpaid', paid_at=NULL, payment_ref='' WHERE id=$1`;
-      params = [id];
+    if (b.action === "mark_paid" || b.action === "mark_unpaid") {
+      const paying = b.action === "mark_paid";
+      if (paying && cur.status !== "unpaid") return res.status(409).json({ ok: false, error: "not_unpaid" });
+      if (!paying && cur.status !== "paid") return res.status(409).json({ ok: false, error: "not_paid" });
+      const db = await pool.connect();
+      let extension = null;
+      try {
+        await db.query("BEGIN");
+        if (paying) {
+          const paidAt = asDate(b.paid_at) || new Date().toISOString().slice(0, 10);
+          await db.query(`UPDATE invoices SET status='paid', paid_at=$2, payment_ref=$3 WHERE id=$1`,
+            [id, paidAt, String(b.payment_ref || "").slice(0, 120)]);
+          extension = await extendForPayment(db, id, cur);
+        } else {
+          await db.query(`UPDATE invoices SET status='unpaid', paid_at=NULL, payment_ref='' WHERE id=$1`, [id]);
+          extension = await undoPaymentExtension(db, id, cur);
+        }
+        await db.query("COMMIT");
+      } catch (e) {
+        await db.query("ROLLBACK").catch(() => {});
+        throw e;
+      } finally {
+        db.release();
+      }
+      const out = await pool.query(`${INVOICE_SELECT} WHERE i.id = $1`, [id]);
+      return res.json({ ok: true, invoice: out.rows[0], company: extension });
     } else if (b.action === "void") {
       if (cur.status !== "unpaid") return res.status(409).json({ ok: false, error: "only_unpaid_can_be_voided" });
       const reason = String(b.reason || "").trim().slice(0, 500);
