@@ -1052,6 +1052,80 @@ module.exports = async function ensureSchema({ pool, genSalt, hashPw }) {
     console.warn("[schema] invoices extension columns skipped:", e?.message || e);
   }
 
+  /* Rate lock (routes/myBilling.cjs): a customer near the end of its promo
+     year asks for a yearly invoice at today's discounted rate. kind marks
+     that invoice; paying it carries the promo on (utils/billingPayments.cjs),
+     and what it moved is kept so an undo restores it. */
+  try {
+    await pool.query(`ALTER TABLE invoices ADD COLUMN IF NOT EXISTS kind              TEXT NOT NULL DEFAULT ''`);
+    await pool.query(`ALTER TABLE invoices ADD COLUMN IF NOT EXISTS promo_extended_to DATE`);
+    await pool.query(`ALTER TABLE invoices ADD COLUMN IF NOT EXISTS prev_promo_until  DATE`);
+  } catch (e) {
+    console.warn("[schema] invoices rate-lock columns skipped:", e?.message || e);
+  }
+
+  /* Payment proofs: a company admin uploads the bank-transfer receipt for an
+     unpaid invoice from inside the app (/my-billing); the owner accepts it
+     (= the invoice is paid) or rejects it with a reason. The browser's OCR
+     reading is kept beside what the customer typed, so the owner sees both. */
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS payment_proofs (
+        id            SERIAL        PRIMARY KEY,
+        company_id    INT           NOT NULL REFERENCES companies(id) ON DELETE RESTRICT,
+        invoice_id    INT           NOT NULL REFERENCES invoices(id) ON DELETE CASCADE,
+        image_url     TEXT          NOT NULL,
+        amount        NUMERIC(14,2),
+        reference     TEXT          NOT NULL DEFAULT '',
+        paid_on       DATE,
+        note          TEXT          NOT NULL DEFAULT '',
+        ocr           JSONB         NOT NULL DEFAULT '{}'::jsonb,
+        status        TEXT          NOT NULL DEFAULT 'pending',
+        reject_reason TEXT          NOT NULL DEFAULT '',
+        submitted_by  TEXT          NOT NULL DEFAULT '',
+        reviewed_by   TEXT          NOT NULL DEFAULT '',
+        reviewed_at   TIMESTAMPTZ,
+        created_at    TIMESTAMPTZ   NOT NULL DEFAULT now()
+      )`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS ix_payment_proofs_status ON payment_proofs(status, created_at DESC)`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS ix_payment_proofs_invoice ON payment_proofs(invoice_id)`);
+  } catch (e) {
+    console.warn("[schema] payment_proofs step skipped:", e?.message || e);
+  }
+
+  /* Referrer portal (routes/promoCodes.cjs): each code holder gets a private
+     link showing what the code brought and the commission earned on it.
+     commission_pct of the paid invoices (before VAT) of the companies on the
+     code, for their first commission_months (NULL = always). Payouts are
+     what the owner has already paid the holder. Visits: /demo?code= landings
+     per code per day (a count only — no visitor data). */
+  try {
+    await pool.query(`ALTER TABLE promo_codes ADD COLUMN IF NOT EXISTS commission_pct    NUMERIC(5,2) NOT NULL DEFAULT 0`);
+    await pool.query(`ALTER TABLE promo_codes ADD COLUMN IF NOT EXISTS commission_months INT DEFAULT 12`);
+    await pool.query(`ALTER TABLE promo_codes ADD COLUMN IF NOT EXISTS portal_token      TEXT`);
+    await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS ux_promo_codes_portal_token ON promo_codes(portal_token) WHERE portal_token IS NOT NULL`);
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS promo_payouts (
+        id            SERIAL        PRIMARY KEY,
+        promo_code_id INT           NOT NULL REFERENCES promo_codes(id) ON DELETE CASCADE,
+        amount        NUMERIC(14,2) NOT NULL,
+        currency      TEXT          NOT NULL DEFAULT 'AED',
+        paid_on       DATE          NOT NULL,
+        note          TEXT          NOT NULL DEFAULT '',
+        created_by    TEXT          NOT NULL DEFAULT '',
+        created_at    TIMESTAMPTZ   NOT NULL DEFAULT now()
+      )`);
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS promo_code_visits (
+        code  TEXT NOT NULL,
+        day   DATE NOT NULL,
+        n     INT  NOT NULL DEFAULT 0,
+        PRIMARY KEY (code, day)
+      )`);
+  } catch (e) {
+    console.warn("[schema] referrer portal step skipped:", e?.message || e);
+  }
+
   /* One-time move of the existing quotations out of `reports`. All or
      nothing in one transaction: the rows are copied, then deleted from
      `reports`, so a quotation can never exist in both places or in neither.

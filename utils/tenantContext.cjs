@@ -39,4 +39,13 @@ function tenantMiddleware(req, _res, next) {
   return als.run({ companyId: id }, next);
 }
 
-module.exports = { tenantMiddleware, currentTenant, tenantRlsEnabled: enabled };
+/** Run `fn` as the platform (no tenant confinement). ONLY for server-owned
+    work a company request triggers but that must see platform-wide rows —
+    e.g. issuing an invoice, whose number is unique across ALL companies
+    (routes/myBilling.cjs). The caller has already checked the company; no
+    request input may choose what runs here. */
+function runAsPlatform(fn) {
+  return als.run({ companyId: null }, fn);
+}
+
+module.exports = { tenantMiddleware, currentTenant, runAsPlatform, tenantRlsEnabled: enabled };

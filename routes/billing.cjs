@@ -2,6 +2,7 @@ module.exports = function registerBillingRoutes(app, deps = {}) {
   const { pool, requireAuthStrict, requireSuperAdmin, verifyToken, tokenFromReq } = deps;
 
   const { markCompanyDisabled } = require("../utils/companyGate.cjs");
+  const { markInvoicePaid, markInvoiceUnpaid, inTransaction } = require("../utils/billingPayments.cjs");
   const noGate = (_req, _res, next) => next();
   const strict = typeof requireAuthStrict === "function" ? requireAuthStrict : noGate;
 
@@ -737,196 +738,157 @@ app.get("/api/invoices/:id", strict, superOnly, async (req, res) => {
   }
 });
 
+/* Issue one invoice — used by the owner's POST /api/invoices and by a
+   customer's rate lock (routes/myBilling.cjs). The server prices nothing
+   it is not told to, except when `lines` is absent: then one line, the
+   company's subscription at its effective price.
+   Throws { status, code } on a refusal. Returns the invoice row. */
+const refusal = (status, code) => Object.assign(new Error(code), { status, code });
+
+async function issueInvoice({ companyId, issueDate: issueIn, periodStart: startIn, periodEnd: endIn, lines: rawLines,
+  vatPct: vatIn, notes, createdBy, kind = "" }) {
+  if (!Number.isInteger(companyId) || companyId <= 0) throw refusal(400, "company_required");
+
+  const cq = await pool.query(
+    `SELECT c.*, p.name AS plan_name, ${PLAN_PRICE_SQL} AS plan_price, p.currency AS plan_currency,
+            p.per_branch AS plan_per_branch
+       FROM companies c LEFT JOIN plans p ON p.id = c.plan_id
+      WHERE c.id = $1`,
+    [companyId]
+  );
+  const company = cq.rows[0];
+  if (!company) throw refusal(400, "company_not_found");
+
+  const issueDate = asDate(issueIn) || new Date().toISOString().slice(0, 10);
+  const periodStart = asDate(startIn);
+  const periodEnd = asDate(endIn);
+  if (periodStart && periodEnd && periodEnd < periodStart) throw refusal(400, "period_invalid");
+
+  const profile = (await pool.query(`SELECT * FROM billing_profile ORDER BY id ASC LIMIT 1`)).rows[0] || {};
+  const seller = sellerSnapshot(profile);
+
+  const price = company.price != null ? Number(company.price) : Number(company.plan_price || 0);
+  const currency = company.currency || company.plan_currency || "AED";
+  let lines;
+  if (rawLines === undefined || rawLines === null) {
+    // The period is printed in the header; the line just names what is billed.
+    // A per-branch plan (no custom price) bills one line per branch.
+    const qty = company.price == null && company.plan_per_branch ? Math.max(1, Number(company.branches) || 1) : 1;
+    lines = [{
+      description: `Subscription — ${company.plan_name || "custom"} plan${qty > 1 ? " (per branch)" : ""}`,
+      qty, unit_price: round2(price / qty), total: round2(price),
+    }];
+  } else {
+    lines = cleanLines(rawLines);
+    if (!lines) throw refusal(400, "lines_invalid");
+  }
+
+  const vatPct = seller.vat_registered ? Math.min(Math.max(Number(vatIn ?? 5) || 0, 0), 100) : 0;
+  const subtotal = round2(lines.reduce((s, l) => s + l.total, 0));
+  const vatAmount = round2((subtotal * vatPct) / 100);
+  const total = round2(subtotal + vatAmount);
+  const dueDate = addDays(issueDate, profile.payment_terms_days ?? 14);
+  const accounts = (await pool.query(
+    `SELECT COUNT(*)::int AS n FROM app_users WHERE company_id = $1 AND is_active = true`, [companyId]
+  ).catch(() => ({ rows: [{ n: 0 }] }))).rows[0].n;
+
+  /* Numbering races: the loser takes the next free number. */
+  let number = await nextInvoiceNumber(pool, issueDate);
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    try {
+      const q = await pool.query(
+        `INSERT INTO invoices (
+           invoice_number, issue_date, period_start, period_end,
+           company_name, company_address, tax_id,
+           plan_name, accounts_count, branches_count, max_branches, max_users,
+           amount, currency, notes, created_by,
+           company_id, status, title, due_date, subtotal, vat_pct, vat_amount,
+           lines, seller, buyer_contact, buyer_email, kind
+         ) VALUES (
+           $1,$2,$3,$4,$5,'','', $6,$7,$24,$8,$9, $10,$11,$12,$13,
+           $14,'unpaid',$15,$16,$17,$18,$19,$20,$21,$22,$23,$25
+         ) RETURNING id`,
+        [
+          number, issueDate, periodStart, periodEnd, company.name,
+          company.plan_name || "", accounts, null, null, // plan limits retired
+          total, currency, String(notes || "").slice(0, 2000), String(createdBy || "admin"),
+          companyId, seller.vat_registered ? "Tax Invoice" : "Invoice", dueDate, subtotal, vatPct, vatAmount,
+          JSON.stringify(lines), JSON.stringify(seller), company.contact_name || "", company.contact_email || "",
+          Math.max(1, Number(company.branches) || 1), String(kind || ""),
+        ]
+      );
+      const out = await pool.query(`${INVOICE_SELECT} WHERE i.id = $1`, [q.rows[0].id]);
+      return out.rows[0];
+    } catch (e) {
+      if (e.code !== "23505") throw e;
+      number = await nextInvoiceNumber(pool, issueDate);
+    }
+  }
+  throw refusal(409, "number_taken");
+}
+
 /* POST /api/invoices
    { company_id, issue_date?, period_start?, period_end?, lines?, vat_pct?, notes? }
    No lines → one line: the company's subscription at its effective price. */
 app.post("/api/invoices", strict, superOnly, async (req, res) => {
   try {
     const b = req.body || {};
-    const companyId = Number(b.company_id);
-    if (!Number.isInteger(companyId) || companyId <= 0) return res.status(400).json({ ok: false, error: "company_required" });
-
-    const cq = await pool.query(
-      `SELECT c.*, p.name AS plan_name, ${PLAN_PRICE_SQL} AS plan_price, p.currency AS plan_currency,
-              p.per_branch AS plan_per_branch
-         FROM companies c LEFT JOIN plans p ON p.id = c.plan_id
-        WHERE c.id = $1`,
-      [companyId]
-    );
-    const company = cq.rows[0];
-    if (!company) return res.status(400).json({ ok: false, error: "company_not_found" });
-
-    const issueDate = asDate(b.issue_date) || new Date().toISOString().slice(0, 10);
-    const periodStart = asDate(b.period_start);
-    const periodEnd = asDate(b.period_end);
-    if (periodStart && periodEnd && periodEnd < periodStart) return res.status(400).json({ ok: false, error: "period_invalid" });
-
-    const profile = (await pool.query(`SELECT * FROM billing_profile ORDER BY id ASC LIMIT 1`)).rows[0] || {};
-    const seller = sellerSnapshot(profile);
-
-    const price = company.price != null ? Number(company.price) : Number(company.plan_price || 0);
-    const currency = company.currency || company.plan_currency || "AED";
-    let lines;
-    if (b.lines === undefined || b.lines === null) {
-      // The period is printed in the header; the line just names what is billed.
-      // A per-branch plan (no custom price) bills one line per branch.
-      const qty = company.price == null && company.plan_per_branch ? Math.max(1, Number(company.branches) || 1) : 1;
-      lines = [{
-        description: `Subscription — ${company.plan_name || "custom"} plan${qty > 1 ? " (per branch)" : ""}`,
-        qty, unit_price: round2(price / qty), total: round2(price),
-      }];
-    } else {
-      lines = cleanLines(b.lines);
-      if (!lines) return res.status(400).json({ ok: false, error: "lines_invalid" });
-    }
-
-    const vatPct = seller.vat_registered ? Math.min(Math.max(Number(b.vat_pct ?? 5) || 0, 0), 100) : 0;
-    const subtotal = round2(lines.reduce((s, l) => s + l.total, 0));
-    const vatAmount = round2((subtotal * vatPct) / 100);
-    const total = round2(subtotal + vatAmount);
-    const dueDate = addDays(issueDate, profile.payment_terms_days ?? 14);
-    const accounts = (await pool.query(
-      `SELECT COUNT(*)::int AS n FROM app_users WHERE company_id = $1 AND is_active = true`, [companyId]
-    ).catch(() => ({ rows: [{ n: 0 }] }))).rows[0].n;
-
-    /* Numbering races: the loser takes the next free number. */
-    let number = await nextInvoiceNumber(pool, issueDate);
-    for (let attempt = 0; attempt < 5; attempt += 1) {
-      try {
-        const q = await pool.query(
-          `INSERT INTO invoices (
-             invoice_number, issue_date, period_start, period_end,
-             company_name, company_address, tax_id,
-             plan_name, accounts_count, branches_count, max_branches, max_users,
-             amount, currency, notes, created_by,
-             company_id, status, title, due_date, subtotal, vat_pct, vat_amount,
-             lines, seller, buyer_contact, buyer_email
-           ) VALUES (
-             $1,$2,$3,$4,$5,'','', $6,$7,$24,$8,$9, $10,$11,$12,$13,
-             $14,'unpaid',$15,$16,$17,$18,$19,$20,$21,$22,$23
-           ) RETURNING id`,
-          [
-            number, issueDate, periodStart, periodEnd, company.name,
-            company.plan_name || "", accounts, null, null, // plan limits retired
-            total, currency, String(b.notes || "").slice(0, 2000), String(req.user?.username || "admin"),
-            companyId, seller.vat_registered ? "Tax Invoice" : "Invoice", dueDate, subtotal, vatPct, vatAmount,
-            JSON.stringify(lines), JSON.stringify(seller), company.contact_name || "", company.contact_email || "",
-            Math.max(1, Number(company.branches) || 1),
-          ]
-        );
-        const out = await pool.query(`${INVOICE_SELECT} WHERE i.id = $1`, [q.rows[0].id]);
-        return res.json({ ok: true, invoice: out.rows[0] });
-      } catch (e) {
-        if (e.code !== "23505") throw e;
-        number = await nextInvoiceNumber(pool, issueDate);
-      }
-    }
-    return res.status(409).json({ ok: false, error: "number_taken" });
+    const invoice = await issueInvoice({
+      companyId: Number(b.company_id), issueDate: b.issue_date, periodStart: b.period_start, periodEnd: b.period_end,
+      lines: b.lines, vatPct: b.vat_pct, notes: b.notes, createdBy: req.user?.username,
+    });
+    res.json({ ok: true, invoice });
   } catch (e) {
+    if (e.status) return res.status(e.status).json({ ok: false, error: e.code });
     console.error("POST /api/invoices ERROR:", e);
     res.status(500).json({ ok: false, error: "server_error" });
   }
 });
 
-/* Paying an invoice keeps the company's subscription running to the end of
-   the period it paid for: end_date moves to the invoice's period_end when
-   that is later, and a company on trial / expired becomes active. Nothing
-   moves backwards, and an invoice with no period (a setup fee, a one-off
-   service) changes nothing. What changed is written on the invoice so an
-   undo can restore it. Returns { from, to, status } or null. */
-async function extendForPayment(db, invoiceId, inv) {
-  if (!inv.company_id || !inv.period_end) return null;
-  const c = (await db.query(
-    `SELECT to_char(end_date, 'YYYY-MM-DD') AS end_date, status FROM companies WHERE id = $1 FOR UPDATE`,
-    [inv.company_id]
-  )).rows[0];
-  if (!c || (c.end_date && c.end_date >= inv.period_end)) return null;
-  const status = ["trial", "expired"].includes(c.status) ? "active" : c.status;
-  await db.query(`UPDATE companies SET end_date=$2, status=$3, updated_at=now() WHERE id=$1`,
-    [inv.company_id, inv.period_end, status]);
-  await db.query(
-    `UPDATE invoices SET extended_to=$2, prev_company_end=$3, prev_company_status=$4 WHERE id=$1`,
-    [invoiceId, inv.period_end, c.end_date || null, c.status]
-  );
-  return { from: c.end_date || null, to: inv.period_end, status };
-}
-
-/* "It was not paid": put the company back as it was before this payment —
-   but only while its end date is still the one this payment set. If a
-   later payment (or the owner by hand) has moved it since, it is left
-   alone. Returns { from, to, status } or null. */
-async function undoPaymentExtension(db, invoiceId, inv) {
-  if (!inv.company_id || !inv.extended_to) return null;
-  await db.query(`UPDATE invoices SET extended_to=NULL, prev_company_end=NULL, prev_company_status=NULL WHERE id=$1`, [invoiceId]);
-  const c = (await db.query(
-    `SELECT to_char(end_date, 'YYYY-MM-DD') AS end_date, status FROM companies WHERE id = $1 FOR UPDATE`,
-    [inv.company_id]
-  )).rows[0];
-  if (!c || c.end_date !== inv.extended_to) return null;
-  const status = inv.prev_company_status || c.status;
-  await db.query(`UPDATE companies SET end_date=$2, status=$3, updated_at=now() WHERE id=$1`,
-    [inv.company_id, inv.prev_company_end || null, status]);
-  return { from: inv.extended_to, to: inv.prev_company_end || null, status };
-}
-
 /* PATCH /api/invoices/:id — payment state only.
    { action: "mark_paid", paid_at?, payment_ref? } | { action: "mark_unpaid" }
-   | { action: "void", reason } */
+   | { action: "void", reason }
+   Paying extends the company's subscription (utils/billingPayments.cjs);
+   the response's `company` says what moved, or null. */
 app.patch("/api/invoices/:id", strict, superOnly, async (req, res) => {
   try {
     const id = parseInt(req.params.id, 10);
     if (!Number.isInteger(id) || id <= 0) return res.status(400).json({ ok: false, error: "bad_id" });
-    const cur = (await pool.query(
-      `SELECT status, issue_date, company_id, to_char(period_end, 'YYYY-MM-DD') AS period_end,
-              to_char(extended_to, 'YYYY-MM-DD') AS extended_to,
-              to_char(prev_company_end, 'YYYY-MM-DD') AS prev_company_end, prev_company_status
-         FROM invoices WHERE id = $1`, [id])).rows[0];
-    if (!cur) return res.status(404).json({ ok: false, error: "not_found" });
     const b = req.body || {};
 
-    let sql;
-    let params;
     if (b.action === "mark_paid" || b.action === "mark_unpaid") {
-      const paying = b.action === "mark_paid";
-      if (paying && cur.status !== "unpaid") return res.status(409).json({ ok: false, error: "not_unpaid" });
-      if (!paying && cur.status !== "paid") return res.status(409).json({ ok: false, error: "not_paid" });
-      const db = await pool.connect();
-      let extension = null;
-      try {
-        await db.query("BEGIN");
-        if (paying) {
-          const paidAt = asDate(b.paid_at) || new Date().toISOString().slice(0, 10);
-          await db.query(`UPDATE invoices SET status='paid', paid_at=$2, payment_ref=$3 WHERE id=$1`,
-            [id, paidAt, String(b.payment_ref || "").slice(0, 120)]);
-          extension = await extendForPayment(db, id, cur);
-        } else {
-          await db.query(`UPDATE invoices SET status='unpaid', paid_at=NULL, payment_ref='' WHERE id=$1`, [id]);
-          extension = await undoPaymentExtension(db, id, cur);
-        }
-        await db.query("COMMIT");
-      } catch (e) {
-        await db.query("ROLLBACK").catch(() => {});
-        throw e;
-      } finally {
-        db.release();
-      }
+      const extension = await inTransaction(pool, (db) => (b.action === "mark_paid"
+        ? markInvoicePaid(db, id, { paidAt: b.paid_at, paymentRef: b.payment_ref })
+        : markInvoiceUnpaid(db, id)));
       const out = await pool.query(`${INVOICE_SELECT} WHERE i.id = $1`, [id]);
       return res.json({ ok: true, invoice: out.rows[0], company: extension });
-    } else if (b.action === "void") {
+    }
+    if (b.action === "void") {
+      const cur = (await pool.query(`SELECT status FROM invoices WHERE id = $1`, [id])).rows[0];
+      if (!cur) return res.status(404).json({ ok: false, error: "not_found" });
       if (cur.status !== "unpaid") return res.status(409).json({ ok: false, error: "only_unpaid_can_be_voided" });
       const reason = String(b.reason || "").trim().slice(0, 500);
       if (!reason) return res.status(400).json({ ok: false, error: "reason_required" });
-      sql = `UPDATE invoices SET status='void', void_reason=$2 WHERE id=$1`;
-      params = [id, reason];
-    } else {
-      return res.status(400).json({ ok: false, error: "unknown_action" });
+      await inTransaction(pool, async (db) => {
+        await db.query(`UPDATE invoices SET status='void', void_reason=$2 WHERE id=$1`, [id, reason]);
+        // Proofs sent against a voided invoice can no longer be accepted.
+        await db.query(
+          `UPDATE payment_proofs SET status='rejected', reject_reason='Invoice void', reviewed_by=$2, reviewed_at=now()
+            WHERE invoice_id=$1 AND status='pending'`,
+          [id, String(req.user?.username || "")]
+        );
+      });
+      const out = await pool.query(`${INVOICE_SELECT} WHERE i.id = $1`, [id]);
+      return res.json({ ok: true, invoice: out.rows[0] });
     }
-    await pool.query(sql, params);
-    const out = await pool.query(`${INVOICE_SELECT} WHERE i.id = $1`, [id]);
-    res.json({ ok: true, invoice: out.rows[0] });
+    return res.status(400).json({ ok: false, error: "unknown_action" });
   } catch (e) {
+    if (e.status) return res.status(e.status).json({ ok: false, error: e.code });
     console.error("PATCH /api/invoices/:id ERROR:", e);
     res.status(500).json({ ok: false, error: "server_error" });
   }
 });
+
+/* For routes/myBilling.cjs (registered right after this file). */
+return { issueInvoice, INVOICE_SELECT, PLAN_PRICE_SQL, EFFECTIVE_STATUS_SQL, round2, addDays };
 };

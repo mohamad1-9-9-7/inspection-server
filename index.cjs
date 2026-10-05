@@ -29,6 +29,7 @@ const registerAuditRoutes = require("./routes/audit.cjs");
 const registerDemoRequestRoutes = require("./routes/demoRequests.cjs");
 const registerTrialRoutes = require("./routes/trial.cjs");
 const registerPromoCodeRoutes = require("./routes/promoCodes.cjs");
+const registerMyBillingRoutes = require("./routes/myBilling.cjs");
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -175,7 +176,8 @@ registerCatalogRoutes(app, deps);
    routes/trainingSessions.cjs, which grades on the server. */
 registerMediaRoutes(app, deps);
 registerAdminRoutes(app, deps);
-registerBillingRoutes(app, deps);
+// The billing file hands back its invoice helpers for the in-app billing routes.
+const billing = registerBillingRoutes(app, deps);
 registerQuotationRoutes(app, deps);
 registerEmailHistoryRoutes(app, deps);
 registerMailerRoutes(app, deps);
@@ -183,6 +185,7 @@ registerAuditRoutes(app, deps);
 registerDemoRequestRoutes(app, deps);
 registerTrialRoutes(app, deps);
 registerPromoCodeRoutes(app, deps);
+registerMyBillingRoutes(app, { ...deps, billing });
 
 // Schema migrations are meant to be additive/idempotent, and every table
 // that matters has existed for a long time — one bad migration step should
