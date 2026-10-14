@@ -1022,6 +1022,59 @@ app.post("/api/reports/migrate-base64", authStrict, superOnly, async (req, res) 
   }
 });
 
+/* `GET /api/reports/kpi-days?types=a,b,c&from=YYYY-MM-DD&to=YYYY-MM-DD`
+   How many records each type has on each business day — counts only, no
+   payload. The KPI page's "did every branch file its daily logs" score used
+   to pull up to 5000 full records per type and count them in the browser;
+   this answers the same question in one grouped query of a few hundred rows.
+
+   The date is the same business date the report screens use (cutDate / date
+   / reportDate first), so a day counted here is the day the user sees. Types
+   and the window are both capped so the query stays small whatever is sent. */
+app.get("/api/reports/kpi-days", readLimiter, auth, async (req, res) => {
+  try {
+    const isDay = (v) => /^\d{4}-\d{2}-\d{2}$/.test(v);
+    const from = normText(req.query?.from || "");
+    const to = normText(req.query?.to || "");
+    if (!isDay(from) || !isDay(to) || from > to) {
+      return res.status(400).json({ ok: false, error: "from_to_required" });
+    }
+    if ((Date.parse(to) - Date.parse(from)) / 86_400_000 > 400) {
+      return res.status(400).json({ ok: false, error: "window_too_wide" });
+    }
+    const types = String(req.query?.types || "")
+      .split(",").map((t) => t.trim()).filter(Boolean).slice(0, 120);
+    if (!types.length) return res.json({ ok: true, data: [] });
+
+    // LEFT(…, 10) on every key: some forms keep a full ISO timestamp in
+    // payload.date (qcs_raw_material), which would neither group by day nor
+    // pass the `<= to` bound on the last day.
+    const DAY = `LEFT(COALESCE(
+        NULLIF(payload->>'cutDate', ''),
+        NULLIF(payload->>'date', ''),
+        NULLIF(payload->>'reportDate', ''),
+        NULLIF(payload#>>'{header,reportDate}', ''),
+        NULLIF(payload#>>'{header,date}', '')
+      ), 10)`;
+    const p = [types, from, to];
+    let where = `type = ANY($1) AND ${DAY} >= $2 AND ${DAY} <= $3`;
+    const companyScope = companyIdOf(req);
+    if (companyScope != null) { p.push(companyScope); where += ` AND company_id = $${p.length}`; }
+
+    const { rows } = await pool.query(
+      `SELECT type, ${DAY} AS day, COUNT(*)::int AS n
+         FROM reports
+        WHERE ${where}
+        GROUP BY 1, 2`,
+      p
+    );
+    return res.json({ ok: true, data: rows });
+  } catch (e) {
+    console.error("GET /api/reports/kpi-days ERROR =", e);
+    return res.status(500).json({ ok: false, error: "kpi_days_failed" });
+  }
+});
+
 app.get("/api/reports/:id(\\d+)", auth, async (req, res) => {
   try {
     const id = Number(req.params.id);
