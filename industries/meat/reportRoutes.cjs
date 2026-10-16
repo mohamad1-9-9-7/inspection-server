@@ -354,6 +354,8 @@ async function mergeCoolerReading(req, b) {
       byName: b.byName,
       outOfRange: !!b.outOfRange,
       correctiveAction: b.correctiveAction || "",
+      // The exact line added to the unit's remarks — the sheet re-adds it from here.
+      remarkLine: b.remarkLine || "",
       photoUrl: b.photoUrl || "",
       recheckDue: b.recheckDue || "",
       replaced: b.kind === "reading" && !!b.replace,
