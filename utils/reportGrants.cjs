@@ -194,6 +194,7 @@ function reportGrantGate(pool) {
       let type = "";
       if (/^\d+$/.test(first)) type = await typeOfId(first);
       else if (first === "qcs-coolers") type = "qcs-coolers";            // POST /qcs-coolers/reading
+      else if (first === "branch-temp") type = String(req.body?.type || ""); // POST /branch-temp/reading
       else if (first) type = first;                                       // PUT /:type, /returns, /qcs
       else type = String(req.body?.type || req.query?.type || "");       // POST/PUT/DELETE /
       if (!type) return next();

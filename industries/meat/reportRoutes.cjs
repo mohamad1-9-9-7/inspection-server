@@ -443,4 +443,197 @@ app.post("/api/reports/qcs-coolers/reading", auth, async (req, res) => {
     return res.status(500).json({ ok: false, error: String(e?.message || e) });
   }
 });
+
+/* ============================================================
+   POST /api/reports/branch-temp/reading
+
+   Same idea as the QCS cooler reading above, for the branch temperature
+   sheets (QR sticker on each unit): one reading merged into that day's
+   record inside a transaction, so phones never overwrite each other.
+
+   Two record shapes exist today:
+   • "grid"  (POS 10 / 11 / 15) — payload.coolers[{ name, temps: { "8:00 AM": "3" }, remarks }]
+   • "pos19" (POS 19)           — payload.entries[{ equipment, unitType, am_time, am_temp, … }]
+   A unit is matched by NAME (case-insensitive); an unknown name is added
+   as a new row. Same readingId twice = no change. A filled slot answers
+   409 SLOT_FILLED unless replace=true. A recheck only adds to the log
+   and the remarks / corrective action.
+
+   body: { type, reportDate, unit, unitType?, slot, timeHM?, value, readingId,
+           kind, at, by, byName, outOfRange, correctiveAction,
+           remarkLine, photoUrl, recheckDue, replace, units? }
+   `units` (names, optional) seeds the rows when the day's record is created.
+============================================================ */
+const BRANCH_TEMP = {
+  pos10_temperature: { shape: "grid", branch: "POS 10", reporter: "pos10",
+    slots: ["8:00 AM", "11:00 AM", "2:00 PM", "5:00 PM", "8:00 PM", "10:00 PM"] },
+  pos11_temperature: { shape: "grid", branch: "POS 11", reporter: "pos11",
+    slots: ["8:00 AM", "12:00 PM", "4:00 PM", "8:00 PM"] },
+  pos15_temperature: { shape: "grid", branch: "POS 15", reporter: "pos15",
+    slots: ["8:00 AM", "11:00 AM", "2:00 PM", "5:00 PM", "8:00 PM", "10:00 PM"] },
+  pos19_temperature_monitoring: { shape: "pos19", branch: "POS 19", reporter: "pos19",
+    slots: ["am", "pm", "ev"] },
+};
+const POS19_TARGET = { chiller: "≤ 5°C", freezer: "≤ -18°C", ambient: "≤ 25°C" };
+const sameName = (a, b) => String(a || "").trim().toLowerCase() === String(b || "").trim().toLowerCase();
+const appendText = (prev, line) => (prev ? `${prev} | ${line}` : line);
+const emptyPos19Row = (name, unitType) => {
+  const ut = POS19_TARGET[unitType] ? unitType : "chiller";
+  return { equipment: name, unitType: ut, targetTemp: POS19_TARGET[ut], correctiveAction: "", checkedBy: "",
+    am_time: "", am_temp: "", pm_time: "", pm_temp: "", ev_time: "", ev_temp: "" };
+};
+
+async function mergeBranchReading(req, cfg, b) {
+  const companyId = companyIdForWrite(req);
+  const db = await pool.connect();
+  try {
+    await db.query("BEGIN");
+    const cur = await db.query(
+      `SELECT id, payload FROM reports
+        WHERE COALESCE(company_id, 1) = COALESCE($1::int, 1)
+          AND type = $2 AND payload->>'reportDate' = $3
+        ORDER BY id LIMIT 1
+        FOR UPDATE`,
+      [companyId, b.type, b.reportDate]
+    );
+    const row = cur.rows[0] || null;
+    const old = row?.payload || null;
+    const day = old ? JSON.parse(JSON.stringify(old)) : { branch: cfg.branch, reportDate: b.reportDate, date: b.reportDate };
+
+    const log = Array.isArray(day.quickReadings) ? day.quickReadings : [];
+    if (log.some((r) => r && r.id === b.readingId)) {
+      await db.query("ROLLBACK");
+      return { status: 200, json: { ok: true, duplicate: true, report: row } };
+    }
+
+    const valueStr = String(b.value);
+    const slotFilled = (prev) => ({ status: 409, json: { ok: false, error: "SLOT_FILLED", value: prev } });
+
+    if (cfg.shape === "grid") {
+      if (!old) {
+        day.coolers = b.units.map((name) => ({ name, temps: {}, remarks: "" }));
+        day.productVerifications = [];
+        day.times = [...cfg.slots, "Corrective Action"];
+        day.unique_key = `${b.type}_${b.reportDate}`;
+        day.checkedBy = "";
+        day.verifiedBy = "";
+      }
+      day.coolers = Array.isArray(day.coolers) ? day.coolers : [];
+      let unit = day.coolers.find((c) => c && sameName(c.name, b.unit));
+      if (!unit) { unit = { name: b.unit, temps: {}, remarks: "" }; day.coolers.push(unit); }
+      unit.temps = isObj(unit.temps) ? unit.temps : {};
+      if (b.kind === "reading") {
+        const prev = String(unit.temps[b.slot] ?? "").trim();
+        if (prev !== "" && !b.replace) { await db.query("ROLLBACK"); return slotFilled(prev); }
+        unit.temps[b.slot] = valueStr;
+      }
+      if (b.remarkLine) {
+        unit.remarks = appendText(String(unit.remarks || ""), b.remarkLine);
+        unit.temps["Corrective Action"] = unit.remarks; // the sheet keeps both in step
+      }
+    } else {
+      if (!old) {
+        day.entries = b.units.map((name) => emptyPos19Row(name, "chiller"));
+        day.classification = "Official";
+        day.section = "";
+        day.checkedBy = "";
+        day.verifiedBy = "";
+      }
+      day.entries = Array.isArray(day.entries) ? day.entries : [];
+      let unit = day.entries.find((e) => e && sameName(e.equipment, b.unit));
+      if (!unit) { unit = emptyPos19Row(b.unit, b.unitType); day.entries.push(unit); }
+      if (b.kind === "reading") {
+        const prev = String(unit[`${b.slot}_temp`] ?? "").trim();
+        if (prev !== "" && !b.replace) { await db.query("ROLLBACK"); return slotFilled(prev); }
+        unit[`${b.slot}_temp`] = valueStr;
+        unit[`${b.slot}_time`] = b.timeHM || "";
+        if (!unit.checkedBy && b.byName) unit.checkedBy = b.byName;
+      }
+      if (b.remarkLine) unit.correctiveAction = appendText(String(unit.correctiveAction || ""), b.remarkLine);
+    }
+
+    log.push({
+      id: b.readingId, unit: b.unit, slot: b.slot, value: b.value, kind: b.kind,
+      at: b.at, savedAt: new Date().toISOString(), by: b.by, byName: b.byName,
+      outOfRange: !!b.outOfRange, correctiveAction: b.correctiveAction || "",
+      remarkLine: b.remarkLine || "", photoUrl: b.photoUrl || "", recheckDue: b.recheckDue || "",
+      timeHM: b.timeHM || "", replaced: b.kind === "reading" && !!b.replace,
+    });
+    day.quickReadings = log;
+
+    let saved;
+    if (row) {
+      const upd = await db.query(
+        `UPDATE reports SET payload=${KEEP_REF("$1")}, updated_at=now() WHERE id=$2 RETURNING *`,
+        [JSON.stringify(day), row.id]
+      );
+      saved = upd.rows[0];
+    } else {
+      const stamped = await stampRef(db, b.type, day, companyId);
+      const ins = await db.query(
+        `INSERT INTO reports (reporter, type, payload, company_id) VALUES ($1, $2, $3::jsonb, $4) RETURNING *`,
+        [cfg.reporter, b.type, JSON.stringify(stamped), companyId]
+      );
+      saved = ins.rows[0];
+    }
+    await db.query("COMMIT");
+    if (row) auditWrite(req, { action: "update", reportId: saved.id, reportType: b.type, oldPayload: old, newPayload: saved.payload });
+    else auditCreate(req, saved);
+    return { status: row ? 200 : 201, json: { ok: true, report: saved } };
+  } catch (e) {
+    await db.query("ROLLBACK").catch(() => {});
+    throw e;
+  } finally {
+    db.release();
+  }
+}
+
+app.post("/api/reports/branch-temp/reading", auth, async (req, res) => {
+  try {
+    const x = req.body || {};
+    const type = String(x.type || "");
+    const cfg = BRANCH_TEMP[type];
+    if (!cfg) return res.status(400).json({ ok: false, error: "bad type" });
+    const value = Number(x.value);
+    const b = {
+      type,
+      reportDate: String(x.reportDate || ""),
+      unit: clip(x.unit, 80),
+      unitType: clip(x.unitType, 20),
+      slot: String(x.slot || ""),
+      timeHM: /^\d{1,2}:\d{2}$/.test(String(x.timeHM || "")) ? String(x.timeHM) : "",
+      value,
+      kind: x.kind === "recheck" ? "recheck" : "reading",
+      readingId: clip(x.readingId, 80),
+      at: clip(x.at, 40) || new Date().toISOString(),
+      by: clip(req.user?.username || x.by, 80),
+      byName: clip(x.byName, 120),
+      outOfRange: !!x.outOfRange,
+      correctiveAction: clip(x.correctiveAction, 300),
+      remarkLine: clip(x.remarkLine, 300),
+      photoUrl: /^https:\/\//.test(String(x.photoUrl || "")) ? clip(x.photoUrl, 500) : "",
+      recheckDue: clip(x.recheckDue, 40),
+      replace: x.replace === true,
+      units: Array.isArray(x.units) ? x.units.slice(0, 40).map((n) => clip(n, 80)).filter(Boolean) : [],
+    };
+    if (!DATE_RE.test(b.reportDate)) return res.status(400).json({ ok: false, error: "reportDate YYYY-MM-DD required" });
+    if (!b.unit) return res.status(400).json({ ok: false, error: "unit required" });
+    if (!cfg.slots.includes(b.slot)) return res.status(400).json({ ok: false, error: "bad slot" });
+    if (!Number.isFinite(value) || value < -60 || value > 80) return res.status(400).json({ ok: false, error: "bad value" });
+    if (!b.readingId) return res.status(400).json({ ok: false, error: "readingId required" });
+
+    let out;
+    try {
+      out = await mergeBranchReading(req, cfg, b);
+    } catch (e) {
+      // Two first readings of the day raced to INSERT: the loser merges into the winner.
+      if (e && e.code === "23505") out = await mergeBranchReading(req, cfg, b);
+      else throw e;
+    }
+    return res.status(out.status).json(out.json);
+  } catch (e) {
+    console.error("POST /api/reports/branch-temp/reading ERROR =", e);
+    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+  }
+});
 };
