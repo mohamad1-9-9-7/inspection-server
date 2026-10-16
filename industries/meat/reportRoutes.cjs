@@ -262,4 +262,183 @@ app.put("/api/reports/qcs", auth, async (req, res) => {
     return res.status(500).json({ ok: false, error: String(e?.message || e) });
   }
 });
+
+/* ============================================================
+   POST /api/reports/qcs-coolers/reading
+
+   قراءة حرارة وحدة من الموبايل (QR على البراد) — قراءة وحدة، مش الشيت كامل.
+
+   ليش مسار لحاله: سجل الحرارة بـQCS سجل واحد لليوم (8 برادات × الأوقات).
+   لو كل موبايل بعت الشيت كامل بـPUT، موظفين بيسجلوا برادين بنفس اللحظة
+   بيمسح واحد قراءة التاني. هون القراءة بتندمج بالسجل جوّا transaction
+   مع FOR UPDATE، فما بتضيع ولا قراءة.
+
+   body: { reportDate, unit: "cooler-N" | "loading-area", slot: "10:00 AM",
+           value, readingId, kind: "reading" | "recheck", at, by,
+           correctiveAction?, remarkLine?, photoUrl?, recheckDue?,
+           replace?, coolerDefs?, loadingDef? }
+
+   • نفس readingId مرتين (outbox بعتها تاني) = ولا تغيير.
+   • خانة الوقت معبّاية و replace مش true → 409 SLOT_FILLED.
+   • recheck ما بيلمس الخانة؛ بينزل بالملاحظات وبالسجل بس.
+============================================================ */
+const COOLERS_TYPE = "qcs-coolers";
+const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+const UNIT_RE = /^(cooler-(\d{1,2})|loading-area)$/;
+const SLOT_RE = /^\d{1,2}:00 (AM|PM)$/;
+const clip = (v, n) => String(v ?? "").trim().slice(0, n);
+
+async function mergeCoolerReading(req, b) {
+  const companyId = companyIdForWrite(req);
+  const db = await pool.connect();
+  try {
+    await db.query("BEGIN");
+    const cur = await db.query(
+      `SELECT id, payload FROM reports
+        WHERE COALESCE(company_id, 1) = COALESCE($1::int, 1)
+          AND type = $2 AND payload->>'reportDate' = $3
+        ORDER BY id LIMIT 1
+        FOR UPDATE`,
+      [companyId, COOLERS_TYPE, b.reportDate]
+    );
+    const row = cur.rows[0] || null;
+    const old = row?.payload || null;
+    const p = old ? JSON.parse(JSON.stringify(old)) : { reportDate: b.reportDate };
+
+    const log = Array.isArray(p.quickReadings) ? p.quickReadings : [];
+    if (log.some((r) => r && r.id === b.readingId)) {
+      await db.query("ROLLBACK");
+      return { status: 200, json: { ok: true, duplicate: true, report: row } };
+    }
+
+    // The limits in force today travel with the record, as the sheet does.
+    if (!p.coolerDefs && Array.isArray(b.coolerDefs)) p.coolerDefs = b.coolerDefs;
+    if (!p.loadingDef && isObj(b.loadingDef)) p.loadingDef = b.loadingDef;
+
+    let block;
+    if (b.unit === "loading-area") {
+      p.loadingArea = isObj(p.loadingArea) ? p.loadingArea : {};
+      block = p.loadingArea;
+    } else {
+      const i = Number(b.unit.split("-")[1]);
+      p.coolers = Array.isArray(p.coolers) ? p.coolers : [];
+      while (p.coolers.length <= i) p.coolers.push({ temps: {}, remarks: "" });
+      if (!isObj(p.coolers[i])) p.coolers[i] = { temps: {}, remarks: "" };
+      block = p.coolers[i];
+    }
+    block.temps = isObj(block.temps) ? block.temps : {};
+    if (typeof block.remarks !== "string") block.remarks = "";
+
+    const valueStr = String(b.value);
+    if (b.kind === "reading") {
+      const prev = String(block.temps[b.slot] ?? "").trim();
+      if (prev !== "" && !b.replace) {
+        await db.query("ROLLBACK");
+        return { status: 409, json: { ok: false, error: "SLOT_FILLED", value: prev } };
+      }
+      block.temps[b.slot] = valueStr;
+    }
+    if (b.remarkLine) {
+      block.remarks = block.remarks ? `${block.remarks} | ${b.remarkLine}` : b.remarkLine;
+    }
+
+    log.push({
+      id: b.readingId,
+      unit: b.unit,
+      slot: b.slot,
+      value: b.value,
+      kind: b.kind,
+      at: b.at,
+      savedAt: new Date().toISOString(),
+      by: b.by,
+      byName: b.byName,
+      outOfRange: !!b.outOfRange,
+      correctiveAction: b.correctiveAction || "",
+      photoUrl: b.photoUrl || "",
+      recheckDue: b.recheckDue || "",
+      replaced: b.kind === "reading" && !!b.replace,
+    });
+    p.quickReadings = log;
+
+    let saved;
+    if (row) {
+      const upd = await db.query(
+        `UPDATE reports SET payload=${KEEP_REF("$1")}, updated_at=now()
+          WHERE id=$2 RETURNING *`,
+        [JSON.stringify(p), row.id]
+      );
+      saved = upd.rows[0];
+    } else {
+      const stamped = await stampRef(db, COOLERS_TYPE, p, companyId);
+      const ins = await db.query(
+        `INSERT INTO reports (reporter, type, payload, company_id)
+         VALUES ($1, $2, $3::jsonb, $4) RETURNING *`,
+        ["QCS/COOLERS", COOLERS_TYPE, JSON.stringify(stamped), companyId]
+      );
+      saved = ins.rows[0];
+    }
+    await db.query("COMMIT");
+
+    if (row) {
+      auditWrite(req, {
+        action: "update", reportId: saved.id, reportType: COOLERS_TYPE,
+        oldPayload: old, newPayload: saved.payload,
+      });
+    } else {
+      auditCreate(req, saved);
+    }
+    return { status: row ? 200 : 201, json: { ok: true, report: saved } };
+  } catch (e) {
+    await db.query("ROLLBACK").catch(() => {});
+    throw e;
+  } finally {
+    db.release();
+  }
+}
+
+app.post("/api/reports/qcs-coolers/reading", auth, async (req, res) => {
+  try {
+    const x = req.body || {};
+    const unit = String(x.unit || "");
+    const um = unit.match(UNIT_RE);
+    const value = Number(x.value);
+    const b = {
+      reportDate: String(x.reportDate || ""),
+      unit,
+      slot: String(x.slot || ""),
+      value,
+      kind: x.kind === "recheck" ? "recheck" : "reading",
+      readingId: clip(x.readingId, 80),
+      at: clip(x.at, 40) || new Date().toISOString(),
+      by: clip(req.user?.username || x.by, 80),
+      byName: clip(x.byName, 120),
+      outOfRange: !!x.outOfRange,
+      correctiveAction: clip(x.correctiveAction, 300),
+      remarkLine: clip(x.remarkLine, 300),
+      photoUrl: /^https:\/\//.test(String(x.photoUrl || "")) ? clip(x.photoUrl, 500) : "",
+      recheckDue: clip(x.recheckDue, 40),
+      replace: x.replace === true,
+      coolerDefs: Array.isArray(x.coolerDefs) ? x.coolerDefs.slice(0, 20) : null,
+      loadingDef: isObj(x.loadingDef) ? x.loadingDef : null,
+    };
+    if (!DATE_RE.test(b.reportDate)) return res.status(400).json({ ok: false, error: "reportDate YYYY-MM-DD required" });
+    if (!um || (um[2] != null && Number(um[2]) > 19)) return res.status(400).json({ ok: false, error: "bad unit" });
+    if (!SLOT_RE.test(b.slot)) return res.status(400).json({ ok: false, error: "bad slot" });
+    if (!Number.isFinite(value) || value < -60 || value > 80) return res.status(400).json({ ok: false, error: "bad value" });
+    if (!b.readingId) return res.status(400).json({ ok: false, error: "readingId required" });
+
+    let out;
+    try {
+      out = await mergeCoolerReading(req, b);
+    } catch (e) {
+      // Two first readings of the day raced to INSERT: the loser merges into the winner.
+      if (e && e.code === "23505") out = await mergeCoolerReading(req, b);
+      else throw e;
+    }
+    return res.status(out.status).json(out.json);
+  } catch (e) {
+    console.error("POST /api/reports/qcs-coolers/reading ERROR =", e);
+    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+  }
+});
 };
