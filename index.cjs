@@ -144,6 +144,10 @@ app.use("/api/reports", (req, res, next) => {
   }
   return rejectBase64(req, res, next);
 });
+/* Per-report permissions (input / view per report of a branch), checked on
+   the server and not only by hiding tabs — see utils/reportGrants.cjs. */
+app.use("/api/reports", require("./utils/reportGrants.cjs").reportGrantGate(pool));
+
 /* INSPECT PRO's own documents (quotations + their settings) live outside
    /api/reports now, and get the same no-embedded-files rule. */
 for (const base of ["/api/quotations", "/api/platform-settings"]) {

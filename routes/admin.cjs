@@ -1,3 +1,5 @@
+const { forgetGrants } = require("../utils/reportGrants.cjs");
+
 module.exports = function registerAdminRoutes(app, deps = {}) {
   const { pool, clampInt, normText, rlCheck, rlReset, genSalt, hashPw, verifyPw, signToken,
           requireAuthStrict, requireSuperAdmin, verifyToken, tokenFromReq,
@@ -518,6 +520,9 @@ app.put("/api/app-users/:id", strict, superOnly, async (req, res) => {
     if (!q.rowCount)
       return res.status(404).json({ ok: false, error: "user_not_found" });
 
+    // Per-report grants are cached a minute by the /api/reports gate — drop
+    // this account's copy so a change applies to its very next request.
+    forgetGrants(id);
     res.json({ ok: true, user: q.rows[0] });
   } catch (e) {
     console.error("PUT /api/app-users/:id ERROR:", e);
