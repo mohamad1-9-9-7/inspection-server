@@ -488,17 +488,22 @@ async function mergeBranchReading(req, cfg, b) {
   const db = await pool.connect();
   try {
     await db.query("BEGIN");
+    /* POS 11 / POS 15 sheets saved only `date` (no reportDate) — match either,
+       or the phone would open a second record for a day the sheet already filed. */
     const cur = await db.query(
       `SELECT id, payload FROM reports
         WHERE COALESCE(company_id, 1) = COALESCE($1::int, 1)
-          AND type = $2 AND payload->>'reportDate' = $3
-        ORDER BY id LIMIT 1
+          AND type = $2
+          AND COALESCE(NULLIF(payload->>'reportDate', ''), LEFT(payload->>'date', 10)) = $3
+        ORDER BY (payload->>'reportDate' = $3) DESC NULLS LAST, id
+        LIMIT 1
         FOR UPDATE`,
       [companyId, b.type, b.reportDate]
     );
     const row = cur.rows[0] || null;
     const old = row?.payload || null;
     const day = old ? JSON.parse(JSON.stringify(old)) : { branch: cfg.branch, reportDate: b.reportDate, date: b.reportDate };
+    if (!day.reportDate) day.reportDate = b.reportDate;
 
     const log = Array.isArray(day.quickReadings) ? day.quickReadings : [];
     if (log.some((r) => r && r.id === b.readingId)) {
