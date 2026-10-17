@@ -661,7 +661,8 @@ app.post("/api/reports/branch-temp/reading", auth, async (req, res) => {
    body: { key, moveId, dir: "in"|"out", code, product, uom, qty, pcs?,
            supplier?, prodDate?, expDate?, keeper, destType?, destination?,
            at?, replay? }
-   • A lot = same code (or product) + supplier + prodDate + expDate.
+   • A lot = same code (or product) + supplier + prodDate + expDate + batch
+     (batch / gtin come from the carton barcode when it was scanned).
    • Same moveId twice (outbox replay) = no change.
    • Out of more than is inside → 409 TOO_MUCH; lot not inside → 409
      NOT_HERE. A REPLAY (queued offline, the goods already left) is
@@ -672,7 +673,7 @@ const STOCK_TYPE = "cold_rooms_stock";
 const MOVES_TYPE = "cold_rooms_moves";
 const MOVES_KEPT = 200;
 const KEY_RE = /^(\d{1,2}|unit:.{1,200})$/;
-const LOT_FIELDS = ["supplier", "prodDate", "expDate"];
+const LOT_FIELDS = ["supplier", "prodDate", "expDate", "batch"];
 const toQty = (v) => {
   const n = Number(String(v ?? "").replace(/,/g, "").trim());
   return Number.isFinite(n) ? Math.round(n * 1000) / 1000 : 0;
@@ -683,6 +684,8 @@ function stockItem(raw) {
   };
   LOT_FIELDS.forEach((k) => { const v = clip(raw?.[k], 120); if (v) it[k] = v; });
   if (toQty(raw?.pcs) > 0) it.pcs = toQty(raw.pcs);
+  const gtin = String(raw?.gtin ?? "").replace(/\D/g, "");
+  if (/^\d{14}$/.test(gtin)) it.gtin = gtin; // the carton barcode, information only
   return it;
 }
 const sameStockLot = (a, b) =>
@@ -745,6 +748,7 @@ async function applyStockMove(req, b) {
       keeper: b.keeper,
     };
     LOT_FIELDS.forEach((k) => { if (lot[k]) move[k] = lot[k]; });
+    if (lot.gtin) move.gtin = lot.gtin;
     if (b.pcs > 0) move.pcs = b.pcs;
 
     if (b.dir === "out") {
@@ -813,7 +817,7 @@ app.post("/api/reports/cold-rooms-stock/move", auth, async (req, res) => {
       moveId: clip(x.moveId, 80),
       dir: x.dir === "out" ? "out" : x.dir === "in" ? "in" : "",
       code: x.code, product: x.product, uom: x.uom, qty: toQty(x.qty),
-      supplier: x.supplier, prodDate: x.prodDate, expDate: x.expDate,
+      supplier: x.supplier, prodDate: x.prodDate, expDate: x.expDate, batch: x.batch, gtin: x.gtin,
       pcs: toQty(x.pcs) > 0 ? toQty(x.pcs) : 0,
       keeper: clip(x.keeper, 120),
       destType: x.destType === "customer" || x.destType === "branch" ? x.destType : "",
