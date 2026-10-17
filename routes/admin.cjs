@@ -197,7 +197,7 @@ app.post("/api/auth/login", async (req, res) => {
     const q = await pool.query(
       `SELECT id, username, display_name, password_hash, salt,
               permissions, crud_perms, employees, allowed_branches, is_active, is_admin, is_super_admin, last_login,
-              company_id
+              company_id, ui_lang
          FROM app_users WHERE username = $1 LIMIT 1`,
       [username]
     );
@@ -334,6 +334,7 @@ app.post("/api/auth/login", async (req, res) => {
         isAdmin:         user.is_admin,
         isSuperAdmin:    user.is_super_admin,
         lastLogin:       user.last_login,
+        uiLang:          user.ui_lang || null,       // 'ar' | 'en' — the account's own language
         companyId:       user.company_id || null,  // NULL = platform-level (super-admin)
         company:         company ? {               // resolved company snapshot (null for platform users)
           id:        company.id,
@@ -350,6 +351,23 @@ app.post("/api/auth/login", async (req, res) => {
     });
   } catch (e) {
     console.error("POST /api/auth/login ERROR:", e);
+    res.status(500).json({ ok: false, error: "server_error" });
+  }
+});
+
+/* PUT /api/auth/me/lang  { lang: "ar" | "en" }
+   The signed-in account saves its own interface language, so it follows the
+   account to any device. Only the caller's own row; no other field. */
+app.put("/api/auth/me/lang", strict, async (req, res) => {
+  try {
+    const uid = req.user?.uid;
+    const lang = req.body?.lang === "ar" ? "ar" : req.body?.lang === "en" ? "en" : null;
+    if (!uid) return res.status(401).json({ ok: false, error: "auth_required" });
+    if (!lang) return res.status(400).json({ ok: false, error: "lang must be ar or en" });
+    await pool.query(`UPDATE app_users SET ui_lang = $1 WHERE id = $2`, [lang, uid]);
+    res.json({ ok: true, lang });
+  } catch (e) {
+    console.error("PUT /api/auth/me/lang ERROR:", e);
     res.status(500).json({ ok: false, error: "server_error" });
   }
 });

@@ -274,6 +274,8 @@ module.exports = async function ensureSchema({ pool, genSalt, hashPw }) {
 
   /* ── is_super_admin column ── */
   await pool.query(`ALTER TABLE app_users ADD COLUMN IF NOT EXISTS is_super_admin BOOLEAN NOT NULL DEFAULT false`);
+  /* Each account's interface language ('ar' | 'en'); NULL = not chosen yet. */
+  await pool.query(`ALTER TABLE app_users ADD COLUMN IF NOT EXISTS ui_lang TEXT`);
 
   /* ── Subscription table ── */
   await pool.query(`
