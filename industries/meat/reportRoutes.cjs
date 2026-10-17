@@ -641,4 +641,215 @@ app.post("/api/reports/branch-temp/reading", auth, async (req, res) => {
     return res.status(500).json({ ok: false, error: String(e?.message || e) });
   }
 });
+
+/* ============================================================
+   POST /api/reports/cold-rooms-stock/move
+
+   One product moved in or out of a cooler — from the QR page on the unit
+   (front: pages/monitor/branches/_shared/QuickGoodsPanel.jsx).
+
+   The stock of every room/unit lives in ONE record (type cold_rooms_stock,
+   reportDate "stock", payload.rooms[key] = { items, moves, … }). If each
+   phone read it and PUT it back whole, two storekeepers saving at the same
+   moment would wipe each other's move. Here the move is applied inside a
+   transaction with FOR UPDATE on that record, so none is lost.
+
+   Every move is also appended, under the same lock, to that month's full
+   log (type cold_rooms_moves, reportDate "YYYY-MM", UAE month) — the room
+   itself keeps only its last 200 for the screens.
+
+   body: { key, moveId, dir: "in"|"out", code, product, uom, qty, pcs?,
+           supplier?, prodDate?, expDate?, keeper, destType?, destination?,
+           at?, replay? }
+   • A lot = same code (or product) + supplier + prodDate + expDate.
+   • Same moveId twice (outbox replay) = no change.
+   • Out of more than is inside → 409 TOO_MUCH; lot not inside → 409
+     NOT_HERE. A REPLAY (queued offline, the goods already left) is
+     recorded anyway: the lot is emptied and the move carries shortBy /
+     notFound, so the books show what really happened.
+============================================================ */
+const STOCK_TYPE = "cold_rooms_stock";
+const MOVES_TYPE = "cold_rooms_moves";
+const MOVES_KEPT = 200;
+const KEY_RE = /^(\d{1,2}|unit:.{1,200})$/;
+const LOT_FIELDS = ["supplier", "prodDate", "expDate"];
+const toQty = (v) => {
+  const n = Number(String(v ?? "").replace(/,/g, "").trim());
+  return Number.isFinite(n) ? Math.round(n * 1000) / 1000 : 0;
+};
+function stockItem(raw) {
+  const it = {
+    code: clip(raw?.code, 60), product: clip(raw?.product, 200), uom: clip(raw?.uom, 30), qty: toQty(raw?.qty),
+  };
+  LOT_FIELDS.forEach((k) => { const v = clip(raw?.[k], 120); if (v) it[k] = v; });
+  if (toQty(raw?.pcs) > 0) it.pcs = toQty(raw.pcs);
+  return it;
+}
+const sameStockLot = (a, b) =>
+  (a.code ? a.code === b.code : a.product === b.product) &&
+  LOT_FIELDS.every((k) => String(a[k] || "") === String(b[k] || ""));
+const uaeMonth = (iso) => {
+  const t = new Date(iso).getTime();
+  return new Date((Number.isFinite(t) ? t : Date.now()) + 4 * 3600000).toISOString().slice(0, 7);
+};
+
+async function lockRecord(db, companyId, type, key) {
+  const cur = await db.query(
+    `SELECT id, payload FROM reports
+      WHERE COALESCE(company_id, 1) = COALESCE($1::int, 1)
+        AND type = $2 AND payload->>'reportDate' = $3
+      ORDER BY id LIMIT 1
+      FOR UPDATE`,
+    [companyId, type, key]
+  );
+  return cur.rows[0] || null;
+}
+async function writeRecord(db, companyId, type, row, payload, reporter) {
+  if (row) {
+    const upd = await db.query(
+      `UPDATE reports SET payload=${KEEP_REF("$1")}, updated_at=now() WHERE id=$2 RETURNING *`,
+      [JSON.stringify(payload), row.id]
+    );
+    return upd.rows[0];
+  }
+  const stamped = await stampRef(db, type, payload, companyId);
+  const ins = await db.query(
+    `INSERT INTO reports (reporter, type, payload, company_id) VALUES ($1, $2, $3::jsonb, $4) RETURNING *`,
+    [reporter, type, JSON.stringify(stamped), companyId]
+  );
+  return ins.rows[0];
+}
+
+async function applyStockMove(req, b) {
+  const companyId = companyIdForWrite(req);
+  const db = await pool.connect();
+  try {
+    await db.query("BEGIN");
+    const row = await lockRecord(db, companyId, STOCK_TYPE, "stock");
+    const old = row?.payload || null;
+    const p = old ? JSON.parse(JSON.stringify(old)) : { reportDate: "stock", rooms: {} };
+    p.rooms = isObj(p.rooms) ? p.rooms : {};
+    const room = isObj(p.rooms[b.key]) ? p.rooms[b.key] : {};
+    const moves = Array.isArray(room.moves) ? room.moves : [];
+    if (moves.some((m) => m && m.id === b.moveId)) {
+      await db.query("ROLLBACK");
+      return { status: 200, json: { ok: true, duplicate: true, room } };
+    }
+
+    const items = (Array.isArray(room.items) ? room.items : []).map(stockItem).filter((it) => it.code || it.product);
+    const lot = stockItem(b);
+    const at = items.findIndex((it) => sameStockLot(it, lot));
+    const move = {
+      id: b.moveId, at: b.at, savedAt: new Date().toISOString(), by: b.by, dir: b.dir,
+      code: lot.code, product: lot.product || items[at]?.product || "", uom: lot.uom || items[at]?.uom || "", qty: lot.qty,
+      keeper: b.keeper,
+    };
+    LOT_FIELDS.forEach((k) => { if (lot[k]) move[k] = lot[k]; });
+    if (b.pcs > 0) move.pcs = b.pcs;
+
+    if (b.dir === "out") {
+      move.destType = b.destType;
+      if (b.destination) move.destination = b.destination;
+      if (at < 0) {
+        if (!b.replay) { await db.query("ROLLBACK"); return { status: 409, json: { ok: false, error: "NOT_HERE" } }; }
+        move.notFound = true;
+      } else {
+        const have = items[at].qty;
+        if (lot.qty > have + 1e-9) {
+          if (!b.replay) { await db.query("ROLLBACK"); return { status: 409, json: { ok: false, error: "TOO_MUCH", value: have } }; }
+          move.shortBy = Math.round((lot.qty - have) * 1000) / 1000;
+        }
+        const left = Math.round((have - lot.qty) * 1000) / 1000;
+        if (left <= 0) items.splice(at, 1);
+        else {
+          const r = { ...items[at], qty: left };
+          if (r.pcs && b.pcs > 0) r.pcs = Math.max(0, r.pcs - b.pcs);
+          if (!r.pcs) delete r.pcs;
+          items[at] = r;
+        }
+      }
+    } else if (at >= 0) {
+      const r = { ...items[at], qty: Math.round((items[at].qty + lot.qty) * 1000) / 1000 };
+      if (b.pcs > 0) r.pcs = (r.pcs || 0) + b.pcs;
+      items[at] = r;
+    } else {
+      items.unshift(lot);
+    }
+
+    p.rooms[b.key] = {
+      ...room, items, moves: [...moves, move].slice(-MOVES_KEPT),
+      updatedAt: move.savedAt, updatedBy: b.by || b.keeper || "",
+    };
+    const saved = await writeRecord(db, companyId, STOCK_TYPE, row, p, "cold-rooms-stock");
+
+    // the month's full log
+    const month = uaeMonth(move.at || move.savedAt);
+    const logRow = await lockRecord(db, companyId, MOVES_TYPE, month);
+    const lp = logRow?.payload ? JSON.parse(JSON.stringify(logRow.payload)) : { reportDate: month, moves: [] };
+    lp.moves = Array.isArray(lp.moves) ? lp.moves : [];
+    lp.moves.push({ ...move, key: b.key });
+    await writeRecord(db, companyId, MOVES_TYPE, logRow, lp, "cold-rooms-stock");
+
+    await db.query("COMMIT");
+    if (row) {
+      auditWrite(req, { action: "update", reportId: saved.id, reportType: STOCK_TYPE, oldPayload: old, newPayload: saved.payload });
+    } else {
+      auditCreate(req, saved);
+    }
+    return { status: 200, json: { ok: true, room: p.rooms[b.key], move } };
+  } catch (e) {
+    await db.query("ROLLBACK").catch(() => {});
+    throw e;
+  } finally {
+    db.release();
+  }
+}
+
+app.post("/api/reports/cold-rooms-stock/move", auth, async (req, res) => {
+  try {
+    const x = req.body || {};
+    const b = {
+      key: clip(x.key, 220),
+      moveId: clip(x.moveId, 80),
+      dir: x.dir === "out" ? "out" : x.dir === "in" ? "in" : "",
+      code: x.code, product: x.product, uom: x.uom, qty: toQty(x.qty),
+      supplier: x.supplier, prodDate: x.prodDate, expDate: x.expDate,
+      pcs: toQty(x.pcs) > 0 ? toQty(x.pcs) : 0,
+      keeper: clip(x.keeper, 120),
+      destType: x.destType === "customer" || x.destType === "branch" ? x.destType : "",
+      destination: clip(x.destination, 80),
+      at: clip(x.at, 40) || new Date().toISOString(),
+      by: clip(req.user?.username || x.by, 80),
+      replay: x.replay === true,
+    };
+    if (!KEY_RE.test(b.key)) return res.status(400).json({ ok: false, error: "bad key" });
+    if (!b.moveId) return res.status(400).json({ ok: false, error: "moveId required" });
+    if (!b.dir) return res.status(400).json({ ok: false, error: "dir in|out required" });
+    if (!(b.qty > 0)) return res.status(400).json({ ok: false, error: "qty required" });
+    if (!String(b.code || "").trim() && !String(b.product || "").trim()) return res.status(400).json({ ok: false, error: "product required" });
+    if (!b.keeper) return res.status(400).json({ ok: false, error: "keeper required" });
+    if (b.dir === "in") {
+      if (!String(b.supplier || "").trim() || !DATE_RE.test(String(b.prodDate || "")) || !DATE_RE.test(String(b.expDate || ""))) {
+        return res.status(400).json({ ok: false, error: "supplier, prodDate and expDate required" });
+      }
+      if (String(b.expDate) <= String(b.prodDate)) return res.status(400).json({ ok: false, error: "expDate must be after prodDate" });
+    } else {
+      if (!b.destType) return res.status(400).json({ ok: false, error: "destType required" });
+      if (b.destType === "branch" && !b.destination) return res.status(400).json({ ok: false, error: "destination required" });
+    }
+
+    let out;
+    try {
+      out = await applyStockMove(req, b);
+    } catch (e) {
+      // first move ever / first of the month raced to INSERT: run again into the winner
+      if (e && e.code === "23505") out = await applyStockMove(req, b);
+      else throw e;
+    }
+    return res.status(out.status).json(out.json);
+  } catch (e) {
+    console.error("POST /api/reports/cold-rooms-stock/move ERROR =", e);
+    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+  }
+});
 };
