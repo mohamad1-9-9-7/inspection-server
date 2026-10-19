@@ -35,7 +35,7 @@ const { eraseCompany } = require("../utils/deleteCompany.cjs");
 const { normalizeMobile } = require("../utils/phone.cjs");
 const { findUsablePromo } = require("./promoCodes.cjs");
 
-const TRIAL_DAYS = 3;
+const TRIAL_DAYS = 30;
 const TRIAL_GRACE_DAYS = 3;
 const SWEEP_EVERY_MS = 6 * 60 * 60_000;
 
