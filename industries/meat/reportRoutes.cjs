@@ -674,6 +674,9 @@ const MOVES_TYPE = "cold_rooms_moves";
 const MOVES_KEPT = 200;
 const KEY_RE = /^(\d{1,2}|unit:.{1,200})$/;
 const LOT_FIELDS = ["supplier", "prodDate", "expDate", "batch"];
+// what one "piece" is: a box, a plate, a tray… (empty = a single piece)
+const PCS_UNITS = ["piece", "box", "carton", "plate", "tray", "bag", "pack", "head"];
+const pcsUnitOf = (v) => (PCS_UNITS.includes(v) ? v : "");
 const toQty = (v) => {
   const n = Number(String(v ?? "").replace(/,/g, "").trim());
   return Number.isFinite(n) ? Math.round(n * 1000) / 1000 : 0;
@@ -683,7 +686,10 @@ function stockItem(raw) {
     code: clip(raw?.code, 60), product: clip(raw?.product, 200), uom: clip(raw?.uom, 30), qty: toQty(raw?.qty),
   };
   LOT_FIELDS.forEach((k) => { const v = clip(raw?.[k], 120); if (v) it[k] = v; });
-  if (toQty(raw?.pcs) > 0) it.pcs = toQty(raw.pcs);
+  if (toQty(raw?.pcs) > 0) {
+    it.pcs = toQty(raw.pcs);
+    if (pcsUnitOf(raw?.pcsUnit)) it.pcsUnit = raw.pcsUnit;
+  }
   const gtin = String(raw?.gtin ?? "").replace(/\D/g, "");
   if (/^\d{14}$/.test(gtin)) it.gtin = gtin; // the carton barcode, information only
   return it;
@@ -750,6 +756,7 @@ async function applyStockMove(req, b) {
     LOT_FIELDS.forEach((k) => { if (lot[k]) move[k] = lot[k]; });
     if (lot.gtin) move.gtin = lot.gtin;
     if (b.pcs > 0) move.pcs = b.pcs;
+    if (b.pcs > 0 && b.pcsUnit) move.pcsUnit = b.pcsUnit;
 
     if (b.dir === "out") {
       move.destType = b.destType;
@@ -768,13 +775,16 @@ async function applyStockMove(req, b) {
         else {
           const r = { ...items[at], qty: left };
           if (r.pcs && b.pcs > 0) r.pcs = Math.max(0, r.pcs - b.pcs);
-          if (!r.pcs) delete r.pcs;
+          if (!r.pcs) { delete r.pcs; delete r.pcsUnit; }
           items[at] = r;
         }
       }
     } else if (at >= 0) {
       const r = { ...items[at], qty: Math.round((items[at].qty + lot.qty) * 1000) / 1000 };
-      if (b.pcs > 0) r.pcs = (r.pcs || 0) + b.pcs;
+      if (b.pcs > 0) {
+        if (b.pcsUnit && (!r.pcs || !r.pcsUnit)) r.pcsUnit = b.pcsUnit;
+        r.pcs = (r.pcs || 0) + b.pcs;
+      }
       items[at] = r;
     } else {
       items.unshift(lot);
@@ -819,6 +829,7 @@ app.post("/api/reports/cold-rooms-stock/move", auth, async (req, res) => {
       code: x.code, product: x.product, uom: x.uom, qty: toQty(x.qty),
       supplier: x.supplier, prodDate: x.prodDate, expDate: x.expDate, batch: x.batch, gtin: x.gtin,
       pcs: toQty(x.pcs) > 0 ? toQty(x.pcs) : 0,
+      pcsUnit: pcsUnitOf(x.pcsUnit),
       keeper: clip(x.keeper, 120),
       destType: x.destType === "customer" || x.destType === "branch" ? x.destType : "",
       destination: clip(x.destination, 80),
