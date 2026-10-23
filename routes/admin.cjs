@@ -1,4 +1,6 @@
 const { forgetGrants } = require("../utils/reportGrants.cjs");
+const zlib = require("zlib");
+const { dumpDatabase } = require("../utils/dbDump.cjs");
 
 module.exports = function registerAdminRoutes(app, deps = {}) {
   const { pool, clampInt, normText, rlCheck, rlReset, genSalt, hashPw, verifyPw, signToken,
@@ -690,6 +692,40 @@ app.get("/api/security/failed-logins", strict, superOnly, async (req, res) => {
   } catch (e) {
     console.error("GET /api/security/failed-logins ERROR:", e);
     res.status(500).json({ ok: false, error: "server_error" });
+  }
+});
+
+/* ============================================================
+   Full database backup — GET /api/admin/db-dump
+   One gzipped .sql file (schema + every row of every table, all companies),
+   restorable with psql into an empty database. See utils/dbDump.cjs.
+   It carries password hashes and every tenant's data, so it demands a REAL
+   super-admin token — no "no AUTH_SECRET" pass-through like superOnly has.
+============================================================ */
+let dumpRunning = false;
+app.get("/api/admin/db-dump", strict, async (req, res) => {
+  if (!req.user || !req.user.isSuperAdmin) {
+    return res.status(403).json({ ok: false, error: "super_admin_required" });
+  }
+  if (dumpRunning) return res.status(429).json({ ok: false, error: "backup_already_running" });
+  dumpRunning = true;
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+  const gz = zlib.createGzip({ level: 6 });
+  res.setHeader("Content-Type", "application/gzip");
+  res.setHeader("Content-Disposition", `attachment; filename="neon-full-${stamp}.sql.gz"`);
+  res.setHeader("Cache-Control", "no-store");
+  gz.pipe(res);
+  const write = (s) => (gz.write(s) ? null : new Promise((r) => gz.once("drain", r)));
+  try {
+    const summary = await dumpDatabase(pool, write);
+    gz.end();
+    console.log(`[db-dump] by ${req.user.username || req.user.id}: ${summary.tables.length} tables, ${summary.totalRows} rows`);
+  } catch (e) {
+    console.error("GET /api/admin/db-dump ERROR:", e);
+    // Headers are gone; a truncated file has no "end of backup" line, which is how a restore spots it.
+    gz.end(`\n-- BACKUP FAILED: ${String(e.message || e).replace(/\n/g, " ")}\n`);
+  } finally {
+    dumpRunning = false;
   }
 });
 };
