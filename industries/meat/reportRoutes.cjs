@@ -10,6 +10,11 @@
    so these routes follow exactly the same company + audit rules as
    every core route — the industry only owns the business logic.
 ============================================================ */
+const { onTemperatureReading } = require("../../utils/alertEngine.cjs");
+
+/* Alert hook input for one phone reading — never fails the reading. */
+const num = (v) => (v === "" || v == null || !Number.isFinite(Number(v)) ? null : Number(v));
+
 module.exports = function registerMeatReportRoutes(app, ctx) {
   const {
     pool, isObj, auth, pingBypass, readLimiter,
@@ -437,6 +442,15 @@ app.post("/api/reports/qcs-coolers/reading", auth, async (req, res) => {
       if (e && e.code === "23505") out = await mergeCoolerReading(req, b);
       else throw e;
     }
+    if (out.status < 300 && !out.json?.duplicate) {
+      // after the answer: the alert (and its e-mail) must not slow the phone down
+      setImmediate(() => onTemperatureReading(pool, companyIdForWrite(req), {
+        type: COOLERS_TYPE, branch: "QCS", reportDate: b.reportDate, unit: b.unit,
+        unitLabel: clip(x.unitLabel, 80) || b.unit, slot: b.slot, value: b.value, kind: b.kind,
+        outOfRange: b.outOfRange, correctiveAction: b.correctiveAction, byName: b.byName,
+        min: num(x.min), max: num(x.max), link: `/monitor/qcs/coolers/quick/${b.unit}`,
+      }));
+    }
     return res.status(out.status).json(out.json);
   } catch (e) {
     console.error("POST /api/reports/qcs-coolers/reading ERROR =", e);
@@ -634,6 +648,14 @@ app.post("/api/reports/branch-temp/reading", auth, async (req, res) => {
       // Two first readings of the day raced to INSERT: the loser merges into the winner.
       if (e && e.code === "23505") out = await mergeBranchReading(req, cfg, b);
       else throw e;
+    }
+    if (out.status < 300 && !out.json?.duplicate) {
+      setImmediate(() => onTemperatureReading(pool, companyIdForWrite(req), {
+        type, branch: cfg.branch, reportDate: b.reportDate, unit: b.unit,
+        unitLabel: clip(x.unitLabel, 80) || b.unit, slot: b.slot, value: b.value, kind: b.kind,
+        outOfRange: b.outOfRange, correctiveAction: b.correctiveAction, byName: b.byName,
+        min: num(x.min), max: num(x.max), link: "",
+      }));
     }
     return res.status(out.status).json(out.json);
   } catch (e) {

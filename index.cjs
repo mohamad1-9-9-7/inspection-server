@@ -30,6 +30,8 @@ const registerDemoRequestRoutes = require("./routes/demoRequests.cjs");
 const registerTrialRoutes = require("./routes/trial.cjs");
 const registerPromoCodeRoutes = require("./routes/promoCodes.cjs");
 const registerMyBillingRoutes = require("./routes/myBilling.cjs");
+const registerAlertRoutes = require("./routes/alerts.cjs");
+const { startAlertScheduler } = require("./utils/alertEngine.cjs");
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -190,6 +192,7 @@ registerDemoRequestRoutes(app, deps);
 registerTrialRoutes(app, deps);
 registerPromoCodeRoutes(app, deps);
 registerMyBillingRoutes(app, { ...deps, billing });
+registerAlertRoutes(app, deps);
 
 // Schema migrations are meant to be additive/idempotent, and every table
 // that matters has existed for a long time — one bad migration step should
@@ -274,5 +277,7 @@ ensureSchema({ pool, genSalt: password.genSalt, hashPw: password.hashPw })
           `AUTH_SECRET ${process.env.AUTH_SECRET ? "set" : "MISSING"}`
       );
       console.log("STARTED AT:", new Date().toISOString());
+      // scheduled alert checks (utils/alertEngine.cjs) — ALERTS=off disables
+      startAlertScheduler(pool);
     });
   });

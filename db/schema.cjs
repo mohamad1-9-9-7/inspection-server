@@ -664,6 +664,44 @@ module.exports = async function ensureSchema({ pool, genSalt, hashPw }) {
       created_at       TIMESTAMPTZ   NOT NULL DEFAULT now()
     );
   `);
+  /* Alerts (utils/alertEngine.cjs): a problem the system found by itself —
+     a temperature out of range, a daily log not filed, a calibration about
+     to expire, a CAPA past its date. One row per problem: dedupe_key makes
+     raising the same problem twice a no-op, so every check can simply run
+     again. Shown in the app bell; e-mailed per the company rules. */
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS alerts (
+      id          BIGSERIAL PRIMARY KEY,
+      company_id  INT,
+      rule        TEXT         NOT NULL,
+      severity    VARCHAR(10)  NOT NULL DEFAULT 'warning',
+      branch      TEXT         NOT NULL DEFAULT '',
+      title       TEXT         NOT NULL DEFAULT '',
+      body        TEXT         NOT NULL DEFAULT '',
+      link        TEXT         NOT NULL DEFAULT '',
+      dedupe_key  TEXT,
+      status      VARCHAR(10)  NOT NULL DEFAULT 'open',
+      data        JSONB        NOT NULL DEFAULT '{}'::jsonb,
+      created_at  TIMESTAMPTZ  NOT NULL DEFAULT now(),
+      ack_at      TIMESTAMPTZ,
+      ack_by      TEXT         NOT NULL DEFAULT '',
+      resolved_at TIMESTAMPTZ,
+      emailed_at  TIMESTAMPTZ
+    );
+  `);
+  await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS ux_alerts_company_dedupe ON alerts (COALESCE(company_id, 1), dedupe_key) WHERE dedupe_key IS NOT NULL`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_alerts_company_status ON alerts (COALESCE(company_id, 1), status, created_at DESC)`);
+  /* A scheduled check runs once per slot per day, across restarts and
+     instances: the run claims (job, day) first; a second claim finds it taken. */
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS alert_job_runs (
+      job        TEXT         NOT NULL,
+      day        DATE         NOT NULL,
+      started_at TIMESTAMPTZ  NOT NULL DEFAULT now(),
+      PRIMARY KEY (job, day)
+    );
+  `);
+
   /* The reference of the exact record that was mailed ("AM-NCR-000042").
      report_date alone can no longer identify a report — several NCRs share a
      day, one per branch — so a per-report send history needs this. Added as an
