@@ -235,6 +235,161 @@ async function onTemperatureReading(pool, companyId, r) {
   }
 }
 
+/* ───────── EVENT: a temperature SHEET saved from the computer ─────────
+   The sheet is saved whole (generic /api/reports writes), so the new
+   readings are found by comparing it with what was stored before. The
+   limits are the phone page's own, so a value alarms the same way whether
+   it was typed on the sheet or on the phone — and the alert key is the
+   same, so one reading never alarms twice. */
+
+const SHEET_BRANCH = {
+  "qcs-coolers": "QCS",
+  pos10_temperature: "POS 10",
+  pos11_temperature: "POS 11",
+  pos15_temperature: "POS 15",
+  pos19_temperature_monitoring: "POS 19",
+};
+const TIME_SLOT = /^\d{1,2}:\d{2} (AM|PM)$/;
+const NO_MIN = -60;
+
+/* QCS: the limits frozen into the record (coolerDefs / loadingDef), else the
+   sheet's legacy defaults — pages/monitor/branches/qcs/coolerDefs.js. */
+const QCS_TYPES = { chilled: [0, 5], frozen: [-19, -14], production: [8, 12], dry: [15, 25], ambient: [0, 16] };
+function qcsDef(raw, index) {
+  const base = index === "loading" ? { type: "ambient", label: "Loading Area", min: 0, max: 16 }
+    : index === 7 ? { type: "frozen", label: "FREEZER", min: -19, max: -14 }
+      : index === 2 || index === 3 ? { type: "production", label: "Production Room", min: 8, max: 12 }
+        : { type: "chilled", label: `Cooler ${index + 1}`, min: 0, max: 5 };
+  const type = QCS_TYPES[raw?.type] ? raw.type : base.type;
+  const n = (v, f) => (Number.isFinite(Number(v)) && v !== "" && v != null ? Number(v) : f);
+  const min = n(raw?.min, n(base.min, QCS_TYPES[type][0]));
+  const max = n(raw?.max, n(base.max, QCS_TYPES[type][1]));
+  return { label: String(raw?.label ?? base.label).trim() || base.label, min: Math.min(min, max), max: Math.max(min, max) };
+}
+/* Branches: by the unit's name / POS 19 unit type — BranchTempQuick.jsx gridDef / pos19Def. */
+function gridDef(name) {
+  const n = String(name || "").toLowerCase();
+  if (/freez/.test(n)) return { min: -25, max: -12 };
+  if (/production|prep/.test(n)) return { min: NO_MIN, max: 10 };
+  if (/loading/.test(n)) return { min: NO_MIN, max: 16 };
+  return { min: NO_MIN, max: 5 };
+}
+function pos19Def(unitType) {
+  if (unitType === "freezer") return { min: NO_MIN, max: -18 };
+  if (unitType === "ambient") return { min: NO_MIN, max: 25 };
+  return { min: NO_MIN, max: 5 };
+}
+
+const reading = (v) => {
+  const s = String(v ?? "").trim();
+  if (!s || !/^[-+]?\d+(\.\d+)?$/.test(s)) return null;
+  return Number(s);
+};
+
+/** Every numeric reading of a sheet: Map "unit|slot" → { unit, label, slot, value, min, max }. */
+function sheetReadings(type, payload) {
+  const out = new Map();
+  const p = payload && typeof payload === "object" ? payload : {};
+  const put = (unit, label, slot, raw, lim) => {
+    const value = reading(raw);
+    if (value == null) return;
+    out.set(`${unit}|${slot}`, { unit: clean(unit, 80), label, slot, value, min: lim.min, max: lim.max });
+  };
+  const temps = (obj, fn) => Object.entries(obj && typeof obj === "object" ? obj : {}).forEach(([slot, v]) => { if (TIME_SLOT.test(slot)) fn(slot, v); });
+
+  if (type === "qcs-coolers") {
+    const defs = Array.isArray(p.coolerDefs) ? p.coolerDefs : [];
+    (Array.isArray(p.coolers) ? p.coolers : []).forEach((c, i) => {
+      const d = qcsDef(defs[i], i);
+      temps(c?.temps, (slot, v) => put(`cooler-${i}`, d.label, slot, v, d));
+    });
+    const ld = qcsDef(p.loadingDef, "loading");
+    temps(p.loadingArea?.temps, (slot, v) => put("loading-area", ld.label, slot, v, ld));
+  } else if (type === "pos19_temperature_monitoring") {
+    (Array.isArray(p.entries) ? p.entries : []).forEach((e) => {
+      const name = String(e?.equipment || "").trim();
+      if (!name) return;
+      const lim = pos19Def(e?.unitType);
+      ["am", "pm", "ev"].forEach((slot) => put(name, name, slot, e?.[`${slot}_temp`], lim));
+    });
+  } else {
+    (Array.isArray(p.coolers) ? p.coolers : []).forEach((c) => {
+      const name = String(c?.name || "").trim();
+      if (!name) return;
+      const lim = gridDef(name);
+      temps(c?.temps, (slot, v) => put(name, name, slot, v, lim));
+    });
+  }
+  return out;
+}
+
+const outside = (r) => r && (r.value < r.min || r.value > r.max);
+const limitText = (r) => (r.min <= NO_MIN ? `≤ ${r.max} °C` : `${r.min} to ${r.max} °C`);
+
+/** Is this one of the sheets the hook watches? (cheap check before any work) */
+const isTempSheet = (type) => Object.prototype.hasOwnProperty.call(SHEET_BRANCH, type);
+
+/**
+ * Called after a temperature sheet was written (create or update).
+ * New or changed readings out of range → critical alert (one e-mail for the
+ * lot); a reading corrected back into range closes its alert. Only today's
+ * and yesterday's sheets: typing up an old sheet must not page anyone.
+ * Never throws.
+ */
+async function onTemperatureSheetSave(pool, companyId, type, oldPayload, newPayload, byName = "") {
+  try {
+    if (!isTempSheet(type)) return [];
+    const day = String(newPayload?.reportDate || newPayload?.date || "").slice(0, 10);
+    if (!isDay(day) || day < addDays(uaeToday(), -1)) return [];
+    const rules = await loadRules(pool, companyId);
+    if (!rules.temperature.enabled) return [];
+
+    const before = sheetReadings(type, oldPayload);
+    const after = sheetReadings(type, newPayload);
+    const branch = SHEET_BRANCH[type];
+    const created = [];
+
+    for (const [k, r] of after) {
+      const old = before.get(k);
+      if (old && old.value === r.value) continue; // not touched by this save
+      const prefix = `temp:${type}:${day}:${r.unit}:`;
+      if (!outside(r)) {
+        if (outside(old)) await resolveAlerts(pool, companyId, `${prefix}${r.slot}`, `Corrected on the sheet to ${r.value}°C${byName ? ` by ${byName}` : ""}`);
+        continue;
+      }
+      const a = await raiseAlert(pool, {
+        companyId,
+        rule: "temperature",
+        severity: "critical",
+        branch,
+        title: `${branch} — ${r.label}: ${r.value}°C out of range`,
+        body: [
+          `Entered on the sheet: ${r.value}°C at ${r.slot} on ${dmy(day)} (limit ${limitText(r)}).`,
+          byName && `By: ${byName}`,
+        ].filter(Boolean).join("\n"),
+        link: "",
+        dedupeKey: `${prefix}${r.slot}`,
+        data: { type, unit: r.unit, slot: r.slot, value: r.value, min: r.min, max: r.max, kind: "sheet" },
+      });
+      if (a) created.push(a);
+    }
+    // a value removed from the sheet (cleared by mistake) closes its alert too
+    for (const [k, old] of before) {
+      if (!after.has(k) && outside(old)) {
+        await resolveAlerts(pool, companyId, `temp:${type}:${day}:${old.unit}:${old.slot}`, "Cleared on the sheet");
+      }
+    }
+    if (created.length) {
+      await mailAlerts(pool, companyId, rules.temperature.emails, created,
+        created.length === 1 ? `🌡️ ${created[0].title}` : `🌡️ ${branch}: ${created.length} temperatures out of range`);
+    }
+    return created;
+  } catch (e) {
+    console.warn("[alerts] sheet hook failed:", e?.message || e);
+    return [];
+  }
+}
+
 /* ───────── SCHEDULE: the checks ───────── */
 
 /** Daily logs: `mode` "filed" (yesterday's sheet saved) or "any" (any record today). */
@@ -522,10 +677,12 @@ module.exports = {
   raiseAlert,
   resolveAlerts,
   onTemperatureReading,
+  onTemperatureSheetSave,
+  isTempSheet,
   runCompanyChecks,
   startAlertScheduler,
   mailAlerts,
   _companyMayMail: companyMayMail,
   // for tests
-  _internal: { toDay, checkCapa, checkExpiries, addDays, daysBetween, cleanEmails },
+  _internal: { toDay, checkCapa, checkExpiries, addDays, daysBetween, cleanEmails, sheetReadings },
 };

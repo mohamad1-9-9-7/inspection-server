@@ -1,4 +1,5 @@
 const cloudinary = require("cloudinary").v2;
+const alertEngine = require("../utils/alertEngine.cjs");
 
 module.exports = function registerReportsRoutes(app, deps = {}) {
   const { pool, clampInt, normText, isObj, requireAuth, requireAuthStrict, makeLimiter } = deps;
@@ -196,12 +197,24 @@ function auditIp(req) {
   );
 }
 
+/* Temperature sheets saved from the computer → alerts (utils/alertEngine.cjs).
+   Hooked here because EVERY report write passes through the audit: one place
+   covers POST, PUT, PUT /:type, PUT/PATCH /:id and the offline outbox. The
+   phone reading routes have their own, richer hook — skipped here. Runs after
+   the response; never affects the save. */
+function sheetAlertHook(req, type, oldPayload, newPayload, companyId) {
+  if (!alertEngine.isTempSheet(type) || /\/reading\b/.test(String(req.originalUrl || req.url || ""))) return;
+  const cid = companyId ?? companyIdForWrite(req);
+  setImmediate(() => alertEngine.onTemperatureSheetSave(pool, cid, type, oldPayload, newPayload, auditUser(req)));
+}
+
 /** Fire-and-forget audit insert. `action` is 'update' | 'delete'. */
 /** `companyId`: the company the row really belongs to. Routes that know it
  *  (by-id edits, creates) pass it, so a super-admin editing another company's
  *  report is logged under THAT company, not under the one the request names. */
 function auditWrite(req, { action, reportId, reportType, oldPayload, newPayload, companyId = null }) {
   if (action === "update" && samePayload(oldPayload, newPayload)) return;
+  if (action === "update") sheetAlertHook(req, reportType, oldPayload, newPayload, companyId);
   pool
     .query(
       `INSERT INTO report_audit
@@ -234,6 +247,7 @@ const AUDIT_SKIP_CREATE = /(^__)|lookup/i;
  *  before-state, so nothing is lost. We keep just enough here (reportDate,
  *  refNo) to make the audit row readable on its own. */
 function auditCreate(req, row) {
+  if (row) sheetAlertHook(req, row.type, null, row.payload, row.company_id);
   if (!row || AUDIT_SKIP_CREATE.test(String(row.type || ""))) return;
   const p = row.payload || {};
   auditWrite(req, {
