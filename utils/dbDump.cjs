@@ -44,6 +44,13 @@ async function dumpDatabase(pool, write) {
       `BEGIN;\n\n`
     );
 
+    /* ── Extensions (pgcrypto: db/schema.cjs creates it; plpgsql is built in) ── */
+    const exts = (await client.query(`
+      select e.extname, n.nspname from pg_extension e join pg_namespace n on n.oid=e.extnamespace
+       where e.extname<>'plpgsql' order by 1`)).rows;
+    for (const e of exts) await out(`CREATE EXTENSION IF NOT EXISTS ${q(e.extname)} WITH SCHEMA ${q(e.nspname)};\n`);
+    if (exts.length) await out(`\n`);
+
     /* ── Sequences (created first; owned-by + setval after the data) ── */
     const seqs = (await client.query(`
       select s.relname name, ps.data_type, ps.start_value, ps.increment_by, ps.min_value, ps.max_value,
@@ -188,6 +195,23 @@ async function dumpDatabase(pool, write) {
         select object_name from information_schema.role_usage_grants
          where object_schema='public' and object_type='SEQUENCE' and grantee=$1 order by 1`, [r])).rows;
       for (const x of sg) await out(`GRANT USAGE, SELECT ON SEQUENCE public.${q(x.object_name)} TO ${q(r)};\n`);
+      // The server connects as the owner and switches with SET ROLE (TENANT_RLS),
+      // which needs membership; whoever runs the restore becomes that owner.
+      await out(`GRANT ${q(r)} TO CURRENT_USER;\n`);
+    }
+    /* Default privileges: tables/sequences the server creates AFTER a restore
+       must still reach app_tenant, or tenant mode breaks on the next new table. */
+    const PRIV = { r: "SELECT", a: "INSERT", w: "UPDATE", d: "DELETE", D: "TRUNCATE", x: "REFERENCES", t: "TRIGGER", U: "USAGE", m: "MAINTAIN" };
+    const defacl = (await client.query(`
+      select defaclobjtype t, defaclacl::text[] acl from pg_default_acl where defaclrole = (select oid from pg_roles where rolname=current_user)`)).rows;
+    for (const d of defacl) {
+      const kind = { r: "TABLES", S: "SEQUENCES", f: "FUNCTIONS", T: "TYPES" }[d.t];
+      for (const item of d.acl || []) {
+        const m = String(item).match(/^"?([^"=]*)"?=([a-zA-Z*]*)\//);
+        if (!kind || !m || !polRoles.includes(m[1])) continue;
+        const privs = [...new Set(m[2].replace(/\*/g, "").split("").map((c) => PRIV[c]).filter(Boolean))];
+        if (privs.length) await out(`ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ${privs.join(", ")} ON ${kind} TO ${q(m[1])};\n`);
+      }
     }
     for (const p of pols) {
       const roles = (Array.isArray(p.roles) ? p.roles : String(p.roles || "").replace(/[{}]/g, "").split(","))

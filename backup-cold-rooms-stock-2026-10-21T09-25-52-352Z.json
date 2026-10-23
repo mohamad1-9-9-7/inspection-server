@@ -1,0 +1,10 @@
+[
+  {
+    "id": 20177,
+    "type": "cold_rooms_stock",
+    "payload": {
+      "rooms": {},
+      "reportDate": "stock"
+    }
+  }
+]
