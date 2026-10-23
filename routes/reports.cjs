@@ -287,6 +287,10 @@ const scopeRows = (rows, sites) =>
     الرابط لحاله لمّا يفتح صفحته، وما بتقراه ولا شاشة قائمة. لو تركناه بيمشي
     مع كل صف بكل طلب قائمة، وهيدا بالضبط نوع التضخّم اللي كلّفنا باندويث قبل.
     الصف المفرد (GET /api/reports/public/:token) بيرجّعه كما هو. */
+/* Branch temperature sheets the phone (QR) entry writes into — see
+   industries/meat/reportRoutes.cjs BRANCH_TEMP. Keep the two in step. */
+const PHONE_DAY_TYPES = ["pos10_temperature", "pos11_temperature", "pos15_temperature", "pos19_temperature_monitoring"];
+
 const stripDrafts = (rows) =>
   (rows || []).map((r) =>
     r && r.payload && r.payload.draft
@@ -1056,8 +1060,14 @@ app.get("/api/reports/kpi-days", readLimiter, auth, async (req, res) => {
         NULLIF(payload#>>'{header,reportDate}', ''),
         NULLIF(payload#>>'{header,date}', '')
       ), 10)`;
-    const p = [types, from, to];
-    let where = `type = ANY($1) AND ${DAY} >= $2 AND ${DAY} <= $3`;
+    /* A branch temperature day is created by the FIRST phone (QR) reading,
+       so a single reading made the day count as filed. It counts once the
+       sheet was saved from the input page — that save stamps payload.savedAt,
+       a phone reading never does. A record without quickReadings predates the
+       QR entry and was always a sheet save. */
+    const p = [types, from, to, PHONE_DAY_TYPES];
+    let where = `type = ANY($1) AND ${DAY} >= $2 AND ${DAY} <= $3
+      AND NOT (type = ANY($4) AND payload ? 'quickReadings' AND COALESCE(payload->>'savedAt', '') = '')`;
     const companyScope = companyIdOf(req);
     if (companyScope != null) { p.push(companyScope); where += ` AND company_id = $${p.length}`; }
 
