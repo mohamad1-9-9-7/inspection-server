@@ -1,5 +1,21 @@
 const cloudinary = require("cloudinary").v2;
 const alertEngine = require("../utils/alertEngine.cjs");
+const { purgeDeletedReportImages } = require("../utils/reportImages.cjs");
+const { runAsPlatform } = require("../utils/tenantContext.cjs");
+
+/* A deleted report's photos go from Cloudinary too (utils/reportImages.cjs).
+   After the answer, never awaited by the request; run as the platform so the
+   "is this file still used anywhere?" check sees every company's rows even
+   when TENANT_RLS confines the request to its own. */
+function purgeImagesLater(pool, rows, label) {
+  const payloads = (rows || []).map((r) => r.payload).filter(Boolean);
+  if (!payloads.length) return;
+  setImmediate(() => {
+    runAsPlatform(() => purgeDeletedReportImages(pool, payloads, label)).catch((e) =>
+      console.warn("[reportImages] purge failed:", e?.message || e)
+    );
+  });
+}
 
 module.exports = function registerReportsRoutes(app, deps = {}) {
   const { pool, clampInt, normText, isObj, requireAuth, requireAuthStrict, makeLimiter } = deps;
@@ -1240,6 +1256,7 @@ app.delete("/api/reports", auth, async (req, res) => {
       })
     );
     res.json({ ok: true, deleted: del.rowCount });
+    purgeImagesLater(pool, del.rows, `${type} ${reportDate}`);
   } catch (e) {
     console.error(e);
     res.status(500).json({ ok: false, error: String(e?.message || e) });
@@ -1269,6 +1286,7 @@ app.delete("/api/reports/:id(\\d+)", auth, async (req, res) => {
       companyId: companyForFilter,
     });
     res.json({ ok: true, deleted: del.rowCount });
+    purgeImagesLater(pool, del.rows, `${del.rows[0].type} #${id}`);
   } catch (e) {
     console.error(e);
     res.status(500).json({ ok: false, error: String(e?.message || e) });
