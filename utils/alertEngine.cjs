@@ -31,6 +31,7 @@
    query here filters by company_id itself.
 ============================================================ */
 const { sendPlatformMail } = require("../routes/mailer.cjs");
+const { supplierDates } = require("./supplierRisk.cjs");
 
 const RULES_TYPE = "alert_rules_config";
 
@@ -418,8 +419,34 @@ async function checkDaily(pool, companyId, checks, day, mode) {
   return checks.filter((c) => live.has(c.type) && !filed.has(c.type));
 }
 
-/* Expiring things: [{ key, name, branch, due, link }] per report family. */
+/* Expiring things: [{ key, name, branch, due, link }] per report family.
+   An item may carry { group, rank }: only the highest rank of a group counts
+   (e.g. a supplier evaluated twice — only the newest evaluation's dates). */
 const EXPIRY_SOURCES = [
+  {
+    types: ["supplier_self_assessment_form"],
+    link: "/haccp-iso/supplier-evaluation/results",
+    items: (row) => {
+      const p = row.payload || {};
+      const pub = p.public || {};
+      const submitted = !!pub.submittedAt || p.meta?.submitted === true;
+      if (!submitted || pub.disabled || pub.revokedAt) return [];
+      const rank = String(pub.submittedAt || p.meta?.submittedAt || row.id);
+      const label = {
+        reeval: (x) => `Supplier re-evaluation — ${x.name} (${x.level} risk)`,
+        halalCert: (x) => `Supplier Halal certificate — ${x.name}`,
+        halalDecl: (x) => `Supplier Halal declaration — ${x.name}`,
+      };
+      return supplierDates(p).map((x) => ({
+        key: `sup:${row.id}:${x.kind}`,
+        name: label[x.kind](x),
+        branch: "",
+        due: x.due,
+        group: `sup:${x.name.toLowerCase()}:${x.kind}`,
+        rank,
+      }));
+    },
+  },
   {
     types: ["calibration_record"],
     link: "/haccp-iso/calibration/view",
@@ -492,9 +519,15 @@ async function checkExpiries(pool, companyId, days, today) {
     if (!newest.has(devKey(x)) || x.due > newest.get(devKey(x)).due) newest.set(devKey(x), x);
   });
 
+  const latest = new Map();
+  all.filter((x) => x.group).forEach((x) => {
+    if (!latest.has(x.group) || x.rank > latest.get(x.group).rank) latest.set(x.group, x);
+  });
+
   const out = [];
   all.forEach((x) => {
     if (isRecordCal(x) && newest.get(devKey(x)) !== x) return;
+    if (x.group && latest.get(x.group) !== x) return;
     const left = daysBetween(today, x.due);
     if (left > days) return;
     out.push({ ...x, left, stage: left < 0 ? "expired" : "soon" });

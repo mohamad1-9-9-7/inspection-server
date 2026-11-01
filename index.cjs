@@ -17,6 +17,7 @@ const { rejectBase64 } = require("./utils/noBase64.cjs");
 
 const registerReportsRoutes = require("./routes/reports.cjs");
 const registerSupplierPublicRoutes = require("./routes/supplierPublic.cjs");
+const registerSupplierDocsRoutes = require("./routes/supplierDocs.cjs");
 const registerTrainingSessionRoutes = require("./routes/trainingSessions.cjs");
 const registerCatalogRoutes = require("./routes/catalog.cjs");
 const registerMediaRoutes = require("./routes/media.cjs");
@@ -174,6 +175,7 @@ const deps = {
 
 registerReportsRoutes(app, deps);
 registerSupplierPublicRoutes(app, deps);
+registerSupplierDocsRoutes(app, deps);
 registerTrainingSessionRoutes(app, deps);
 registerCatalogRoutes(app, deps);
 /* routes/trainingLinks.cjs retired (Sep 2026): no screen called it, the
