@@ -20,8 +20,9 @@
 const { raiseAlert } = require("../utils/alertEngine.cjs");
 
 module.exports = function registerSupplierDocsRoutes(app, deps = {}) {
-  const { pool, normText, isObj, rollbackQuietly, sendDbError, makeLimiter } = deps;
   const noGate = (_req, _res, next) => next();
+  const { pool, normText, isObj, rollbackQuietly, sendDbError, makeLimiter, requireAuthStrict, clampInt } = deps;
+  const strict = typeof requireAuthStrict === "function" ? requireAuthStrict : noGate;
   const limiter = typeof makeLimiter === "function"
     ? makeLimiter({ max: 40, windowMs: 60_000, name: "supplier-docs" })
     : noGate;
@@ -211,6 +212,85 @@ module.exports = function registerSupplierDocsRoutes(app, deps = {}) {
       return sendDbError(res, e);
     } finally {
       if (client) client.release();
+    }
+  });
+
+  /* ============================================================
+     Suppliers seen in goods receiving — GET /api/supplier-receiving?days=365
+     One row per supplier name: deliveries (records), last date, branches.
+     Aggregated in SQL so the page gets a short list, not a year of
+     receiving logs. The results page matches these names against the
+     evaluated suppliers and flags who still needs an evaluation.
+  ============================================================ */
+  const companyScopeOf = (req) => {
+    const u = req.user || {};
+    const id = Number(u.companyId);
+    if (Number.isFinite(id) && id > 0) return id;
+    if (u.isSuperAdmin) {
+      const q = Number(req.query?.company_id);
+      return Number.isFinite(q) && q > 0 ? q : null;
+    }
+    return 1;
+  };
+
+  app.get("/api/supplier-receiving", strict, async (req, res) => {
+    try {
+      const days = typeof clampInt === "function" ? clampInt(req.query.days, 365, 7, 1095) : 365;
+      const scope = companyScopeOf(req);
+      const params = [String(days)];
+      let companySql = "";
+      if (scope != null) {
+        params.push(scope);
+        companySql = `AND COALESCE(r.company_id, 1) = $${params.length}`;
+      }
+      const arr = (path) => `CASE WHEN jsonb_typeof(${path}) = 'array' THEN ${path} ELSE '[]'::jsonb END`;
+      const sql = `
+        WITH src AS (
+          SELECT r.id, r.type, r.payload, r.created_at
+            FROM reports r
+           WHERE (r.type LIKE '%receiving_log_butchery'
+                  OR r.type IN ('qcs_raw_material', 'qcs_rm_packaging', 'qcs_rm_ingredients', 'pos_al_qusais_fresh_chicken_receiving')
+                  OR r.type LIKE '%\\_receiving')
+             AND r.created_at >= now() - ($1 || ' days')::interval
+             ${companySql}
+        ),
+        names AS (
+          SELECT id, type, created_at, payload->>'branch' AS branch, x->>'supplier' AS supplier
+            FROM src, jsonb_array_elements(
+                   CASE WHEN jsonb_array_length(${arr("payload->'deliveries'")}) > 0
+                        THEN ${arr("payload->'deliveries'")} ELSE ${arr("payload->'entries'")} END) x
+           WHERE type LIKE '%receiving_log_butchery'
+          UNION ALL
+          SELECT id, type, created_at, 'QCS', x->>'supplier'
+            FROM src, jsonb_array_elements(${arr("payload->'entries'")}) x
+           WHERE type IN ('qcs_rm_packaging', 'qcs_rm_ingredients')
+          UNION ALL
+          SELECT id, type, created_at, COALESCE(payload->'generalInfo'->>'receivingAddress', 'QCS'), payload->'generalInfo'->>'supplierName'
+            FROM src WHERE type = 'qcs_raw_material'
+          UNION ALL
+          SELECT id, type, created_at, 'POS Al Qusais', payload->'header'->>'supplier'
+            FROM src WHERE type = 'pos_al_qusais_fresh_chicken_receiving'
+          UNION ALL
+          SELECT id, type, created_at, '', x->>'supplier'
+            FROM src, jsonb_array_elements(${arr("payload->'rows'")}) x
+           WHERE type LIKE '%\\_receiving' AND type NOT LIKE '%receiving_log_butchery'
+        )
+        SELECT MAX(btrim(supplier)) AS supplier,
+               COUNT(DISTINCT id)::int AS deliveries,
+               to_char(MAX(created_at), 'YYYY-MM-DD') AS last_date,
+               to_char(MIN(created_at), 'YYYY-MM-DD') AS first_date,
+               ARRAY_REMOVE(ARRAY_AGG(DISTINCT NULLIF(btrim(branch), '')), NULL) AS branches,
+               ARRAY_AGG(DISTINCT type) AS types
+          FROM names
+         WHERE btrim(COALESCE(supplier, '')) <> ''
+         GROUP BY lower(regexp_replace(btrim(supplier), '\\s+', ' ', 'g'))
+         ORDER BY deliveries DESC
+         LIMIT 1000`;
+      const q = await pool.query(sql, params);
+      return res.json({ ok: true, days, suppliers: q.rows });
+    } catch (e) {
+      console.error("GET /api/supplier-receiving ERROR =", e);
+      return sendDbError(res, e);
     }
   });
 };
