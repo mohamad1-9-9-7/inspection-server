@@ -691,6 +691,26 @@ module.exports = async function ensureSchema({ pool, genSalt, hashPw }) {
   `);
   await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS ux_alerts_company_dedupe ON alerts (COALESCE(company_id, 1), dedupe_key) WHERE dedupe_key IS NOT NULL`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_alerts_company_status ON alerts (COALESCE(company_id, 1), status, created_at DESC)`);
+  /* Inspector links (routes/inspectorLinks.cjs): a QR an outside inspector
+     scans to read the last 7 days of one report. Only the SHA-256 of the
+     token is kept — the plain token is shown once, when the QR is printed. */
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS inspector_links (
+      id             BIGSERIAL PRIMARY KEY,
+      company_id     INT          NOT NULL,
+      token_hash     TEXT         NOT NULL UNIQUE,
+      report_type    TEXT         NOT NULL,
+      label          TEXT         NOT NULL DEFAULT '',
+      created_by     TEXT         NOT NULL DEFAULT '',
+      created_at     TIMESTAMPTZ  NOT NULL DEFAULT now(),
+      expires_at     TIMESTAMPTZ  NOT NULL,
+      revoked_at     TIMESTAMPTZ,
+      revoked_by     TEXT         NOT NULL DEFAULT '',
+      last_opened_at TIMESTAMPTZ,
+      open_count     INT          NOT NULL DEFAULT 0
+    );
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_inspector_links_company ON inspector_links (company_id, report_type, created_at DESC)`);
   /* A scheduled check runs once per slot per day, across restarts and
      instances: the run claims (job, day) first; a second claim finds it taken. */
   await pool.query(`

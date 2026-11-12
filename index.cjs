@@ -32,6 +32,7 @@ const registerTrialRoutes = require("./routes/trial.cjs");
 const registerPromoCodeRoutes = require("./routes/promoCodes.cjs");
 const registerMyBillingRoutes = require("./routes/myBilling.cjs");
 const registerAlertRoutes = require("./routes/alerts.cjs");
+const registerInspectorLinkRoutes = require("./routes/inspectorLinks.cjs");
 const { startAlertScheduler } = require("./utils/alertEngine.cjs");
 
 const app = express();
@@ -195,6 +196,7 @@ registerTrialRoutes(app, deps);
 registerPromoCodeRoutes(app, deps);
 registerMyBillingRoutes(app, { ...deps, billing });
 registerAlertRoutes(app, deps);
+registerInspectorLinkRoutes(app, deps);
 
 // Schema migrations are meant to be additive/idempotent, and every table
 // that matters has existed for a long time — one bad migration step should

@@ -40,6 +40,7 @@ async function eraseCompany(pool, id) {
     counts = (await client.query(DELETE_COUNTS_SQL, [id])).rows[0];
     await client.query(`DELETE FROM report_audit    WHERE company_id = $1`, [id]);
     await client.query(`DELETE FROM email_history   WHERE company_id = $1`, [id]);
+    await client.query(`DELETE FROM inspector_links WHERE company_id = $1`, [id]);
     // Payment receipts reference both the company (RESTRICT) and its invoices.
     await client.query(`DELETE FROM payment_proofs  WHERE company_id = $1`, [id]);
     await client.query(`DELETE FROM invoices        WHERE company_id = $1`, [id]);

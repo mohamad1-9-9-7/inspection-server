@@ -48,6 +48,7 @@ const TENANT_TABLES = [
   ["companies", "id"],
   ["payment_proofs", "company_id"],
   ["alerts", "company_id"],
+  ["inspector_links", "company_id"],
 ];
 
 async function ensureTenantRls(pool) {
