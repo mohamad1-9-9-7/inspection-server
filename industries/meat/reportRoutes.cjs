@@ -488,8 +488,9 @@ const BRANCH_TEMP = {
     slots: ["8:00 AM", "11:00 AM", "2:00 PM", "5:00 PM", "8:00 PM", "10:00 PM"] },
   pos19_temperature_monitoring: { shape: "pos19", branch: "POS 19", reporter: "pos19",
     slots: ["am", "pm", "ev"] },
+  // the truck opens 1 PM – 10 PM — ftr1/ftr1TempUnits.js GRID_TIMES
   ftr1_temperature: { shape: "grid", branch: "FTR 1", reporter: "ftr1", typedUnits: true,
-    slots: ["8:00 AM", "11:00 AM", "2:00 PM", "5:00 PM", "8:00 PM", "10:00 PM"] },
+    slots: ["1:00 PM", "4:00 PM", "7:00 PM", "10:00 PM"] },
 };
 const GRID_UNIT_TYPES = new Set(["chiller", "freezer"]);
 const POS19_TARGET = { chiller: "≤ 5°C", freezer: "≤ -18°C", ambient: "≤ 25°C" };
