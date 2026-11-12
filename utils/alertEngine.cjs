@@ -44,11 +44,12 @@ const DEFAULT_DAILY = [
   { type: "pos11_temperature", branch: "POS 11", label: "POS 11 temperature" },
   { type: "pos15_temperature", branch: "POS 15", label: "POS 15 temperature" },
   { type: "pos19_temperature_monitoring", branch: "POS 19", label: "POS 19 temperature" },
+  { type: "ftr1_temperature", branch: "FTR 1", label: "FTR 1 temperature" },
 ];
-const TEMP_TYPES = new Set(["qcs-coolers", "pos10_temperature", "pos11_temperature", "pos15_temperature", "pos19_temperature_monitoring"]);
+const TEMP_TYPES = new Set(["qcs-coolers", "pos10_temperature", "pos11_temperature", "pos15_temperature", "pos19_temperature_monitoring", "ftr1_temperature"]);
 /* A phone (QR) reading creates the day; the day is FILED once the sheet is
    saved (payload.savedAt) — same rule as /api/reports/kpi-days. */
-const PHONE_DAY_TYPES = ["pos10_temperature", "pos11_temperature", "pos15_temperature", "pos19_temperature_monitoring"];
+const PHONE_DAY_TYPES = ["pos10_temperature", "pos11_temperature", "pos15_temperature", "pos19_temperature_monitoring", "ftr1_temperature"];
 
 const DEFAULT_RULES = {
   temperature: { enabled: true, emails: [] },
@@ -249,6 +250,7 @@ const SHEET_BRANCH = {
   pos11_temperature: "POS 11",
   pos15_temperature: "POS 15",
   pos19_temperature_monitoring: "POS 19",
+  ftr1_temperature: "FTR 1",
 };
 const TIME_SLOT = /^\d{1,2}:\d{2} (AM|PM)$/;
 const NO_MIN = -60;
@@ -274,6 +276,11 @@ function gridDef(name) {
   if (/production|prep/.test(n)) return { min: NO_MIN, max: 10 };
   if (/loading/.test(n)) return { min: NO_MIN, max: 16 };
   return { min: NO_MIN, max: 5 };
+}
+/* FTR 1: the row's type (unit editor), else the name — ftr1/ftr1TempUnits.js. */
+function ftr1Def(c) {
+  const freezer = c?.type ? c.type === "freezer" : /freez/i.test(String(c?.name || ""));
+  return freezer ? { min: -20, max: -16 } : { min: 0, max: 5 };
 }
 function pos19Def(unitType) {
   if (unitType === "freezer") return { min: NO_MIN, max: -18 };
@@ -317,7 +324,7 @@ function sheetReadings(type, payload) {
     (Array.isArray(p.coolers) ? p.coolers : []).forEach((c) => {
       const name = String(c?.name || "").trim();
       if (!name) return;
-      const lim = gridDef(name);
+      const lim = type === "ftr1_temperature" ? ftr1Def(c) : gridDef(name);
       temps(c?.temps, (slot, v) => put(name, name, slot, v, lim));
     });
   }

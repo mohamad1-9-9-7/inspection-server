@@ -466,7 +466,8 @@ app.post("/api/reports/qcs-coolers/reading", auth, async (req, res) => {
    record inside a transaction, so phones never overwrite each other.
 
    Two record shapes exist today:
-   • "grid"  (POS 10 / 11 / 15) — payload.coolers[{ name, temps: { "8:00 AM": "3" }, remarks }]
+   • "grid"  (POS 10 / 11 / 15, FTR 1) — payload.coolers[{ name, type?, temps: { "8:00 AM": "3" }, remarks }]
+             (FTR 1 rows carry type "chiller" | "freezer" — its unit editor sets it)
    • "pos19" (POS 19)           — payload.entries[{ equipment, unitType, am_time, am_temp, … }]
    A unit is matched by NAME (case-insensitive); an unknown name is added
    as a new row. Same readingId twice = no change. A filled slot answers
@@ -487,7 +488,10 @@ const BRANCH_TEMP = {
     slots: ["8:00 AM", "11:00 AM", "2:00 PM", "5:00 PM", "8:00 PM", "10:00 PM"] },
   pos19_temperature_monitoring: { shape: "pos19", branch: "POS 19", reporter: "pos19",
     slots: ["am", "pm", "ev"] },
+  ftr1_temperature: { shape: "grid", branch: "FTR 1", reporter: "ftr1", typedUnits: true,
+    slots: ["8:00 AM", "11:00 AM", "2:00 PM", "5:00 PM", "8:00 PM", "10:00 PM"] },
 };
+const GRID_UNIT_TYPES = new Set(["chiller", "freezer"]);
 const POS19_TARGET = { chiller: "≤ 5°C", freezer: "≤ -18°C", ambient: "≤ 25°C" };
 const sameName = (a, b) => String(a || "").trim().toLowerCase() === String(b || "").trim().toLowerCase();
 const appendText = (prev, line) => (prev ? `${prev} | ${line}` : line);
@@ -539,7 +543,11 @@ async function mergeBranchReading(req, cfg, b) {
       }
       day.coolers = Array.isArray(day.coolers) ? day.coolers : [];
       let unit = day.coolers.find((c) => c && sameName(c.name, b.unit));
-      if (!unit) { unit = { name: b.unit, temps: {}, remarks: "" }; day.coolers.push(unit); }
+      if (!unit) {
+        unit = { name: b.unit, temps: {}, remarks: "" };
+        if (cfg.typedUnits && GRID_UNIT_TYPES.has(b.unitType)) unit.type = b.unitType;
+        day.coolers.push(unit);
+      }
       unit.temps = isObj(unit.temps) ? unit.temps : {};
       if (b.kind === "reading") {
         const prev = String(unit.temps[b.slot] ?? "").trim();

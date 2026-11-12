@@ -319,7 +319,7 @@ const scopeRows = (rows, sites) =>
     الصف المفرد (GET /api/reports/public/:token) بيرجّعه كما هو. */
 /* Branch temperature sheets the phone (QR) entry writes into — see
    industries/meat/reportRoutes.cjs BRANCH_TEMP. Keep the two in step. */
-const PHONE_DAY_TYPES = ["pos10_temperature", "pos11_temperature", "pos15_temperature", "pos19_temperature_monitoring"];
+const PHONE_DAY_TYPES = ["pos10_temperature", "pos11_temperature", "pos15_temperature", "pos19_temperature_monitoring", "ftr1_temperature"];
 
 const stripDrafts = (rows) =>
   (rows || []).map((r) =>
