@@ -951,6 +951,23 @@ module.exports = async function ensureSchema({ pool, genSalt, hashPw }) {
     // The promo code the visitor came with (routes/promoCodes.cjs) — who brought this lead.
     await pool.query(`ALTER TABLE demo_requests ADD COLUMN IF NOT EXISTS promo_code TEXT NOT NULL DEFAULT ''`);
     await pool.query(`CREATE INDEX IF NOT EXISTS ix_demo_requests_promo ON demo_requests(promo_code) WHERE promo_code <> ''`);
+    /* Every finished readiness check, even when the visitor leaves no number:
+       score + answers + where they came from. No name, phone or IP. lead_id is
+       set if the same visitor then left their details (routes/demoRequests.cjs). */
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS demo_quiz_runs (
+        id          SERIAL      PRIMARY KEY,
+        score       INT         NOT NULL,
+        answers     JSONB,
+        source      TEXT        NOT NULL DEFAULT '',
+        lang        TEXT        NOT NULL DEFAULT '',
+        country     TEXT        NOT NULL DEFAULT '',
+        device      TEXT        NOT NULL DEFAULT '',
+        lead_id     INT,
+        created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+      )
+    `);
+    await pool.query(`CREATE INDEX IF NOT EXISTS ix_demo_quiz_runs_created ON demo_quiz_runs(created_at DESC)`);
     /* One code per person who brings customers (routes/promoCodes.cjs). */
     await pool.query(`
       CREATE TABLE IF NOT EXISTS promo_codes (

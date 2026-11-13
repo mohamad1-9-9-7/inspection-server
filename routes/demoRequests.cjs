@@ -14,6 +14,9 @@
    an expired deadline.
      POST   /api/demo-requests/wa-click  PUBLIC  count a WhatsApp tap per ?src=
      POST   /api/demo-requests/quiz-event PUBLIC { event: start|done, source }
+            done + { score, answers, lang, country, device } also stores a row in
+            demo_quiz_runs (no name/phone/IP) → { runId }; the lead POST can send
+            quizRunId to link it. DELETE /api/demo-quiz-runs/:id  super-admin.
 
    Readiness check (/readiness): a finished check that asks for its full
    report POSTs to /api/demo-requests like any lead, plus quizScore (0-100)
@@ -238,6 +241,15 @@ module.exports = function registerDemoRequestRoutes(app, deps = {}) {
       );
       res.status(201).json({ ok: true, id: rows[0].id });
       notifyOwner(d);
+      // Tie the finished check to this lead (same score, recent, not yet linked).
+      const runId = Number(body.quizRunId);
+      if (d.quizScore != null && Number.isInteger(runId) && runId > 0) {
+        pool.query(
+          `UPDATE demo_quiz_runs SET lead_id = $1
+            WHERE id = $2 AND lead_id IS NULL AND score = $3 AND created_at > now() - interval '6 hours'`,
+          [rows[0].id, runId, d.quizScore]
+        ).catch((e) => console.error("[demo-requests] quiz run link failed:", e?.message || e));
+      }
     } catch (e) {
       console.error("POST /api/demo-requests ERROR:", e?.message || e);
       if (!res.headersSent) res.status(500).json({ ok: false, error: "save_failed" });
@@ -269,8 +281,28 @@ module.exports = function registerDemoRequestRoutes(app, deps = {}) {
     try {
       const ev = String(req.body?.event || "");
       if (!QUIZ_EVENTS.has(ev)) return res.status(400).json({ ok: false, error: "bad_event" });
-      await bump(QUIZ_KEY, `${ev}:${srcSlug(req.body?.source)}`);
-      res.json({ ok: true });
+      const b = req.body || {};
+      await bump(QUIZ_KEY, `${ev}:${srcSlug(b.source)}`);
+      // A finished check is kept on its own (no name/phone/IP) so the owner can read it.
+      let runId = null;
+      const score = Number(b.score);
+      if (ev === "done" && Number.isInteger(score) && score >= 0 && score <= 100) {
+        const cc = String(b.country || "").toUpperCase();
+        const { rows } = await pool.query(
+          `INSERT INTO demo_quiz_runs (score, answers, source, lang, country, device)
+           VALUES ($1, $2::jsonb, $3, $4, $5, $6) RETURNING id`,
+          [
+            score,
+            JSON.stringify(cleanAnswers(b.answers)),
+            srcSlug(b.source),
+            b.lang === "ar" ? "ar" : "en",
+            /^[A-Z]{2}$/.test(cc) ? cc : "",
+            ["mobile", "tablet", "desktop"].includes(b.device) ? b.device : "",
+          ]
+        );
+        runId = rows[0]?.id || null;
+      }
+      res.json({ ok: true, runId });
     } catch (e) {
       console.error("POST /api/demo-requests/quiz-event ERROR:", e?.message || e);
       res.json({ ok: false });
@@ -392,7 +424,11 @@ module.exports = function registerDemoRequestRoutes(app, deps = {}) {
       const waClicks = await readSetting(CLICKS_KEY).catch(() => ({}));
       const config = await readSetting(CONFIG_KEY).catch(() => ({}));
       const quizStats = await readSetting(QUIZ_KEY).catch(() => ({}));
-      res.json({ ok: true, requests: rows, waClicks, quizStats, config, whatsapp: String(config.whatsapp || "") });
+      const quizRuns = await pool.query(
+        `SELECT id, score, answers, source, lang, country, device, lead_id, created_at
+           FROM demo_quiz_runs ORDER BY created_at DESC LIMIT 1000`
+      ).then((r) => r.rows).catch(() => []);
+      res.json({ ok: true, requests: rows, waClicks, quizStats, quizRuns, config, whatsapp: String(config.whatsapp || "") });
     } catch (e) {
       console.error("GET /api/demo-requests ERROR:", e?.message || e);
       res.status(500).json({ ok: false, error: "load_failed" });
@@ -426,6 +462,19 @@ module.exports = function registerDemoRequestRoutes(app, deps = {}) {
     } catch (e) {
       console.error("PATCH /api/demo-requests ERROR:", e?.message || e);
       res.status(500).json({ ok: false, error: "update_failed" });
+    }
+  });
+
+  app.delete("/api/demo-quiz-runs/:id", ...gate, async (req, res) => {
+    try {
+      const id = Number(req.params.id);
+      if (!Number.isInteger(id) || id <= 0) return res.status(400).json({ ok: false, error: "bad_id" });
+      const { rowCount } = await pool.query(`DELETE FROM demo_quiz_runs WHERE id = $1`, [id]);
+      if (!rowCount) return res.status(404).json({ ok: false, error: "not_found" });
+      res.json({ ok: true });
+    } catch (e) {
+      console.error("DELETE /api/demo-quiz-runs ERROR:", e?.message || e);
+      res.status(500).json({ ok: false, error: "delete_failed" });
     }
   });
 
