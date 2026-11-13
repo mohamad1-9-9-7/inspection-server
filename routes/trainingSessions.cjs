@@ -122,7 +122,7 @@ app.get("/api/training-session/by-token/:token", publicLimiter, async (req, res)
     });
   } catch (e) {
     console.error("GET /api/training-session/by-token/:token ERROR =", e);
-    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+    return res.status(500).json({ ok: false, error: "server_error" });
   }
 });
 

@@ -7,6 +7,7 @@ module.exports = function registerAdminRoutes(app, deps = {}) {
           requireAuthStrict, requireSuperAdmin, verifyToken, tokenFromReq,
           userLocked = () => 0, userFailed = () => {}, userReset = () => {} } = deps;
   const SCRYPT_PFX = "scrypt:";
+  const DUMMY_SALT = typeof genSalt === "function" ? genSalt() : SCRYPT_PFX + "00";
 
   const noLimit = (_req, _res, next) => next();
   /* Account/audit surfaces are admin-only. They were previously guarded by
@@ -19,37 +20,10 @@ module.exports = function registerAdminRoutes(app, deps = {}) {
      the client-side isAdmin flag), and so could any signed-in account. */
   const superOnly = typeof requireSuperAdmin === "function" ? requireSuperAdmin : noLimit;
 
-/* --------- Auth: verify role password --------- */
-app.post("/api/auth/verify-role", (req, res) => {
-  const { roleId, password } = req.body || {};
-
-  if (!roleId || typeof password !== "string") {
-    return res.status(400).json({ success: false, error: "Missing roleId or password" });
-  }
-
-  let passwords;
-  try {
-    passwords = JSON.parse(process.env.ROLE_PASSWORDS_JSON || "{}");
-  } catch {
-    return res.status(500).json({ success: false, error: "Server config error" });
-  }
-
-  const expected = passwords[roleId] ?? passwords["default"];
-
-  if (expected === undefined) {
-    // Role not configured server-side — defer to client-side auth silently
-    return res.json({ success: true });
-  }
-
-  if (password === expected) {
-    return res.json({ success: true });
-  }
-
-  // تأخير 500ms لمنع brute-force
-  setTimeout(() => {
-    res.status(401).json({ success: false, error: "Wrong password" });
-  }, 500);
-});
+/* REMOVED (Nov 2026): POST /api/auth/verify-role — no screen called it, it
+   answered success:true for any role not listed in ROLE_PASSWORDS_JSON, and
+   compared plain-text passwords with no real throttle. Sign-in is
+   POST /api/auth/login only. */
 
 /* ============================================================
    Reports summary — one query returns count + latest per type.
@@ -215,21 +189,26 @@ app.post("/api/auth/login", async (req, res) => {
     };
 
     if (!q.rowCount) {
+      /* Burn the same scrypt time as a real account, so the response time
+         doesn't tell an unknown name from a wrong password. */
+      verifyPw(password, DUMMY_SALT, "");
       await logFailed("unknown_user");
       return res.status(401).json({ ok: false, error: "invalid_credentials" });
     }
 
     const user = q.rows[0];
 
-    if (!user.is_active) {
-      await logFailed("account_disabled");
-      return res.status(403).json({ ok: false, error: "account_disabled" });
-    }
-
+    /* Password FIRST: answering "account_disabled" before it told anyone
+       guessing names which accounts exist (and which are switched off). */
     if (!verifyPw(password, user.salt, user.password_hash)) {
       userFailed(username);
       await logFailed("wrong_password");
       return res.status(401).json({ ok: false, error: "invalid_credentials" });
+    }
+
+    if (!user.is_active) {
+      await logFailed("account_disabled");
+      return res.status(403).json({ ok: false, error: "account_disabled" });
     }
 
     /* ── A company's own site signs in only that company's accounts ──
@@ -377,10 +356,14 @@ app.put("/api/auth/me/lang", strict, async (req, res) => {
 /* POST /api/auth/logout  { username } */
 app.post("/api/auth/logout", async (req, res) => {
   try {
-    const username = normText(req.body?.username);
+    /* Who logged out comes from the session token, never from the body —
+       anyone could POST { username: "admin" } and write fake logout lines
+       into the security log. No valid token = nothing to record. */
+    const raw = typeof tokenFromReq === "function" ? tokenFromReq(req) : null;
+    const tok = raw && typeof verifyToken === "function" ? verifyToken(raw) : null;
+    const username = tok ? normText(tok.username) : "";
     if (username) {
-      const u = await pool.query(`SELECT id FROM app_users WHERE username=$1 LIMIT 1`, [username]);
-      const uid = u.rows[0]?.id || null;
+      const uid = tok.uid || null;
       const ip = req.headers["x-forwarded-for"]?.split(",")[0]?.trim() || req.socket.remoteAddress || "";
       await pool.query(
         `INSERT INTO activity_log (user_id, username, action, ip_addr)

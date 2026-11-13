@@ -219,7 +219,7 @@ app.post("/api/supplier-links", strict, async (req, res) => {
     return res.status(201).json({ ok: true, link: ins.rows[0] });
   } catch (e) {
     console.error("POST /api/supplier-links ERROR =", e);
-    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+    return res.status(500).json({ ok: false, error: "server_error" });
   }
 });
 
@@ -284,7 +284,7 @@ app.get("/api/supplier-links/:token", publicLimiter, async (req, res) => {
     });
   } catch (e) {
     console.error("GET /api/supplier-links/:token ERROR =", e);
-    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+    return res.status(500).json({ ok: false, error: "server_error" });
   }
 });
 

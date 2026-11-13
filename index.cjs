@@ -40,6 +40,18 @@ const PORT = process.env.PORT || 5000;
 
 app.disable("x-powered-by");
 
+/* Baseline security headers. The API answers JSON (and a few downloads),
+   never pages, so it can refuse to be framed or sniffed outright. */
+app.use((req, res, next) => {
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  // /api/files/* redirects an <iframe> to a Cloudinary PDF — never block that.
+  if (!req.path.startsWith("/api/files/")) res.setHeader("X-Frame-Options", "DENY");
+  res.setHeader("Referrer-Policy", "no-referrer");
+  res.setHeader("Strict-Transport-Security", "max-age=31536000; includeSubDomains");
+  res.setHeader("Cross-Origin-Resource-Policy", "cross-origin");
+  next();
+});
+
 /* Express 4 does not catch a rejected promise from an async handler: the
    request hangs until the client times out, and on Node 18 the unhandled
    rejection takes the WHOLE process down — every company's session with it.
@@ -150,6 +162,7 @@ app.use("/api/reports", (req, res, next) => {
 });
 /* Per-report permissions (input / view per report of a branch), checked on
    the server and not only by hiding tabs — see utils/reportGrants.cjs. */
+app.use("/api/reports", require("./utils/reportGrants.cjs").reportDeleteGate(pool));
 app.use("/api/reports", require("./utils/reportGrants.cjs").reportGrantGate(pool));
 
 /* INSPECT PRO's own documents (quotations + their settings) live outside

@@ -229,7 +229,7 @@ function cleanList(v, cap = MAX_RECIPIENTS) {
    verify/send answer 403.
    MAIL_COMPANY_IDS = comma-separated company ids that own the mailbox;
    unset = "1". */
-const { companyOf } = require("../utils/tenant.cjs");
+const { companyOf, userOf } = require("../utils/tenant.cjs");
 
 function mailCompanies() {
   const raw = String(process.env.MAIL_COMPANY_IDS || "1");
@@ -254,7 +254,11 @@ module.exports = function registerMailerRoutes(app, deps = {}) {
   /* Is direct sending available? Never exposes the password. */
   app.get("/api/email/status", (req, res) => {
     const cfg = smtpConfig();
-    const ownMailbox = companyHasMailbox(req);
+    /* A visitor with no session used to fall into company 1 and be told the
+       mailbox address and SMTP host. Only a signed-in account (or a server
+       with no AUTH_SECRET, local dev) learns anything. */
+    const signedIn = !process.env.AUTH_SECRET || !!userOf(req);
+    const ownMailbox = signedIn && companyHasMailbox(req);
     res.json({
       ok: true,
       configured: cfg.configured && ownMailbox,

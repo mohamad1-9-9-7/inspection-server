@@ -177,7 +177,7 @@ module.exports = function registerAuditRoutes(app, deps = {}) {
       return res.json({ ok: true, total, rows });
     } catch (e) {
       console.error("GET /api/audit ERROR =", e);
-      return res.status(500).json({ ok: false, error: String(e?.message || e) });
+      return res.status(500).json({ ok: false, error: "server_error" });
     }
   });
 
@@ -251,7 +251,7 @@ module.exports = function registerAuditRoutes(app, deps = {}) {
       });
     } catch (e) {
       console.error("GET /api/audit/stats ERROR =", e);
-      return res.status(500).json({ ok: false, error: String(e?.message || e) });
+      return res.status(500).json({ ok: false, error: "server_error" });
     }
   });
 
@@ -274,7 +274,7 @@ module.exports = function registerAuditRoutes(app, deps = {}) {
       return res.json({ ok: true, types: q.rows });
     } catch (e) {
       console.error("GET /api/audit/types ERROR =", e);
-      return res.status(500).json({ ok: false, error: String(e?.message || e) });
+      return res.status(500).json({ ok: false, error: "server_error" });
     }
   });
 };

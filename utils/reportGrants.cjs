@@ -122,7 +122,10 @@ async function loadGrants(pool, uid) {
     const sections = Object.keys(crud).filter((s) => Array.isArray(crud[s]) && crud[s].length);
     // Only branch screens → its reads can be gated without breaking anything else.
     const branchOnly = sections.length > 0 && sections.every((s) => s === "daily" || s === "admin");
-    grants = { full, set: new Set(list), restricted, branchOnly };
+    // Any section granting "delete" (the frontend's canDelete(section) — the
+    // server has no type → section map, so this is the coarse version).
+    const mayDelete = full || sections.some((sec) => crud[sec].includes("delete"));
+    grants = { full, set: new Set(list), restricted, branchOnly, mayDelete };
   }
   cache.set(key, { at: Date.now(), grants });
   return grants;
@@ -207,4 +210,44 @@ function reportGrantGate(pool) {
   };
 }
 
-module.exports = { reportGrantGate, forgetGrants, TYPE_REPORT };
+/* ============================================================
+   Whole-record DELETE under /api/reports — checked on the server.
+
+   Until now a delete needed nothing: with REQUIRE_AUTH in audit mode an
+   anonymous script could walk /api/reports/1…N and erase every record (and
+   its photos, see purgeImagesLater), and any signed-in account could delete
+   records the app never shows it a Delete button for.
+
+   • no valid token → 401. No screen deletes without a session (the butcher
+     kiosk and the public token pages only read/write), so this is safe even
+     while REQUIRE_AUTH stays in audit mode. Skipped only when AUTH_SECRET is
+     unset (local dev: no token can exist).
+   • admin / super-admin / full access → allowed.
+   • any other account → needs "delete" in at least one crud_perms section,
+     the same flag that shows Delete buttons in the app.
+============================================================ */
+function reportDeleteGate(pool) {
+  return async function deleteGate(req, res, next) {
+    if (req.method !== "DELETE") return next();
+    if (!process.env.AUTH_SECRET) return next();
+    let user = null;
+    try {
+      const raw = tokenFromReq(req);
+      user = raw ? verifyTokenRaw(raw) : null;
+    } catch { user = null; }
+    if (!user) return res.status(401).json({ ok: false, error: "auth_required" });
+    if (user.isAdmin || user.isSuperAdmin) return next();
+    if (!user.uid) return res.status(403).json({ ok: false, error: "delete_not_allowed" });
+    try {
+      const grants = await loadGrants(pool, user.uid);
+      if (grants && grants.mayDelete) return next();
+      console.warn(`[report-delete] refused for ${user.username || user.uid}: ${req.method} ${req.originalUrl}`);
+      return res.status(403).json({ ok: false, error: "delete_not_allowed" });
+    } catch (e) {
+      console.warn("[report-delete] check failed:", e?.message || e);
+      return res.status(503).json({ ok: false, error: "permission_check_failed" });
+    }
+  };
+}
+
+module.exports = { reportGrantGate, reportDeleteGate, forgetGrants, TYPE_REPORT };

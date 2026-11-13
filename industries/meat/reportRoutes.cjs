@@ -215,7 +215,7 @@ app.put("/api/reports/returns", auth, async (req, res) => {
     return res.status(201).json({ ok: true, report: ins.rows[0], method: "insert" });
   } catch (e) {
     console.error("PUT /api/reports/returns ERROR =", e);
-    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+    return res.status(500).json({ ok: false, error: "server_error" });
   }
 });
 
@@ -264,7 +264,7 @@ app.put("/api/reports/qcs", auth, async (req, res) => {
     return res.status(201).json({ ok: true, report: ins.rows[0], method: "insert" });
   } catch (e) {
     console.error("PUT /api/reports/qcs ERROR =", e);
-    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+    return res.status(500).json({ ok: false, error: "server_error" });
   }
 });
 
@@ -454,7 +454,7 @@ app.post("/api/reports/qcs-coolers/reading", auth, async (req, res) => {
     return res.status(out.status).json(out.json);
   } catch (e) {
     console.error("POST /api/reports/qcs-coolers/reading ERROR =", e);
-    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+    return res.status(500).json({ ok: false, error: "server_error" });
   }
 });
 
@@ -669,7 +669,7 @@ app.post("/api/reports/branch-temp/reading", auth, async (req, res) => {
     return res.status(out.status).json(out.json);
   } catch (e) {
     console.error("POST /api/reports/branch-temp/reading ERROR =", e);
-    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+    return res.status(500).json({ ok: false, error: "server_error" });
   }
 });
 
@@ -895,7 +895,7 @@ app.post("/api/reports/cold-rooms-stock/move", auth, async (req, res) => {
     return res.status(out.status).json(out.json);
   } catch (e) {
     console.error("POST /api/reports/cold-rooms-stock/move ERROR =", e);
-    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+    return res.status(500).json({ ok: false, error: "server_error" });
   }
 });
 };

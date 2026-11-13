@@ -76,7 +76,7 @@ async function listCatalogProducts(req, res, fallbackScope = "returns_items") {
     return res.json({ ok: true, scope, count: items.length, items, map });
   } catch (e) {
     console.error("GET catalog products ERROR =", e);
-    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+    return res.status(500).json({ ok: false, error: "server_error" });
   }
 }
 
@@ -101,7 +101,7 @@ async function upsertCatalogProduct(req, res, fallbackScope = "returns_items") {
     return res.json({ ok: true, item: catalogRowToClient(rows[0]) });
   } catch (e) {
     console.error("UPSERT catalog products ERROR =", e);
-    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+    return res.status(500).json({ ok: false, error: "server_error" });
   }
 }
 
@@ -194,7 +194,7 @@ async function deleteCatalogProduct(req, res, fallbackScope = "returns_items") {
     });
   } catch (e) {
     console.error("DELETE catalog products ERROR =", e);
-    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+    return res.status(500).json({ ok: false, error: "server_error" });
   }
 }
 
@@ -234,7 +234,7 @@ app.get("/api/product-catalog", async (req, res) => {
     return res.json({ ok: true, scope, count: rows.length, items: rows, map });
   } catch (e) {
     console.error("GET /api/product-catalog ERROR =", e);
-    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+    return res.status(500).json({ ok: false, error: "server_error" });
   }
 });
 
@@ -267,7 +267,7 @@ app.post("/api/product-catalog", strict, async (req, res) => {
       });
     }
 
-    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+    return res.status(500).json({ ok: false, error: "server_error" });
   }
 });
 };

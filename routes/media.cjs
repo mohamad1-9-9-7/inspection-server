@@ -126,7 +126,7 @@ app.get("/api/files/cloudinary/:publicId", lookupLimiter, async (req, res) => {
     return res.redirect(302, url);
   } catch (e) {
     console.error("GET /api/files/cloudinary/:publicId ERROR =", e);
-    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+    return res.status(500).json({ ok: false, error: "server_error" });
   }
 });
 
@@ -158,7 +158,7 @@ app.get("/health/db", async (_req, res) => {
     }
     res.json({ ok: true, db: "connected", roundTripMs: ms.map((x) => Math.round(x * 10) / 10) });
   } catch (e) {
-    res.status(500).json({ ok: false, error: String(e) });
+    res.status(500).json({ ok: false, error: "server_error" });
   }
 });
 
@@ -190,6 +190,23 @@ function uploadBufferToCloudinary(buffer, opts = {}) {
   });
 }
 
+/* This route is open (public token pages upload evidence with no login), so
+   it must not double as free hosting for web pages or programs under our
+   Cloudinary account — an uploaded .html is served back as a live page that
+   phishing mail can link to. The app only ever uploads photos, PDFs, office
+   documents and text/CSV; active content is refused by extension, by the
+   declared type, and by sniffing the first bytes (an HTML page renamed). */
+const BLOCKED_EXT = /\.(html?|xhtml|shtml|mht|hta|js|mjs|cjs|jsx|ts|php\d?|phtml|asp|aspx|jsp|cgi|pl|py|rb|sh|bash|ps1|psm1|bat|cmd|com|exe|msi|msp|dll|scr|vbs|vbe|wsf|jar|apk|app|dmg|iso|swf|xml|xsl|xslt)$/i;
+const BLOCKED_MIME = /^(text\/html|application\/xhtml\+xml|text\/javascript|application\/(x-)?javascript|application\/ecmascript|application\/x-(msdownload|msdos-program|sh|httpd-php)|application\/java-archive|application\/vnd\.android\.package-archive|application\/x-shockwave-flash|text\/xml|application\/xml)\b/i;
+function blockedUpload(f) {
+  if (BLOCKED_EXT.test(String(f.originalname || ""))) return true;
+  if (BLOCKED_MIME.test(String(f.mimetype || ""))) return true;
+  const head = f.buffer.subarray(0, 512).toString("latin1").replace(/^﻿/, "").trimStart().toLowerCase();
+  if (/^(<!doctype html|<html|<head|<body|<script|<\?php)/.test(head)) return true;
+  if (f.buffer[0] === 0x4d && f.buffer[1] === 0x5a && f.buffer[2] === 0x90) return true; // Windows executable (MZ header)
+  return false;
+}
+
 app.post("/api/images", uploadLimiter, uploadAny.any(), async (req, res) => {
   try {
     const cfg = cloudinary.config();
@@ -204,8 +221,12 @@ app.post("/api/images", uploadLimiter, uploadAny.any(), async (req, res) => {
 
     let up;
     if (f?.buffer) {
+      if (blockedUpload(f)) return res.status(415).json({ ok: false, error: "file_type_not_allowed" });
       up = await uploadBufferToCloudinary(f.buffer, { resource_type: "auto", folder });
     } else if (typeof dataUrl === "string" && dataUrl.startsWith("data:")) {
+      if (BLOCKED_MIME.test(dataUrl.slice(5, 80).split(/[;,]/)[0])) {
+        return res.status(415).json({ ok: false, error: "file_type_not_allowed" });
+      }
       up = await cloudinary.uploader.upload(dataUrl, {
         folder,
         transformation: [{ width: 1280, height: 1280, crop: "limit", quality: "80" }],
@@ -389,7 +410,7 @@ app.delete("/api/images", strict, async (req, res) => {
     });
   } catch (e) {
     console.error("DELETE /api/images ERROR:", e);
-    res.status(500).json({ ok: false, error: String(e?.message || e) });
+    res.status(500).json({ ok: false, error: "server_error" });
   }
 });
 

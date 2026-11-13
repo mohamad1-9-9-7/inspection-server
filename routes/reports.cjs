@@ -645,7 +645,7 @@ app.post("/api/reports", auth, async (req, res) => {
       });
     }
     console.error("POST /api/reports ERROR =", e);
-    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+    return res.status(500).json({ ok: false, error: "server_error" });
   }
 });
 
@@ -711,7 +711,7 @@ app.put("/api/reports", auth, async (req, res) => {
       });
     }
     console.error("PUT /api/reports ERROR =", e);
-    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+    return res.status(500).json({ ok: false, error: "server_error" });
   }
 });
 
@@ -785,7 +785,7 @@ app.put("/api/reports/:type([A-Za-z_][A-Za-z0-9_-]*)", auth, async (req, res) =>
     return res.status(201).json({ ok: true, report: ins.rows[0], method: "insert" });
   } catch (e) {
     console.error("PUT /api/reports/:type ERROR =", e);
-    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+    return res.status(500).json({ ok: false, error: "server_error" });
   }
 });
 
@@ -882,7 +882,7 @@ app.post("/api/reports/backfill-refs", authStrict, adminOnly, async (req, res) =
   } catch (e) {
     if (client) await client.query("ROLLBACK").catch(() => {});
     console.error("POST /api/reports/backfill-refs ERROR =", e);
-    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+    return res.status(500).json({ ok: false, error: "server_error" });
   } finally {
     if (client) client.release();
   }
@@ -1052,7 +1052,7 @@ app.post("/api/reports/migrate-base64", authStrict, superOnly, async (req, res) 
     });
   } catch (e) {
     console.error("POST /api/reports/migrate-base64 ERROR =", e);
-    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+    return res.status(500).json({ ok: false, error: "server_error" });
   }
 });
 
@@ -1133,7 +1133,7 @@ app.get("/api/reports/:id(\\d+)", auth, async (req, res) => {
     return res.json({ ok: true, report: q.rows[0] });
   } catch (e) {
     console.error("GET /api/reports/:id ERROR =", e);
-    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+    return res.status(500).json({ ok: false, error: "server_error" });
   }
 });
 
@@ -1180,7 +1180,7 @@ app.patch("/api/reports/:id(\\d+)", auth, async (req, res) => {
     return res.json({ ok: true, report: upd.rows[0] });
   } catch (e) {
     console.error("PATCH /api/reports/:id ERROR =", e);
-    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+    return res.status(500).json({ ok: false, error: "server_error" });
   }
 });
 
@@ -1233,7 +1233,7 @@ app.put("/api/reports/:id(\\d+)", auth, async (req, res) => {
       });
     }
     console.error("PUT /api/reports/:id ERROR =", e);
-    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+    return res.status(500).json({ ok: false, error: "server_error" });
   }
 });
 
@@ -1259,7 +1259,7 @@ app.delete("/api/reports", auth, async (req, res) => {
     purgeImagesLater(pool, del.rows, `${type} ${reportDate}`);
   } catch (e) {
     console.error(e);
-    res.status(500).json({ ok: false, error: String(e?.message || e) });
+    res.status(500).json({ ok: false, error: "server_error" });
   }
 });
 
@@ -1289,7 +1289,7 @@ app.delete("/api/reports/:id(\\d+)", auth, async (req, res) => {
     purgeImagesLater(pool, del.rows, `${del.rows[0].type} #${id}`);
   } catch (e) {
     console.error(e);
-    res.status(500).json({ ok: false, error: String(e?.message || e) });
+    res.status(500).json({ ok: false, error: "server_error" });
   }
 });
 };
