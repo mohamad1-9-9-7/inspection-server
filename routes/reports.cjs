@@ -1115,6 +1115,34 @@ app.get("/api/reports/kpi-days", readLimiter, auth, async (req, res) => {
   }
 });
 
+/* `GET /api/reports/status-counts?type=maintenance`
+   How many records of ONE type sit in each payload.status — counts only, no
+   payload. The home dashboard shows "N open requests" on a card without
+   pulling every record to count them in the browser. */
+app.get("/api/reports/status-counts", readLimiter, auth, async (req, res) => {
+  try {
+    const type = normText(req.query?.type || "");
+    if (!type) return res.status(400).json({ ok: false, error: "type_required" });
+    const p = [type];
+    let where = `type = $1`;
+    const companyScope = companyIdOf(req);
+    if (companyScope != null) { p.push(companyScope); where += ` AND company_id = $${p.length}`; }
+    const { rows } = await pool.query(
+      `SELECT LEFT(COALESCE(payload->>'status', ''), 80) AS status, COUNT(*)::int AS n
+         FROM reports
+        WHERE ${where}
+        GROUP BY 1
+        ORDER BY 2 DESC
+        LIMIT 50`,
+      p
+    );
+    return res.json({ ok: true, data: rows });
+  } catch (e) {
+    console.error("GET /api/reports/status-counts ERROR =", e);
+    return res.status(500).json({ ok: false, error: "status_counts_failed" });
+  }
+});
+
 app.get("/api/reports/:id(\\d+)", auth, async (req, res) => {
   try {
     const id = Number(req.params.id);
