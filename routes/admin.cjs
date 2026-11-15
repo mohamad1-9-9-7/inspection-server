@@ -173,7 +173,7 @@ app.post("/api/auth/login", async (req, res) => {
     const q = await pool.query(
       `SELECT id, username, display_name, password_hash, salt,
               permissions, crud_perms, employees, allowed_branches, is_active, is_admin, is_super_admin, last_login,
-              company_id, ui_lang
+              company_id, ui_lang, ui_prefs
          FROM app_users WHERE username = $1 LIMIT 1`,
       [username]
     );
@@ -316,6 +316,7 @@ app.post("/api/auth/login", async (req, res) => {
         isSuperAdmin:    user.is_super_admin,
         lastLogin:       user.last_login,
         uiLang:          user.ui_lang || null,       // 'ar' | 'en' — the account's own language
+        uiPrefs:         user.ui_prefs || null,      // { favs, recent } — the account's dashboard pins
         companyId:       user.company_id || null,  // NULL = platform-level (super-admin)
         company:         company ? {               // resolved company snapshot (null for platform users)
           id:        company.id,
@@ -349,6 +350,34 @@ app.put("/api/auth/me/lang", strict, async (req, res) => {
     res.json({ ok: true, lang });
   } catch (e) {
     console.error("PUT /api/auth/me/lang ERROR:", e);
+    res.status(500).json({ ok: false, error: "server_error" });
+  }
+});
+
+/* PUT /api/auth/me/prefs  { prefs: { favs: [cardId…], recent: [{ k, l, r }…] } }
+   The signed-in account saves its own dashboard choices (pinned cards and
+   the last few things it opened), so they follow the account to any device.
+   Only the caller's own row; only these two short lists, cleaned here. */
+app.put("/api/auth/me/prefs", strict, async (req, res) => {
+  try {
+    const uid = req.user?.uid;
+    if (!uid) return res.status(401).json({ ok: false, error: "auth_required" });
+    const src = req.body?.prefs && typeof req.body.prefs === "object" ? req.body.prefs : {};
+    const str = (v, max) => String(v == null ? "" : v).slice(0, max);
+    const prefs = {
+      favs: (Array.isArray(src.favs) ? src.favs : [])
+        .map((x) => str(x, 40)).filter(Boolean).slice(0, 12),
+      recent: (Array.isArray(src.recent) ? src.recent : [])
+        .filter((x) => x && typeof x === "object")
+        .map((x) => ({ k: str(x.k, 80), l: str(x.l, 120), r: str(x.r, 200) }))
+        // in-app paths only — never a stored external address
+        .filter((x) => x.k && x.r.startsWith("/") && !x.r.startsWith("//"))
+        .slice(0, 6),
+    };
+    await pool.query(`UPDATE app_users SET ui_prefs = $1::jsonb WHERE id = $2`, [JSON.stringify(prefs), uid]);
+    res.json({ ok: true, prefs });
+  } catch (e) {
+    console.error("PUT /api/auth/me/prefs ERROR:", e);
     res.status(500).json({ ok: false, error: "server_error" });
   }
 });
