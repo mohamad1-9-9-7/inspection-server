@@ -14,6 +14,7 @@
 ============================================================ */
 const { companyOf, userOf } = require("../utils/tenant.cjs");
 const engine = require("../utils/alertEngine.cjs");
+const { canonBranch } = require("../utils/branchCanon.cjs");
 
 const isAdmin = (req) => {
   const u = userOf(req) || {};
@@ -93,7 +94,18 @@ module.exports = function registerAlertRoutes(app, deps = {}) {
        ) x WHERE b IS NOT NULL ORDER BY b LIMIT 200`,
       [companyId]
     ).catch(() => ({ rows: [] }));
-    res.json({ ok: true, rules, branches: rows.map((r) => r.b), mailbox: engine._companyMayMail(companyId) });
+    /* The same shop is typed many ways ("POS 15", "AL BARSHA BUTCHERY (POS15)",
+       "Al Barsha Butchery"): one entry per canonical branch, its spellings kept. */
+    const groups = new Map();
+    for (const { b } of rows) {
+      const key = canonBranch(b);
+      if (!key) continue;
+      if (!groups.has(key)) groups.set(key, new Set());
+      groups.get(key).add(b);
+    }
+    const branchGroups = [...groups].map(([key, names]) => ({ key, names: [...names].sort() }))
+      .sort((a, b) => a.key.localeCompare(b.key, undefined, { numeric: true }));
+    res.json({ ok: true, rules, branches: branchGroups.map((g) => g.key), branchGroups, mailbox: engine._companyMayMail(companyId) });
   });
 
   /* A test e-mail to one address — checks the recipient before relying on it. */

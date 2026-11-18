@@ -36,6 +36,7 @@
 ============================================================ */
 const { sendPlatformMail } = require("../routes/mailer.cjs");
 const { supplierDates } = require("./supplierRisk.cjs");
+const { canonBranch } = require("./branchCanon.cjs");
 
 const RULES_TYPE = "alert_rules_config";
 
@@ -217,8 +218,10 @@ const alertsText = (list) =>
      • every active contact whose types include the rule (empty = all types),
        whose branches include the alert's branch (empty = every branch; an
        alert that names no branch goes to the every-branch contacts only),
-       and — when the contact asked for critical only — a critical alert. */
-const normBranch = (b) => String(b || "").trim().toLowerCase();
+       and — when the contact asked for critical only — a critical alert.
+   Branches compare by canonBranch, so "POS 15", "AL BARSHA BUTCHERY (POS15)"
+   and "Al Barsha Butchery" are one branch. */
+const normBranch = canonBranch;
 function recipientsFor(rules, ruleKey, alert) {
   const out = new Set(cleanEmails(rules?.[ruleKey]?.emails));
   const br = normBranch(alert?.branch);
