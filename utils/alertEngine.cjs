@@ -114,8 +114,9 @@ function mergeRules(saved) {
   out.expiries.kinds = kinds.length === EXPIRY_KINDS.length ? [] : kinds;
   out.capa.openDays = Math.min(365, Math.max(1, Number(out.capa.openDays) || 30));
   out.contacts = cleanContacts(s.contacts);
-  // per-branch To / CC / BCC lists; older configs are derived from their people
-  out.distribution = cleanDistribution(Array.isArray(s.distribution) ? s.distribution : distributionFromContacts(out.contacts));
+  // custom reminders per branch; older configs (lists / people with branches) are converted
+  out.reminders = cleanReminders(Array.isArray(s.reminders) ? s.reminders
+    : Array.isArray(s.distribution) ? remindersFromLists(s.distribution) : remindersFromContacts(s.contacts));
   return out;
 }
 
@@ -287,73 +288,100 @@ async function attachmentsFor(alerts, cache = new Map()) {
   return { attachments: out, skipped };
 }
 
-/* ───────── who receives what ─────────
-   Recipients are set PER BRANCH, like the e-mail popup: rules.distribution =
-   [{ branch, to[], cc[], bcc[] }] where branch is a canonical branch key
-   (canonBranch: "POS 15", "QCS"…) or "__all" (every branch + alerts that
-   name no branch). An alert of branch B goes to the "__all" lists plus B's
-   lists, as ONE mail: To / CC / BCC exactly as set.
-   rules.contacts keeps per-person settings, keyed by e-mail: which alert
-   types (rules[]), critical only, active. A person with no settings row gets
-   everything. The old per-rule lists (rules[k].emails) still go in To. */
+/* ───────── who receives what: custom reminders ─────────
+   rules.reminders = [{ id, name, branch, rules[], kinds[], onlyCritical,
+   active, to[], cc[], bcc[] }] — set per branch on the Alerts page. Each
+   reminder says WHAT (alert types; for expiries which kinds; critical only)
+   and WHO (To / CC / BCC). A branch can have several — different people, or
+   the same people with a different kind of reminder. An alert goes out once
+   per reminder it matches, as one mail with that reminder's To / CC / BCC.
+   branch is a canonical key (canonBranch) or "__all" (any branch + alerts
+   that name no branch). The old per-rule lists (rules[k].emails) still go
+   in To. Older configs (contacts with branches / distribution lists) are
+   turned into reminders on load. */
 const ALL = "__all";
 const normBranch = canonBranch;
+const EMAIL_OK = (e) => /^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(e);
 
-/** Old configs had people with branches[] + mode — turn them into lists. */
-function distributionFromContacts(contacts) {
-  const lists = new Map();
+function cleanList(v, max = 50) {
+  return [...new Set((Array.isArray(v) ? v : []).map((x) => String(x || "").trim().toLowerCase()).filter(EMAIL_OK))].slice(0, max);
+}
+
+/** Older people-based configs → reminders, keeping each person's own
+    settings: people with the same branch + alert types + critical-only share
+    one reminder (To or CC as they were). */
+function remindersFromContacts(contacts) {
+  const groups = new Map();
   for (const c of Array.isArray(contacts) ? contacts : []) {
-    if (!c?.email) continue;
-    const mode = c.mode === "cc" ? "cc" : "to";
+    if (!c?.email || c.active === false) continue;
     const keys = Array.isArray(c.branches) && c.branches.length ? c.branches.map(normBranch).filter(Boolean) : [ALL];
+    const rules = Array.isArray(c.rules) ? [...c.rules].sort() : [];
     for (const k of keys) {
-      if (!lists.has(k)) lists.set(k, { branch: k, to: [], cc: [], bcc: [] });
-      if (!lists.get(k)[mode].includes(c.email)) lists.get(k)[mode].push(c.email);
+      const g = `${k}|${rules.join(",")}|${c.onlyCritical ? 1 : 0}`;
+      if (!groups.has(g)) groups.set(g, { id: `r-mig-${groups.size + 1}`, name: "", branch: k, rules, kinds: [], onlyCritical: !!c.onlyCritical, active: true, to: [], cc: [], bcc: [] });
+      const slot = groups.get(g)[c.mode === "cc" ? "cc" : "to"];
+      if (!slot.includes(c.email)) slot.push(c.email);
     }
   }
-  return [...lists.values()];
+  return [...groups.values()];
 }
 
-function cleanDistribution(list) {
-  const byKey = new Map();
-  for (const d of Array.isArray(list) ? list : []) {
-    if (!d || typeof d !== "object") continue;
-    const key = d.branch === ALL ? ALL : normBranch(d.branch);
-    if (!key) continue;
-    if (!byKey.has(key)) byKey.set(key, { branch: key, to: [], cc: [], bcc: [] });
-    const slot = byKey.get(key);
-    for (const f of ["to", "cc", "bcc"]) {
-      for (const e of (Array.isArray(d[f]) ? d[f] : []).map((x) => String(x || "").trim().toLowerCase())) {
-        if (/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(e) && !slot[f].includes(e) && slot[f].length < 50) slot[f].push(e);
-      }
-    }
-  }
-  // one address appears once per branch: To beats CC beats BCC
-  for (const s of byKey.values()) {
-    s.cc = s.cc.filter((e) => !s.to.includes(e));
-    s.bcc = s.bcc.filter((e) => !s.to.includes(e) && !s.cc.includes(e));
-  }
-  return [...byKey.values()].filter((s) => s.to.length || s.cc.length || s.bcc.length).slice(0, 300);
+/** Per-branch lists → one "all alerts" reminder per branch. */
+function remindersFromLists(lists) {
+  return (Array.isArray(lists) ? lists : []).map((d, i) => ({
+    id: `r-mig-${i + 1}`, name: "", branch: d.branch, rules: [], kinds: [], onlyCritical: false, active: true,
+    to: d.to || [], cc: d.cc || [], bcc: d.bcc || [],
+  }));
 }
 
-/** May this person get this alert? (their own settings; none = yes) */
-function personWants(rules, email, ruleKey, alert) {
-  const c = (Array.isArray(rules?.contacts) ? rules.contacts : []).find((x) => x?.email === email);
-  if (!c) return true;
-  if (c.active === false) return false;
-  if (c.rules?.length && !c.rules.includes(ruleKey)) return false;
-  if (c.onlyCritical && alert?.severity !== "critical") return false;
+function cleanReminders(list) {
+  const out = [];
+  const ids = new Set();
+  for (const r of Array.isArray(list) ? list : []) {
+    if (!r || typeof r !== "object") continue;
+    const branch = r.branch === ALL ? ALL : normBranch(r.branch);
+    if (!branch) continue;
+    let id = clean(r.id, 40) || `r${out.length + 1}${Date.now().toString(36)}`;
+    while (ids.has(id)) id += "x";
+    ids.add(id);
+    const to = cleanList(r.to);
+    const cc = cleanList(r.cc).filter((e) => !to.includes(e));
+    const bcc = cleanList(r.bcc).filter((e) => !to.includes(e) && !cc.includes(e));
+    const rules = [...new Set((Array.isArray(r.rules) ? r.rules : []).filter((k) => RULE_KEYS().includes(k)))];
+    const kinds = [...new Set((Array.isArray(r.kinds) ? r.kinds : []).filter((k) => EXPIRY_KINDS.includes(k)))];
+    out.push({
+      id, name: clean(r.name, 80), branch,
+      rules: rules.length === RULE_KEYS().length ? [] : rules,
+      kinds: kinds.length === EXPIRY_KINDS.length ? [] : kinds,
+      onlyCritical: !!r.onlyCritical, active: r.active !== false, to, cc, bcc,
+    });
+    if (out.length >= 300) break;
+  }
+  return out;
+}
+
+/** Does this reminder cover this alert? */
+function reminderMatches(rem, ruleKey, alert) {
+  if (!rem || rem.active === false) return false;
+  const br = normBranch(alert?.branch);
+  if (rem.branch !== ALL && (!br || rem.branch !== br)) return false;
+  if (rem.rules?.length && !rem.rules.includes(ruleKey)) return false;
+  if (ruleKey === "expiries" && rem.kinds?.length) {
+    const kind = alert?.data?.kind || expiryKindOf(alert?.data?.key || "");
+    if (!kind || !rem.kinds.includes(kind)) return false;
+  }
+  if (rem.onlyCritical && alert?.severity !== "critical") return false;
   return true;
 }
+const remindersFor = (rules, ruleKey, alert) =>
+  (Array.isArray(rules?.reminders) ? rules.reminders : []).filter((r) => reminderMatches(r, ruleKey, alert));
 
-/** { to, cc, bcc } for one alert. */
+/** { to, cc, bcc } — everyone an alert reaches, over all its reminders. */
 function resolveRecipients(rules, ruleKey, alert) {
-  const br = normBranch(alert?.branch);
-  const lists = (Array.isArray(rules?.distribution) ? rules.distribution : []).filter((d) => d.branch === ALL || (br && d.branch === br));
-  const pick = (f) => [...new Set(lists.flatMap((d) => d[f] || []))].filter((e) => personWants(rules, e, ruleKey, alert));
-  const to = [...new Set([...cleanEmails(rules?.[ruleKey]?.emails), ...pick("to")])];
-  const cc = pick("cc").filter((e) => !to.includes(e));
-  const bcc = pick("bcc").filter((e) => !to.includes(e) && !cc.includes(e));
+  const rems = remindersFor(rules, ruleKey, alert);
+  const to = [...new Set([...cleanEmails(rules?.[ruleKey]?.emails), ...rems.flatMap((r) => r.to)])];
+  const cc = [...new Set(rems.flatMap((r) => r.cc))].filter((e) => !to.includes(e));
+  const bcc = [...new Set(rems.flatMap((r) => r.bcc))].filter((e) => !to.includes(e) && !cc.includes(e));
   return { to, cc, bcc };
 }
 
@@ -422,35 +450,43 @@ async function deliver(pool, companyId, to, alerts, subject, { rule, method = "a
   }
 }
 
-/** alerts → mails: [{ to[], cc[], bcc[], alerts[] }] — alerts with the same
-    recipients share one mail (typically: one mail per branch). With no To,
-    CC moves up to To (then BCC) so the mail still has an addressee.
-    `only` (send now to one person) = that person as To, alone. */
-function routeAlerts(rules, ruleKey, list, only = "") {
+/** alerts → mails: one per reminder [{ id, name, to[], cc[], bcc[], alerts[] }].
+    With no To, CC moves up to To (then BCC) so the mail has an addressee.
+    `only` (send now to one person) = that person as To, alone, with every
+    alert of every reminder they are on. `reminderId` = that reminder only. */
+function routeAlerts(rules, ruleKey, list, only = "", reminderId = "") {
   const groups = new Map();
-  for (const a of list) {
-    let { to, cc, bcc } = resolveRecipients(rules, ruleKey, a);
-    if (only) {
-      if (![...to, ...cc, ...bcc].includes(only)) continue;
-      to = [only]; cc = []; bcc = [];
-    } else if (!to.length) {
-      if (cc.length) { to = cc; cc = []; } else if (bcc.length) { to = bcc; bcc = []; } else continue;
-    }
-    const key = [to, cc, bcc].map((x) => [...x].sort().join(",")).join("|");
-    if (!groups.has(key)) groups.set(key, { to, cc, bcc, alerts: [] });
+  const legacy = cleanEmails(rules?.[ruleKey]?.emails);
+  const add = (key, base, a) => {
+    if (!groups.has(key)) groups.set(key, { ...base, alerts: [] });
     groups.get(key).alerts.push(a);
+  };
+  for (const a of list) {
+    const rems = remindersFor(rules, ruleKey, a).filter((r) => !reminderId || r.id === reminderId);
+    if (only) {
+      const on = rems.some((r) => [...r.to, ...r.cc, ...r.bcc].includes(only)) || (!reminderId && legacy.includes(only));
+      if (on) add("only", { id: "only", name: "", to: [only], cc: [], bcc: [] }, a);
+      continue;
+    }
+    for (const r of rems) {
+      let { to, cc, bcc } = r;
+      if (!to.length) { if (cc.length) { to = cc; cc = []; } else if (bcc.length) { to = bcc; bcc = []; } else continue; }
+      add(r.id, { id: r.id, name: r.name, to, cc, bcc }, a);
+    }
+    if (legacy.length && !reminderId) add("legacy", { id: "legacy", name: "", to: legacy, cc: [], bcc: [] }, a);
   }
   return [...groups.values()];
 }
 
-/** Mails NEW alerts of one rule to their branch lists; marks the mailed ones.
-    Best-effort. `subject` is a string or (alerts) => string. */
+/** Mails NEW alerts of one rule — one mail per reminder they match; marks
+    the mailed ones. Best-effort. `subject` is a string or (alerts) => string. */
 async function mailAlerts(pool, companyId, rules, ruleKey, list, subject) {
   if (!list.length || !companyMayMail(companyId)) return false;
   const mailed = new Set();
   const cache = new Map();
   for (const g of routeAlerts(rules, ruleKey, list).slice(0, 100)) {
-    const subj = typeof subject === "function" ? subject(g.alerts) : subject;
+    const base = typeof subject === "function" ? subject(g.alerts) : subject;
+    const subj = g.name ? `${base} — ${g.name}` : base;
     if (await deliver(pool, companyId, g.to, g.alerts, subj, { rule: ruleKey, method: "auto", cache, cc: g.cc, bcc: g.bcc })) {
       g.alerts.forEach((a) => mailed.add(a.id));
     }
@@ -462,10 +498,11 @@ async function mailAlerts(pool, companyId, rules, ruleKey, list, subject) {
 }
 
 /** "Send the reminders now" (Alerts page): everything expiring or expired
-    right now — of the kinds chosen — mailed at once to the branch lists (all
-    branches, one branch with `branch`, or one person with `email`), details +
-    documents. Not limited by the once-per-step rule and files no alert. */
-async function sendRemindersNow(pool, companyId, { email = "", branch = "", sentBy = "" } = {}) {
+    right now — of the kinds chosen — mailed at once through the reminders
+    (all, one branch with `branch`, one reminder with `reminderId`, or one
+    person with `email`), details + documents. Not limited by the
+    once-per-step rule and files no alert. */
+async function sendRemindersNow(pool, companyId, { email = "", branch = "", reminderId = "", sentBy = "" } = {}) {
   if (!companyMayMail(companyId)) return { ok: false, error: "no_mailbox" };
   const rules = await loadRules(pool, companyId);
   const found = await checkExpiries(pool, companyId, rules.expiries.days, uaeToday(), rules.expiries.kinds);
@@ -476,17 +513,17 @@ async function sendRemindersNow(pool, companyId, { email = "", branch = "", sent
       id: null, rule: "expiries", branch: x.branch, title: expiryTitle(x),
       severity: x.stage === "expired" || x.stage === "today" || x.failed ? "critical" : "warning",
       body: Array.isArray(x.details) ? x.details.join("\n") : "",
-      data: { files: Array.isArray(x.files) ? x.files : [] },
+      data: { files: Array.isArray(x.files) ? x.files : [], kind: expiryKindOf(x.key) },
     }));
   const only = String(email || "").trim().toLowerCase();
-  const mails = routeAlerts(rules, "expiries", items, only);
+  const mails = routeAlerts(rules, "expiries", items, only, String(reminderId || ""));
   const cache = new Map();
   let sent = 0;
   let failed = 0;
   const people = new Set();
   for (const g of mails.slice(0, 100)) {
     const brs = [...new Set(g.alerts.map((a) => a.branch).filter(Boolean))];
-    const subject = `⏳ Reminder — ${g.alerts.length} expiring / expired${brs.length === 1 ? ` · ${brs[0]}` : ""}`;
+    const subject = `⏳ Reminder — ${g.alerts.length} expiring / expired${brs.length === 1 ? ` · ${brs[0]}` : ""}${g.name ? ` — ${g.name}` : ""}`;
     if (await deliver(pool, companyId, g.to, g.alerts, subject, { rule: "expiries", method: "manual", sentBy, cache, cc: g.cc, bcc: g.bcc })) {
       sent++;
       [...g.to, ...g.cc, ...g.bcc].forEach((e) => people.add(e));
@@ -1111,7 +1148,7 @@ async function runCompanyChecks(pool, companyId, { first = true, today = uaeToda
         title: expiryTitle(x),
         body: Array.isArray(x.details) ? x.details.join("\n") : "",
         link: x.link, dedupeKey: keyOf(x),
-        data: { due: x.due, stage: x.stage, step: x.step || null, files: Array.isArray(x.files) ? x.files : [] },
+        data: { due: x.due, stage: x.stage, step: x.step || null, kind: expiryKindOf(x.key), files: Array.isArray(x.files) ? x.files : [] },
       }));
     }
     // Licences & contracts: only the current step stays open in the bell —

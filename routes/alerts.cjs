@@ -9,7 +9,7 @@
    PUT  /api/alerts/rules                    admin            save them
    POST /api/alerts/run                      admin            run the scheduled checks now
    POST /api/alerts/test-mail                admin            one test e-mail
-   POST /api/alerts/send-now                 admin            the real reminders, now (all, body.branch or body.email)
+   POST /api/alerts/send-now                 admin            the real reminders, now (all, body.branch, body.reminderId or body.email)
    GET  /api/alerts/log                                       the send log (email_history, alerts:*)
 
    Always the caller's own company (utils/tenant.cjs companyOf). The engine
@@ -136,7 +136,8 @@ module.exports = function registerAlertRoutes(app, deps = {}) {
     if (email && !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) return res.status(400).json({ ok: false, error: "bad_email" });
     try {
       const branch = String(req.body?.branch || "").slice(0, 120);
-      const r = await engine.sendRemindersNow(pool, companyId, { email, branch, sentBy: String(userOf(req)?.username || "") });
+      const reminderId = String(req.body?.reminderId || "").slice(0, 40);
+      const r = await engine.sendRemindersNow(pool, companyId, { email, branch, reminderId, sentBy: String(userOf(req)?.username || "") });
       if (!r.ok) return res.status(409).json(r);
       res.json(r);
     } catch (e) {
