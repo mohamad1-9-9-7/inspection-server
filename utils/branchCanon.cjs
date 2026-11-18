@@ -25,6 +25,7 @@ const ALIASES = [
   [/\bmotor\s*city\b/i, "POS 19"],
   [/\bmamzar\b/i, "FTR 2"],
   [/\bmushrif\b/i, "FTR 1"],
+  [/\bsupervisor\b.*\bfood\s*truck\b|\bfood\s*truck\b.*\bsupervisor\b/i, "FTR 1"], // the Mushrif truck, also listed as "Supervisor Food Truck"
   [/\bwar[qk]a\b.*\bkitchen\b|\bkitchen\b.*\bwar[qk]a\b/i, "AL WARQA KITCHEN"],
 ];
 
