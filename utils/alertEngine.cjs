@@ -11,6 +11,8 @@
      • EVENT — a phone temperature reading saved out of range
        (industries/meat/reportRoutes.cjs calls onTemperatureReading). A
        recheck back inside the range closes it again by itself.
+     • EVENT — a CCP monitoring record outside its critical limit
+       (routes/reports.cjs ccpAlertHook → onCcpRecordSave).
      • SCHEDULE — fixed UAE times (ALERT_TIMES, default "08:00,13:00"):
          first slot  → yesterday's daily logs not filed, expiries
                        (calibration, certificates, licences, mock recall;
@@ -59,6 +61,7 @@ const DEFAULT_RULES = {
   noReadingToday: { enabled: true, emails: [] },
   expiries: { enabled: true, emails: [], days: 30 },
   capa: { enabled: true, emails: [], openDays: 30 },
+  ccp: { enabled: true, emails: [] },
 };
 
 const DAY_SQL = `LEFT(COALESCE(
@@ -230,7 +233,7 @@ function recipientsFor(rules, ruleKey, alert) {
 }
 
 /** Mails NEW alerts of one rule — each recipient gets only the alerts routed
-    to them (one mail per group with the same alerts); marks the mailed ones.
+    to them, in a mail of their own; marks the mailed ones.
     Best-effort. `subject` is a string or (alerts) => string. */
 async function mailAlerts(pool, companyId, rules, ruleKey, list, subject) {
   if (!list.length || !companyMayMail(companyId)) return false;
@@ -241,26 +244,22 @@ async function mailAlerts(pool, companyId, rules, ruleKey, list, subject) {
       byEmail.get(e).push(a);
     }
   }
-  const groups = new Map(); // "id,id" → { to[], alerts[] }
-  for (const [e, alerts] of byEmail) {
-    const k = alerts.map((a) => a.id).join(",");
-    if (!groups.has(k)) groups.set(k, { to: [], alerts });
-    groups.get(k).to.push(e);
-  }
-  let any = false;
-  for (const g of groups.values()) {
+  /* One mail PER PERSON: a branch manager must not see the addresses of the
+     other recipients (QA, management, other branches) in the To line. */
+  const mailed = new Set();
+  for (const [e, alerts] of [...byEmail].slice(0, 100)) {
     try {
-      const subj = typeof subject === "function" ? subject(g.alerts) : subject;
-      const sent = await sendPlatformMail({ to: g.to.slice(0, 50), subject: subj, text: alertsText(g.alerts), html: alertsHtml(g.alerts) });
-      if (sent) {
-        any = true;
-        await pool.query(`UPDATE alerts SET emailed_at = now() WHERE id = ANY($1::bigint[])`, [g.alerts.map((a) => a.id)]);
-      }
-    } catch (e) {
-      console.warn("[alerts] e-mail failed:", e?.message || e);
+      const subj = typeof subject === "function" ? subject(alerts) : subject;
+      const sent = await sendPlatformMail({ to: [e], subject: subj, text: alertsText(alerts), html: alertsHtml(alerts) });
+      if (sent) alerts.forEach((a) => mailed.add(a.id));
+    } catch (err) {
+      console.warn("[alerts] e-mail failed:", e, err?.message || err);
     }
   }
-  return any;
+  if (mailed.size) {
+    await pool.query(`UPDATE alerts SET emailed_at = now() WHERE id = ANY($1::bigint[])`, [[...mailed]]).catch(() => {});
+  }
+  return mailed.size > 0;
 }
 
 /** A test e-mail from the Alerts page (one recipient). */
@@ -274,6 +273,50 @@ async function sendTestMail(to, { name = "", branches = [] } = {}) {
     <p style="color:#334155">Alerts will arrive from this address — add it to your contacts so they never land in spam.</p>
     <p><a href="${esc(APP_ORIGIN())}/alerts" style="color:#2563eb">Open the alerts</a></p></div>`;
   return sendPlatformMail({ to: [to], subject: "✅ INSPECT PRO alerts — test e-mail", text, html });
+}
+
+/* ───────── EVENT: a CCP monitoring record outside its critical limit ─────────
+   Called from routes/reports.cjs on every create / edit of a
+   ccp_monitoring_record (the frontend evaluates the reading against the
+   CCP critical limit and saves payload.autoEval.withinLimit). A record
+   edited back inside the limit closes its alert. Never throws. */
+async function onCcpRecordSave(pool, companyId, reportId, payload, byName = "") {
+  try {
+    if (!reportId || !payload || typeof payload !== "object") return null;
+    const prefix = `ccp:${reportId}:`;
+    if (payload.autoEval?.withinLimit !== false) {
+      await resolveAlerts(pool, companyId, prefix, "Record corrected — back inside the critical limit");
+      return null;
+    }
+    const rules = await loadRules(pool, companyId);
+    if (!rules.ccp.enabled) return null;
+    const snap = payload.ccpSnapshot || {};
+    const lim = snap.criticalLimit || {};
+    const name = clean(snap.nameEn || snap.nameAr || payload.ccpId || "CCP", 120);
+    const value = clean(payload.reading?.value, 40);
+    const unit = clean(lim.unit, 20);
+    const day = toDay(payload.reportDate || payload.date || payload.savedAt);
+    const alert = await raiseAlert(pool, {
+      companyId, rule: "ccp", severity: "critical",
+      branch: clean(payload.product?.branch || payload.branch, 80),
+      title: `CCP deviation — ${name}: ${value}${unit ? ` ${unit}` : ""} outside the critical limit`,
+      body: [
+        (lim.descEn || lim.descAr) && `Critical limit: ${lim.descEn || lim.descAr}`,
+        payload.product?.name && `Product: ${payload.product.name}${payload.product.batch ? ` (batch ${payload.product.batch})` : ""}`,
+        day && `Date: ${dmy(day)}`,
+        payload.deviation?.correctiveAction && `Corrective action: ${payload.deviation.correctiveAction}`,
+        (payload.signoff?.monitoredBy || byName) && `By: ${payload.signoff?.monitoredBy || byName}`,
+      ].filter(Boolean).join("\n"),
+      link: "/haccp-iso/ccp-monitoring/view",
+      dedupeKey: `${prefix}dev`,
+      data: { reportId, value, unit },
+    });
+    if (alert) await mailAlerts(pool, companyId, rules, "ccp", [alert], `🎯 ${alert.title}`);
+    return alert;
+  } catch (e) {
+    console.warn("[alerts] CCP hook failed:", e?.message || e);
+    return null;
+  }
 }
 
 /* ───────── EVENT: a phone temperature reading ───────── */
@@ -875,6 +918,7 @@ module.exports = {
   onTemperatureReading,
   onTemperatureSheetSave,
   isTempSheet,
+  onCcpRecordSave,
   runCompanyChecks,
   startAlertScheduler,
   mailAlerts,

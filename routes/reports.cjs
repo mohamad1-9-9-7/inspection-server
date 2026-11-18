@@ -224,13 +224,26 @@ function sheetAlertHook(req, type, oldPayload, newPayload, companyId) {
   setImmediate(() => alertEngine.onTemperatureSheetSave(pool, cid, type, oldPayload, newPayload, auditUser(req)));
 }
 
+/* CCP monitoring records outside the critical limit → a "ccp" alert
+   (closed again when the record is corrected). Same single hook point. */
+function ccpAlertHook(req, type, reportId, newPayload, companyId) {
+  if (type !== "ccp_monitoring_record" || !reportId) return;
+  const cid = companyId ?? companyIdForWrite(req);
+  setImmediate(() => alertEngine.onCcpRecordSave(pool, cid, reportId, newPayload, auditUser(req)));
+}
+
 /** Fire-and-forget audit insert. `action` is 'update' | 'delete'. */
 /** `companyId`: the company the row really belongs to. Routes that know it
  *  (by-id edits, creates) pass it, so a super-admin editing another company's
  *  report is logged under THAT company, not under the one the request names. */
 function auditWrite(req, { action, reportId, reportType, oldPayload, newPayload, companyId = null }) {
   if (action === "update" && samePayload(oldPayload, newPayload)) return;
-  if (action === "update") sheetAlertHook(req, reportType, oldPayload, newPayload, companyId);
+  if (action === "update") {
+    sheetAlertHook(req, reportType, oldPayload, newPayload, companyId);
+    ccpAlertHook(req, reportType, reportId, newPayload, companyId);
+  }
+  // a deleted CCP record closes its deviation alert
+  if (action === "delete") ccpAlertHook(req, reportType, reportId, { autoEval: { withinLimit: true } }, companyId);
   pool
     .query(
       `INSERT INTO report_audit
@@ -263,7 +276,10 @@ const AUDIT_SKIP_CREATE = /(^__)|lookup/i;
  *  before-state, so nothing is lost. We keep just enough here (reportDate,
  *  refNo) to make the audit row readable on its own. */
 function auditCreate(req, row) {
-  if (row) sheetAlertHook(req, row.type, null, row.payload, row.company_id);
+  if (row) {
+    sheetAlertHook(req, row.type, null, row.payload, row.company_id);
+    ccpAlertHook(req, row.type, row.id, row.payload, row.company_id);
+  }
   if (!row || AUDIT_SKIP_CREATE.test(String(row.type || ""))) return;
   const p = row.payload || {};
   auditWrite(req, {
