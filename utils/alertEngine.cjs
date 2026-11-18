@@ -162,7 +162,6 @@ function companyMayMail(companyId) {
   return ids.has(Number(companyId || 1));
 }
 
-const APP_ORIGIN = () => String(process.env.APP_ORIGIN || "https://inspectpro-ae.netlify.app").replace(/\/$/, "");
 
 /* ───────── raise / resolve ───────── */
 
@@ -203,15 +202,83 @@ function alertsHtml(list) {
       <div style="font-weight:700;color:${color[a.severity] || "#0f172a"}">${esc(a.title)}</div>
       ${a.branch ? `<div style="color:#64748b;font-size:13px">${esc(a.branch)}</div>` : ""}
       ${a.body ? `<div style="color:#334155;font-size:14px;margin-top:4px;white-space:pre-line">${esc(a.body)}</div>` : ""}
-      ${a.link ? `<div style="margin-top:6px"><a href="${esc(APP_ORIGIN() + a.link)}" style="color:#2563eb">Open in the system</a></div>` : ""}
     </td></tr>`).join("");
   return `<div style="font-family:Arial,sans-serif;max-width:640px">
     <table style="width:100%;border-collapse:collapse;border:1px solid #e5e7eb;border-radius:8px">${items}</table>
-    <div style="color:#94a3b8;font-size:12px;margin-top:10px">INSPECT PRO — automatic alert. All alerts: ${esc(APP_ORIGIN())}/alerts</div>
+    <div style="color:#94a3b8;font-size:12px;margin-top:10px">INSPECT PRO — automatic alert.</div>
   </div>`;
 }
 const alertsText = (list) =>
-  list.map((a) => [`• ${a.title}`, a.branch && `  ${a.branch}`, a.body && `  ${a.body}`, a.link && `  ${APP_ORIGIN()}${a.link}`].filter(Boolean).join("\n")).join("\n\n");
+  list.map((a) => [`• ${a.title}`, a.branch && `  ${a.branch}`, a.body && `  ${String(a.body).replace(/\n/g, "\n  ")}`].filter(Boolean).join("\n")).join("\n\n");
+
+/* ───────── attached documents ─────────
+   An alert may carry the documents behind it (data.files: [{ url, name }] —
+   the contract / licence copy, CCP evidence). They are downloaded and
+   attached to the mail, never sent as links. Only https files on Cloudinary
+   (where every upload lives) are fetched — a payload can never make the
+   server fetch an internal address. Limits: 6 files, 8 MB each, 12 MB total;
+   what does not fit is named in the mail instead. */
+const filesOf = (a) => (Array.isArray(a?.data?.files) ? a.data.files : []).filter((f) => f && f.url);
+const MAX_FILES = 6;
+const MAX_FILE_BYTES = 8 * 1024 * 1024;
+const MAX_MAIL_BYTES = 12 * 1024 * 1024;
+
+function safeFileUrl(u) {
+  try {
+    const url = new URL(String(u || ""));
+    return url.protocol === "https:" && /(^|\.)cloudinary\.com$/i.test(url.hostname) ? url : null;
+  } catch { return null; }
+}
+function fileNameFor(f, i, contentType) {
+  let name = String(f.name || "").trim();
+  if (!name) {
+    try { name = decodeURIComponent(new URL(f.url).pathname.split("/").pop() || ""); } catch { name = ""; }
+  }
+  name = name.replace(/[\\/:*?"<>|]+/g, "_").slice(0, 120) || `document-${i + 1}`;
+  if (!/\.[a-z0-9]{2,5}$/i.test(name)) {
+    const ext = /pdf/i.test(contentType) ? ".pdf" : /png/i.test(contentType) ? ".png" : /jpe?g/i.test(contentType) ? ".jpg" : /webp/i.test(contentType) ? ".webp" : "";
+    name += ext;
+  }
+  return name;
+}
+/** Downloads the documents of a set of alerts → nodemailer attachments.
+    `cache` (url → attachment | null) is shared by the mails of one run. */
+async function attachmentsFor(alerts, cache = new Map()) {
+  const out = [];
+  const skipped = [];
+  let total = 0;
+  const files = [];
+  const seen = new Set();
+  alerts.forEach((a) => filesOf(a).forEach((f) => { if (!seen.has(f.url)) { seen.add(f.url); files.push(f); } }));
+  for (const [i, f] of files.entries()) {
+    if (out.length >= MAX_FILES) { skipped.push(f.name || f.url); continue; }
+    if (!cache.has(f.url)) {
+      let att = null;
+      const url = safeFileUrl(f.url);
+      if (url) {
+        try {
+          const res = await fetch(url, { signal: AbortSignal.timeout(20_000) });
+          const len = Number(res.headers.get("content-length") || 0);
+          if (res.ok && (!len || len <= MAX_FILE_BYTES)) {
+            const buf = Buffer.from(await res.arrayBuffer());
+            if (buf.length <= MAX_FILE_BYTES) {
+              const contentType = res.headers.get("content-type") || "application/octet-stream";
+              att = { filename: fileNameFor(f, i, contentType), content: buf, contentType };
+            }
+          }
+        } catch (e) {
+          console.warn("[alerts] attachment download failed:", e?.message || e);
+        }
+      }
+      cache.set(f.url, att);
+    }
+    const att = cache.get(f.url);
+    if (!att || total + att.content.length > MAX_MAIL_BYTES) { skipped.push(f.name || "document"); continue; }
+    total += att.content.length;
+    out.push(att);
+  }
+  return { attachments: out, skipped };
+}
 
 /* Who receives one alert of one rule:
      • the rule's own list (rules[k].emails — everything of that rule), and
@@ -250,10 +317,21 @@ async function mailAlerts(pool, companyId, rules, ruleKey, list, subject) {
   /* One mail PER PERSON: a branch manager must not see the addresses of the
      other recipients (QA, management, other branches) in the To line. */
   const mailed = new Set();
+  const fileCache = new Map();
   for (const [e, alerts] of [...byEmail].slice(0, 100)) {
     try {
       const subj = typeof subject === "function" ? subject(alerts) : subject;
-      const sent = await sendPlatformMail({ to: [e], subject: subj, text: alertsText(alerts), html: alertsHtml(alerts) });
+      const { attachments, skipped } = await attachmentsFor(alerts, fileCache);
+      // the real list of what went with this mail (and what could not)
+      const note = [
+        attachments.length && `📎 Attached: ${attachments.map((x) => x.filename).join(", ")}`,
+        skipped.length && `Not attached (too large or unavailable): ${skipped.join(", ")}`,
+      ].filter(Boolean).join("\n");
+      const sent = await sendPlatformMail({
+        to: [e], subject: subj, attachments,
+        text: alertsText(alerts) + (note ? `\n\n${note}` : ""),
+        html: alertsHtml(alerts) + (note ? `<div style="color:#475569;font-size:13px;margin-top:8px;white-space:pre-line">${note.replace(/[&<>"]/g, "")}</div>` : ""),
+      });
       if (sent) alerts.forEach((a) => mailed.add(a.id));
     } catch (err) {
       console.warn("[alerts] e-mail failed:", e, err?.message || err);
@@ -269,12 +347,11 @@ async function mailAlerts(pool, companyId, rules, ruleKey, list, subject) {
 async function sendTestMail(to, { name = "", branches = [] } = {}) {
   const esc = (s) => String(s || "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
   const scope = branches.length ? branches.join(", ") : "All branches";
-  const text = `Hello${name ? ` ${name}` : ""},\n\nThis is a test from INSPECT PRO alerts. You are on the recipients list for: ${scope}.\nAlerts will arrive from this address.\n\n${APP_ORIGIN()}/alerts`;
+  const text = `Hello${name ? ` ${name}` : ""},\n\nThis is a test from INSPECT PRO alerts. You are on the recipients list for: ${scope}.\nAlerts will arrive from this address, with the details and the documents attached.`;
   const html = `<div style="font-family:Arial,sans-serif;max-width:560px">
     <h2 style="color:#0f2740;margin:0 0 8px">✅ Test e-mail — INSPECT PRO alerts</h2>
     <p style="color:#334155">Hello${name ? ` <b>${esc(name)}</b>` : ""}, you are on the alert recipients list for: <b>${esc(scope)}</b>.</p>
-    <p style="color:#334155">Alerts will arrive from this address — add it to your contacts so they never land in spam.</p>
-    <p><a href="${esc(APP_ORIGIN())}/alerts" style="color:#2563eb">Open the alerts</a></p></div>`;
+    <p style="color:#334155">Alerts will arrive from this address with the details and the documents attached — add it to your contacts so they never land in spam.</p></div>`;
   return sendPlatformMail({ to: [to], subject: "✅ INSPECT PRO alerts — test e-mail", text, html });
 }
 
@@ -312,7 +389,12 @@ async function onCcpRecordSave(pool, companyId, reportId, payload, byName = "") 
       ].filter(Boolean).join("\n"),
       link: "/haccp-iso/ccp-monitoring/view",
       dedupeKey: `${prefix}dev`,
-      data: { reportId, value, unit },
+      data: {
+        reportId, value, unit,
+        files: (Array.isArray(payload.attachments) ? payload.attachments : [])
+          .map((f) => ({ url: f?.url || f?.dataUrl || "", name: clean(f?.fileName || f?.label, 120) }))
+          .filter((f) => f.url).slice(0, MAX_FILES),
+      },
     });
     if (alert) await mailAlerts(pool, companyId, rules, "ccp", [alert], `🎯 ${alert.title}`);
     return alert;
@@ -632,17 +714,23 @@ const EXPIRY_SOURCES = [
       const p = row.payload || {};
       const branch = p.branch || "";
       const out = [];
+      const lic = (l, key, label) => ({
+        key, name: `Licence — ${l.name || label}`, branch, due: toDay(l.expiryDate), milestones: true,
+        details: docDetails(branch, l, [["Licence", l.name || label]]), files: docFiles(l),
+      });
       const main = p.license && typeof p.license === "object" ? p.license : null;
-      if (main && (main.name || main.expiryDate)) {
-        out.push({ key: `lic:${row.id}:license`, name: `Licence — ${main.name || "Licence"}`, branch, due: toDay(main.expiryDate), milestones: true });
-      }
+      if (main && (main.name || main.expiryDate)) out.push(lic(main, `lic:${row.id}:license`, "Licence"));
       (Array.isArray(p.licenses) ? p.licenses : []).forEach((l, i) => {
         if (!l || typeof l !== "object") return;
-        out.push({ key: `lic:${row.id}:${l.uid || `lidx${i}`}`, name: `Licence — ${l.name || `#${i + 1}`}`, branch, due: toDay(l.expiryDate), milestones: true });
+        out.push(lic(l, `lic:${row.id}:${l.uid || `lidx${i}`}`, `#${i + 1}`));
       });
       (Array.isArray(p.contracts) ? p.contracts : []).forEach((c, i) => {
         if (!c || typeof c !== "object") return;
-        out.push({ key: `ct:${row.id}:${c.uid || `idx${i}`}`, name: `Contract — ${[c.contractType, c.companyName].filter(Boolean).join(" · ") || `#${i + 1}`}`, branch, due: toDay(c.expiryDate), milestones: true });
+        out.push({
+          key: `ct:${row.id}:${c.uid || `idx${i}`}`, name: `Contract — ${[c.contractType, c.companyName].filter(Boolean).join(" · ") || `#${i + 1}`}`,
+          branch, due: toDay(c.expiryDate), milestones: true,
+          details: docDetails(branch, c, [["Contract type", c.contractType], ["Company", c.companyName]]), files: docFiles(c),
+        });
       });
       return out;
     },
@@ -687,6 +775,30 @@ async function closeStaleLicenceAlerts(pool, companyId, keepKeys) {
     [companyId, keepKeys]
   );
   return rowCount;
+}
+
+/* A licence / contract in the e-mail: its details as lines, its documents
+   as files to attach (the page saves fileUrls[] + fileNames[]). */
+function docDetails(branch, o, head) {
+  const ren = Array.isArray(o.renewals) ? o.renewals[o.renewals.length - 1] : null;
+  return [
+    ...head,
+    ["Expiry date", dmy(toDay(o.expiryDate))],
+    ren?.renewedOn && ["Last renewal", `${dmy(toDay(ren.renewedOn))}${ren.note ? ` — ${ren.note}` : ""}`],
+    ["Notes", o.notes],
+  ].filter((x) => x && x[1]).map(([k, v]) => `${k}: ${clean(v, 300)}`);
+}
+function docFiles(o) {
+  const urls = [];
+  for (const k of ["fileUrls", "fileUrl", "files", "attachments"]) {
+    const v = o?.[k];
+    (Array.isArray(v) ? v : v ? [v] : []).forEach((u) => {
+      const url = typeof u === "string" ? u : u?.url || u?.dataUrl || "";
+      if (url && !urls.includes(url)) urls.push(url);
+    });
+  }
+  const names = Array.isArray(o?.fileNames) ? o.fileNames : [];
+  return urls.slice(0, MAX_FILES).map((url, i) => ({ url, name: clean(names[i], 120) }));
 }
 
 async function checkExpiries(pool, companyId, days, today) {
@@ -830,7 +942,9 @@ async function runCompanyChecks(pool, companyId, { first = true, today = uaeToda
         companyId, rule: "expiries",
         severity: x.stage === "expired" || x.stage === "today" || x.failed ? "critical" : "warning", branch: x.branch,
         title: expiryTitle(x),
-        link: x.link, dedupeKey: keyOf(x), data: { due: x.due, stage: x.stage, step: x.step || null },
+        body: Array.isArray(x.details) ? x.details.join("\n") : "",
+        link: x.link, dedupeKey: keyOf(x),
+        data: { due: x.due, stage: x.stage, step: x.step || null, files: Array.isArray(x.files) ? x.files : [] },
       }));
     }
     // Licences & contracts: only the current step stays open in the bell —
