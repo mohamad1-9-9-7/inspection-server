@@ -149,7 +149,7 @@ module.exports = function registerAlertRoutes(app, deps = {}) {
   app.get("/api/alerts/log", strict, async (req, res) => {
     const limit = Math.min(500, Math.max(1, Number(req.query?.limit) || 200));
     const { rows } = await pool.query(
-      `SELECT id, sent_at, sent_by, report_type, subject, to_emails, method, attachment_count, note, status
+      `SELECT id, sent_at, sent_by, report_type, subject, to_emails, cc_emails, method, attachment_count, note, status
          FROM email_history
         WHERE company_id = COALESCE($1::int, 1) AND report_type LIKE 'alerts:%'
         ORDER BY id DESC LIMIT $2`,
