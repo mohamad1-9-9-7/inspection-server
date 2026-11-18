@@ -79,8 +79,36 @@ module.exports = function registerAlertRoutes(app, deps = {}) {
   });
 
   app.get("/api/alerts/rules", strict, async (req, res) => {
-    const rules = await engine.loadRules(pool, companyOf(req));
-    res.json({ ok: true, rules, mailbox: engine._companyMayMail(companyOf(req)) });
+    const companyId = companyOf(req);
+    const rules = await engine.loadRules(pool, companyId);
+    /* The branch names alerts really carry (alerts of the last year + the
+       licences register), so a recipient is routed by the exact same text. */
+    const { rows } = await pool.query(
+      `SELECT DISTINCT b FROM (
+         SELECT NULLIF(TRIM(branch), '') AS b FROM alerts
+          WHERE COALESCE(company_id, 1) = COALESCE($1::int, 1) AND created_at > now() - interval '365 days'
+         UNION
+         SELECT NULLIF(TRIM(payload->>'branch'), '') FROM reports
+          WHERE COALESCE(company_id, 1) = COALESCE($1::int, 1) AND type = 'licenses_contracts'
+       ) x WHERE b IS NOT NULL ORDER BY b LIMIT 200`,
+      [companyId]
+    ).catch(() => ({ rows: [] }));
+    res.json({ ok: true, rules, branches: rows.map((r) => r.b), mailbox: engine._companyMayMail(companyId) });
+  });
+
+  /* A test e-mail to one address — checks the recipient before relying on it. */
+  app.post("/api/alerts/test-mail", strict, async (req, res) => {
+    if (!isAdmin(req)) return res.status(403).json({ ok: false, error: "admin_required" });
+    const companyId = companyOf(req);
+    const to = String(req.body?.email || "").trim().toLowerCase();
+    if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(to)) return res.status(400).json({ ok: false, error: "bad_email" });
+    if (!engine._companyMayMail(companyId)) return res.status(409).json({ ok: false, error: "no_mailbox" });
+    const sent = await engine.sendTestMail(to, {
+      name: String(req.body?.name || "").slice(0, 80),
+      branches: Array.isArray(req.body?.branches) ? req.body.branches.slice(0, 60).map((b) => String(b).slice(0, 80)) : [],
+    }).catch(() => false);
+    if (!sent) return res.status(502).json({ ok: false, error: "send_failed" });
+    res.json({ ok: true });
   });
 
   app.put("/api/alerts/rules", strict, async (req, res) => {

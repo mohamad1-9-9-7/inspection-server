@@ -106,6 +106,36 @@ function mergeRules(saved) {
   if (!Array.isArray(out.missedReports.checks)) out.missedReports.checks = DEFAULT_DAILY;
   out.expiries.days = Math.min(180, Math.max(1, Number(out.expiries.days) || 30));
   out.capa.openDays = Math.min(365, Math.max(1, Number(out.capa.openDays) || 30));
+  out.contacts = cleanContacts(s.contacts);
+  return out;
+}
+
+/* Named recipients routed by branch and alert type (the Alerts page's
+   "Recipients"): { id, name, email, role, branches[] (empty = every branch),
+   rules[] (empty = every type), onlyCritical, active }. One row per e-mail. */
+const RULE_KEYS = () => Object.keys(DEFAULT_RULES);
+function cleanContacts(list) {
+  const seen = new Set();
+  const out = [];
+  for (const c of Array.isArray(list) ? list : []) {
+    if (!c || typeof c !== "object") continue;
+    const email = cleanEmails([c.email])[0];
+    if (!email || seen.has(email)) continue;
+    seen.add(email);
+    const branches = [...new Set((Array.isArray(c.branches) ? c.branches : []).map((b) => clean(b, 80)).filter(Boolean))].slice(0, 60);
+    const rules = [...new Set((Array.isArray(c.rules) ? c.rules : []).filter((r) => RULE_KEYS().includes(r)))];
+    out.push({
+      id: clean(c.id, 40) || `c${out.length + 1}${Date.now().toString(36)}`,
+      name: clean(c.name, 80),
+      email,
+      role: clean(c.role, 80),
+      branches,
+      rules: rules.length === RULE_KEYS().length ? [] : rules,
+      onlyCritical: !!c.onlyCritical,
+      active: c.active !== false,
+    });
+    if (out.length >= 200) break;
+  }
   return out;
 }
 
@@ -179,20 +209,71 @@ function alertsHtml(list) {
 const alertsText = (list) =>
   list.map((a) => [`• ${a.title}`, a.branch && `  ${a.branch}`, a.body && `  ${a.body}`, a.link && `  ${APP_ORIGIN()}${a.link}`].filter(Boolean).join("\n")).join("\n\n");
 
-/** Mails a set of NEW alerts to the rule's recipients; marks them emailed. Best-effort. */
-async function mailAlerts(pool, companyId, emails, list, subject) {
-  const to = cleanEmails(emails);
-  if (!to.length || !list.length || !companyMayMail(companyId)) return false;
-  try {
-    const sent = await sendPlatformMail({ to, subject, text: alertsText(list), html: alertsHtml(list) });
-    if (sent) {
-      await pool.query(`UPDATE alerts SET emailed_at = now() WHERE id = ANY($1::bigint[])`, [list.map((a) => a.id)]);
-    }
-    return sent;
-  } catch (e) {
-    console.warn("[alerts] e-mail failed:", e?.message || e);
-    return false;
+/* Who receives one alert of one rule:
+     • the rule's own list (rules[k].emails — everything of that rule), and
+     • every active contact whose types include the rule (empty = all types),
+       whose branches include the alert's branch (empty = every branch; an
+       alert that names no branch goes to the every-branch contacts only),
+       and — when the contact asked for critical only — a critical alert. */
+const normBranch = (b) => String(b || "").trim().toLowerCase();
+function recipientsFor(rules, ruleKey, alert) {
+  const out = new Set(cleanEmails(rules?.[ruleKey]?.emails));
+  const br = normBranch(alert?.branch);
+  for (const c of Array.isArray(rules?.contacts) ? rules.contacts : []) {
+    if (!c || c.active === false || !c.email) continue;
+    if (c.rules?.length && !c.rules.includes(ruleKey)) continue;
+    if (c.branches?.length && (!br || !c.branches.some((b) => normBranch(b) === br))) continue;
+    if (c.onlyCritical && alert?.severity !== "critical") continue;
+    out.add(c.email);
   }
+  return [...out];
+}
+
+/** Mails NEW alerts of one rule — each recipient gets only the alerts routed
+    to them (one mail per group with the same alerts); marks the mailed ones.
+    Best-effort. `subject` is a string or (alerts) => string. */
+async function mailAlerts(pool, companyId, rules, ruleKey, list, subject) {
+  if (!list.length || !companyMayMail(companyId)) return false;
+  const byEmail = new Map(); // email → alerts
+  for (const a of list) {
+    for (const e of recipientsFor(rules, ruleKey, a)) {
+      if (!byEmail.has(e)) byEmail.set(e, []);
+      byEmail.get(e).push(a);
+    }
+  }
+  const groups = new Map(); // "id,id" → { to[], alerts[] }
+  for (const [e, alerts] of byEmail) {
+    const k = alerts.map((a) => a.id).join(",");
+    if (!groups.has(k)) groups.set(k, { to: [], alerts });
+    groups.get(k).to.push(e);
+  }
+  let any = false;
+  for (const g of groups.values()) {
+    try {
+      const subj = typeof subject === "function" ? subject(g.alerts) : subject;
+      const sent = await sendPlatformMail({ to: g.to.slice(0, 50), subject: subj, text: alertsText(g.alerts), html: alertsHtml(g.alerts) });
+      if (sent) {
+        any = true;
+        await pool.query(`UPDATE alerts SET emailed_at = now() WHERE id = ANY($1::bigint[])`, [g.alerts.map((a) => a.id)]);
+      }
+    } catch (e) {
+      console.warn("[alerts] e-mail failed:", e?.message || e);
+    }
+  }
+  return any;
+}
+
+/** A test e-mail from the Alerts page (one recipient). */
+async function sendTestMail(to, { name = "", branches = [] } = {}) {
+  const esc = (s) => String(s || "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+  const scope = branches.length ? branches.join(", ") : "All branches";
+  const text = `Hello${name ? ` ${name}` : ""},\n\nThis is a test from INSPECT PRO alerts. You are on the recipients list for: ${scope}.\nAlerts will arrive from this address.\n\n${APP_ORIGIN()}/alerts`;
+  const html = `<div style="font-family:Arial,sans-serif;max-width:560px">
+    <h2 style="color:#0f2740;margin:0 0 8px">✅ Test e-mail — INSPECT PRO alerts</h2>
+    <p style="color:#334155">Hello${name ? ` <b>${esc(name)}</b>` : ""}, you are on the alert recipients list for: <b>${esc(scope)}</b>.</p>
+    <p style="color:#334155">Alerts will arrive from this address — add it to your contacts so they never land in spam.</p>
+    <p><a href="${esc(APP_ORIGIN())}/alerts" style="color:#2563eb">Open the alerts</a></p></div>`;
+  return sendPlatformMail({ to: [to], subject: "✅ INSPECT PRO alerts — test e-mail", text, html });
 }
 
 /* ───────── EVENT: a phone temperature reading ───────── */
@@ -233,7 +314,7 @@ async function onTemperatureReading(pool, companyId, r) {
       dedupeKey: `${prefix}${r.kind === "recheck" ? "recheck:" : ""}${r.slot}`,
       data: { type: r.type, unit: r.unit, slot: r.slot, value: r.value, min: r.min, max: r.max, kind: r.kind },
     });
-    if (alert) await mailAlerts(pool, companyId, rules.temperature.emails, [alert], `🌡️ ${alert.title}`);
+    if (alert) await mailAlerts(pool, companyId, rules, "temperature", [alert], `🌡️ ${alert.title}`);
   } catch (e) {
     console.warn("[alerts] temperature hook failed:", e?.message || e);
   }
@@ -390,8 +471,8 @@ async function onTemperatureSheetSave(pool, companyId, type, oldPayload, newPayl
       }
     }
     if (created.length) {
-      await mailAlerts(pool, companyId, rules.temperature.emails, created,
-        created.length === 1 ? `🌡️ ${created[0].title}` : `🌡️ ${branch}: ${created.length} temperatures out of range`);
+      await mailAlerts(pool, companyId, rules, "temperature", created,
+        (g) => (g.length === 1 ? `🌡️ ${g[0].title}` : `🌡️ ${branch}: ${g.length} temperatures out of range`));
     }
     return created;
   } catch (e) {
@@ -728,7 +809,12 @@ async function runCompanyChecks(pool, companyId, { first = true, today = uaeToda
     capa: "🛠️ CAPA / NCR overdue",
   };
   for (const [k, list] of Object.entries(created)) {
-    if (list.length) await mailAlerts(pool, companyId, rules[k].emails, list, `${subjects[k]} — ${list.length}`);
+    if (list.length) {
+      await mailAlerts(pool, companyId, rules, k, list, (g) => {
+        const brs = [...new Set(g.map((a) => a.branch).filter(Boolean))];
+        return `${subjects[k]} — ${g.length}${brs.length === 1 ? ` · ${brs[0]}` : ""}`;
+      });
+    }
   }
   return Object.values(created).flat();
 }
@@ -793,6 +879,9 @@ module.exports = {
   startAlertScheduler,
   mailAlerts,
   _companyMayMail: companyMayMail,
+  sendTestMail,
+  recipientsFor,
+  cleanContacts,
   // for tests
   _internal: { toDay, checkCapa, checkExpiries, licenceStep, expiryTitle, addDays, daysBetween, cleanEmails, sheetReadings },
 };
