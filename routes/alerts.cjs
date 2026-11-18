@@ -9,7 +9,7 @@
    PUT  /api/alerts/rules                    admin            save them
    POST /api/alerts/run                      admin            run the scheduled checks now
    POST /api/alerts/test-mail                admin            one test e-mail
-   POST /api/alerts/send-now                 admin            the real reminders, now (all or body.email)
+   POST /api/alerts/send-now                 admin            the real reminders, now (all, body.branch or body.email)
    GET  /api/alerts/log                                       the send log (email_history, alerts:*)
 
    Always the caller's own company (utils/tenant.cjs companyOf). The engine
@@ -135,7 +135,8 @@ module.exports = function registerAlertRoutes(app, deps = {}) {
     const email = String(req.body?.email || "").trim().toLowerCase();
     if (email && !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) return res.status(400).json({ ok: false, error: "bad_email" });
     try {
-      const r = await engine.sendRemindersNow(pool, companyId, { email, sentBy: String(userOf(req)?.username || "") });
+      const branch = String(req.body?.branch || "").slice(0, 120);
+      const r = await engine.sendRemindersNow(pool, companyId, { email, branch, sentBy: String(userOf(req)?.username || "") });
       if (!r.ok) return res.status(409).json(r);
       res.json(r);
     } catch (e) {
@@ -149,7 +150,7 @@ module.exports = function registerAlertRoutes(app, deps = {}) {
   app.get("/api/alerts/log", strict, async (req, res) => {
     const limit = Math.min(500, Math.max(1, Number(req.query?.limit) || 200));
     const { rows } = await pool.query(
-      `SELECT id, sent_at, sent_by, report_type, subject, to_emails, cc_emails, method, attachment_count, note, status
+      `SELECT id, sent_at, sent_by, report_type, subject, to_emails, cc_emails, bcc_emails, method, attachment_count, note, status
          FROM email_history
         WHERE company_id = COALESCE($1::int, 1) AND report_type LIKE 'alerts:%'
         ORDER BY id DESC LIMIT $2`,
