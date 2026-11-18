@@ -109,6 +109,9 @@ function mergeRules(saved) {
   }
   if (!Array.isArray(out.missedReports.checks)) out.missedReports.checks = DEFAULT_DAILY;
   out.expiries.days = Math.min(180, Math.max(1, Number(out.expiries.days) || 30));
+  // which kinds of expiry are reminded — empty = every kind
+  const kinds = [...new Set((Array.isArray(out.expiries.kinds) ? out.expiries.kinds : []).filter((k) => EXPIRY_KINDS.includes(k)))];
+  out.expiries.kinds = kinds.length === EXPIRY_KINDS.length ? [] : kinds;
   out.capa.openDays = Math.min(365, Math.max(1, Number(out.capa.openDays) || 30));
   out.contacts = cleanContacts(s.contacts);
   return out;
@@ -395,7 +398,7 @@ async function mailAlerts(pool, companyId, rules, ruleKey, list, subject) {
 async function sendRemindersNow(pool, companyId, { email = "", sentBy = "" } = {}) {
   if (!companyMayMail(companyId)) return { ok: false, error: "no_mailbox" };
   const rules = await loadRules(pool, companyId);
-  const found = await checkExpiries(pool, companyId, rules.expiries.days, uaeToday());
+  const found = await checkExpiries(pool, companyId, rules.expiries.days, uaeToday(), rules.expiries.kinds);
   const items = found.map((x) => ({
     id: null, rule: "expiries", branch: x.branch, title: expiryTitle(x),
     severity: x.stage === "expired" || x.stage === "today" || x.failed ? "critical" : "warning",
@@ -881,7 +884,14 @@ function docFiles(o) {
   return urls.slice(0, MAX_FILES).map((url, i) => ({ url, name: clean(names[i], 120) }));
 }
 
-async function checkExpiries(pool, companyId, days, today) {
+/* The kinds of expiry an admin can pick on the Alerts page (rules.expiries.kinds,
+   empty = all). Told apart by the item key's prefix. */
+const EXPIRY_KINDS = ["licences", "contracts", "calibration", "training", "ohc", "supplier", "mockRecall"];
+const KIND_BY_PREFIX = { lic: "licences", ct: "contracts", cal: "calibration", cert: "training", ohc: "ohc", sup: "supplier", drill: "mockRecall" };
+const expiryKindOf = (key) => KIND_BY_PREFIX[String(key || "").split(":")[0]] || "";
+
+async function checkExpiries(pool, companyId, days, today, kinds = []) {
+  const wanted = (k) => !kinds?.length || kinds.includes(k);
   const types = EXPIRY_SOURCES.flatMap((s) => s.types);
   const { rows } = await pool.query(
     `SELECT id, type, payload FROM reports
@@ -926,6 +936,7 @@ async function checkExpiries(pool, companyId, days, today) {
   });
 
   // ISO 22000: a mock recall drill at least every 90 days
+  if (!wanted("mockRecall")) return out.filter((x) => wanted(expiryKindOf(x.key)));
   const drill = await pool.query(
     `SELECT MAX(LEFT(payload->>'drillDate', 10)) AS last FROM reports
       WHERE COALESCE(company_id, 1) = COALESCE($1::int, 1) AND type = 'mock_recall_drill'`,
@@ -939,7 +950,7 @@ async function checkExpiries(pool, companyId, days, today) {
       out.push({ key: `drill:${last}`, name: `Mock recall drill (last one ${dmy(last)})`, branch: "", due, left, stage: left < 0 ? "expired" : "soon", link: "/haccp-iso/mock-recall" });
     }
   }
-  return out;
+  return out.filter((x) => wanted(expiryKindOf(x.key)));
 }
 
 async function checkCapa(pool, companyId, openDays, today) {
@@ -1015,7 +1026,7 @@ async function runCompanyChecks(pool, companyId, { first = true, today = uaeToda
     }
   }
   if (first && rules.expiries.enabled) {
-    const found = await checkExpiries(pool, companyId, rules.expiries.days, today);
+    const found = await checkExpiries(pool, companyId, rules.expiries.days, today, rules.expiries.kinds);
     const keyOf = (x) => `exp:${x.key}:${x.due}:${x.step || x.stage}`;
     for (const x of found) {
       push("expiries", await raiseAlert(pool, {
@@ -1125,5 +1136,6 @@ module.exports = {
   recipientsFor,
   cleanContacts,
   // for tests
-  _internal: { toDay, checkCapa, checkExpiries, licenceStep, expiryTitle, addDays, daysBetween, cleanEmails, sheetReadings },
+  EXPIRY_KINDS,
+  _internal: { toDay, checkCapa, checkExpiries, expiryKindOf, licenceStep, expiryTitle, addDays, daysBetween, cleanEmails, sheetReadings },
 };
