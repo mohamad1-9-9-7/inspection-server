@@ -8,6 +8,9 @@
    GET  /api/alerts/rules                                     the company rules (defaults filled in)
    PUT  /api/alerts/rules                    admin            save them
    POST /api/alerts/run                      admin            run the scheduled checks now
+   POST /api/alerts/test-mail                admin            one test e-mail
+   POST /api/alerts/send-now                 admin            the real reminders, now (all or body.email)
+   GET  /api/alerts/log                                       the send log (email_history, alerts:*)
 
    Always the caller's own company (utils/tenant.cjs companyOf). The engine
    itself is utils/alertEngine.cjs.
@@ -118,9 +121,41 @@ module.exports = function registerAlertRoutes(app, deps = {}) {
     const sent = await engine.sendTestMail(to, {
       name: String(req.body?.name || "").slice(0, 80),
       branches: Array.isArray(req.body?.branches) ? req.body.branches.slice(0, 60).map((b) => String(b).slice(0, 80)) : [],
-    }).catch(() => false);
+    }, { pool, companyId, sentBy: String(userOf(req)?.username || "") }).catch(() => false);
     if (!sent) return res.status(502).json({ ok: false, error: "send_failed" });
     res.json({ ok: true });
+  });
+
+  /* Send the reminders NOW — the real ones (everything expiring / expired
+     today, details + documents), to every recipient or to one (body.email).
+     Uses the SAVED rules: save the page first. */
+  app.post("/api/alerts/send-now", strict, async (req, res) => {
+    if (!isAdmin(req)) return res.status(403).json({ ok: false, error: "admin_required" });
+    const companyId = companyOf(req);
+    const email = String(req.body?.email || "").trim().toLowerCase();
+    if (email && !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) return res.status(400).json({ ok: false, error: "bad_email" });
+    try {
+      const r = await engine.sendRemindersNow(pool, companyId, { email, sentBy: String(userOf(req)?.username || "") });
+      if (!r.ok) return res.status(409).json(r);
+      res.json(r);
+    } catch (e) {
+      console.warn("[alerts] send-now failed:", e?.message || e);
+      res.status(500).json({ ok: false, error: "server_error" });
+    }
+  });
+
+  /* The send log of the alerts: the E-mail Center's email_history rows whose
+     report_type starts with "alerts:" (scheduled, manual and test mails). */
+  app.get("/api/alerts/log", strict, async (req, res) => {
+    const limit = Math.min(500, Math.max(1, Number(req.query?.limit) || 200));
+    const { rows } = await pool.query(
+      `SELECT id, sent_at, sent_by, report_type, subject, to_emails, method, attachment_count, note, status
+         FROM email_history
+        WHERE company_id = COALESCE($1::int, 1) AND report_type LIKE 'alerts:%'
+        ORDER BY id DESC LIMIT $2`,
+      [companyOf(req), limit]
+    ).catch(() => ({ rows: [] }));
+    res.json({ ok: true, data: rows });
   });
 
   app.put("/api/alerts/rules", strict, async (req, res) => {

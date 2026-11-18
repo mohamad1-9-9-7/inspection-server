@@ -302,40 +302,85 @@ function recipientsFor(rules, ruleKey, alert) {
   return [...out];
 }
 
+/* ───────── the send log ─────────
+   Every alert e-mail (scheduled, "send now" from the Alerts page, test) is
+   written to email_history — the same log the E-mail Center shows — with
+   report_type "alerts:<rule>" and method auto / manual / test. One row per
+   recipient, failures included (status "failed"). Best-effort. */
+async function logMail(pool, companyId, { to, subject, rule, method, sentBy, status, attachments = 0, note = "" }) {
+  try {
+    await pool.query(
+      `INSERT INTO email_history (sent_by, report_type, report_title, report_date, subject, to_emails, recipient_count,
+                                  classification, priority, method, attachment_count, note, status, company_id)
+       VALUES ($1, $2, $3, $4::date, $5, $6::jsonb, 1, 'internal', $7, $8, $9, $10, $11, $12)`,
+      [
+        clean(sentBy || "system", 100), clean(`alerts:${rule}`, 100), "Alerts", uaeToday(), clean(subject, 500),
+        JSON.stringify([to]), method === "test" ? "normal" : "high", clean(method, 20), Number(attachments) || 0,
+        clean(note, 2000), clean(status, 20), companyId ?? 1,
+      ]
+    );
+  } catch (e) {
+    console.warn("[alerts] send log failed:", e?.message || e);
+  }
+}
+
+/** One mail to one person: the alerts routed to them, their documents
+    attached, no links; logged either way. Returns true when sent. */
+async function deliver(pool, companyId, email, alerts, subject, { rule, method = "auto", sentBy = "", cache = new Map() } = {}) {
+  let attachments = [];
+  try {
+    const got = await attachmentsFor(alerts, cache);
+    attachments = got.attachments;
+    // the real list of what went with this mail (and what could not)
+    const note = [
+      attachments.length && `📎 Attached: ${attachments.map((x) => x.filename).join(", ")}`,
+      got.skipped.length && `Not attached (too large or unavailable): ${got.skipped.join(", ")}`,
+    ].filter(Boolean).join("\n");
+    const sent = await sendPlatformMail({
+      to: [email], subject, attachments,
+      text: alertsText(alerts) + (note ? `\n\n${note}` : ""),
+      html: alertsHtml(alerts) + (note ? `<div style="color:#475569;font-size:13px;margin-top:8px;white-space:pre-line">${note.replace(/[&<>"]/g, "")}</div>` : ""),
+    });
+    await logMail(pool, companyId, {
+      to: email, subject, rule, method, sentBy, status: sent ? "sent" : "failed", attachments: attachments.length,
+      note: alerts.map((a) => a.title).join("\n") + (sent ? "" : "\nSMTP not configured"),
+    });
+    return !!sent;
+  } catch (err) {
+    console.warn("[alerts] e-mail failed:", email, err?.message || err);
+    await logMail(pool, companyId, {
+      to: email, subject, rule, method, sentBy, status: "failed", attachments: attachments.length,
+      note: `${alerts.map((a) => a.title).join("\n")}\n${err?.message || err}`,
+    });
+    return false;
+  }
+}
+
+/** alerts → Map(email → its alerts), by the rule's routing. */
+function routeAlerts(rules, ruleKey, list, only = "") {
+  const byEmail = new Map();
+  for (const a of list) {
+    for (const e of recipientsFor(rules, ruleKey, a)) {
+      if (only && e !== only) continue;
+      if (!byEmail.has(e)) byEmail.set(e, []);
+      byEmail.get(e).push(a);
+    }
+  }
+  return byEmail;
+}
+
 /** Mails NEW alerts of one rule — each recipient gets only the alerts routed
     to them, in a mail of their own; marks the mailed ones.
     Best-effort. `subject` is a string or (alerts) => string. */
 async function mailAlerts(pool, companyId, rules, ruleKey, list, subject) {
   if (!list.length || !companyMayMail(companyId)) return false;
-  const byEmail = new Map(); // email → alerts
-  for (const a of list) {
-    for (const e of recipientsFor(rules, ruleKey, a)) {
-      if (!byEmail.has(e)) byEmail.set(e, []);
-      byEmail.get(e).push(a);
-    }
-  }
   /* One mail PER PERSON: a branch manager must not see the addresses of the
      other recipients (QA, management, other branches) in the To line. */
   const mailed = new Set();
-  const fileCache = new Map();
-  for (const [e, alerts] of [...byEmail].slice(0, 100)) {
-    try {
-      const subj = typeof subject === "function" ? subject(alerts) : subject;
-      const { attachments, skipped } = await attachmentsFor(alerts, fileCache);
-      // the real list of what went with this mail (and what could not)
-      const note = [
-        attachments.length && `📎 Attached: ${attachments.map((x) => x.filename).join(", ")}`,
-        skipped.length && `Not attached (too large or unavailable): ${skipped.join(", ")}`,
-      ].filter(Boolean).join("\n");
-      const sent = await sendPlatformMail({
-        to: [e], subject: subj, attachments,
-        text: alertsText(alerts) + (note ? `\n\n${note}` : ""),
-        html: alertsHtml(alerts) + (note ? `<div style="color:#475569;font-size:13px;margin-top:8px;white-space:pre-line">${note.replace(/[&<>"]/g, "")}</div>` : ""),
-      });
-      if (sent) alerts.forEach((a) => mailed.add(a.id));
-    } catch (err) {
-      console.warn("[alerts] e-mail failed:", e, err?.message || err);
-    }
+  const cache = new Map();
+  for (const [e, alerts] of [...routeAlerts(rules, ruleKey, list)].slice(0, 100)) {
+    const subj = typeof subject === "function" ? subject(alerts) : subject;
+    if (await deliver(pool, companyId, e, alerts, subj, { rule: ruleKey, method: "auto", cache })) alerts.forEach((a) => mailed.add(a.id));
   }
   if (mailed.size) {
     await pool.query(`UPDATE alerts SET emailed_at = now() WHERE id = ANY($1::bigint[])`, [[...mailed]]).catch(() => {});
@@ -343,16 +388,51 @@ async function mailAlerts(pool, companyId, rules, ruleKey, list, subject) {
   return mailed.size > 0;
 }
 
+/** "Send the reminders now" (Alerts page): everything expiring or expired
+    right now — licences & contracts, calibration, certificates, mock recall —
+    mailed at once to its recipients (or to one of them), with the details and
+    documents. Not limited by the once-per-step rule and files no alert. */
+async function sendRemindersNow(pool, companyId, { email = "", sentBy = "" } = {}) {
+  if (!companyMayMail(companyId)) return { ok: false, error: "no_mailbox" };
+  const rules = await loadRules(pool, companyId);
+  const found = await checkExpiries(pool, companyId, rules.expiries.days, uaeToday());
+  const items = found.map((x) => ({
+    id: null, rule: "expiries", branch: x.branch, title: expiryTitle(x),
+    severity: x.stage === "expired" || x.stage === "today" || x.failed ? "critical" : "warning",
+    body: Array.isArray(x.details) ? x.details.join("\n") : "",
+    data: { files: Array.isArray(x.files) ? x.files : [] },
+  }));
+  const only = String(email || "").trim().toLowerCase();
+  const routed = routeAlerts(rules, "expiries", items, only);
+  const cache = new Map();
+  let sent = 0;
+  let failed = 0;
+  for (const [e, list] of [...routed].slice(0, 100)) {
+    const brs = [...new Set(list.map((a) => a.branch).filter(Boolean))];
+    const subject = `⏳ Reminder — ${list.length} expiring / expired${brs.length === 1 ? ` · ${brs[0]}` : ""}`;
+    if (await deliver(pool, companyId, e, list, subject, { rule: "expiries", method: "manual", sentBy, cache })) sent++;
+    else failed++;
+  }
+  return { ok: true, items: items.length, recipients: routed.size, sent, failed };
+}
+
 /** A test e-mail from the Alerts page (one recipient). */
-async function sendTestMail(to, { name = "", branches = [] } = {}) {
+async function sendTestMail(to, { name = "", branches = [] } = {}, { pool = null, companyId = null, sentBy = "" } = {}) {
   const esc = (s) => String(s || "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
   const scope = branches.length ? branches.join(", ") : "All branches";
+  const subject = "✅ INSPECT PRO alerts — test e-mail";
   const text = `Hello${name ? ` ${name}` : ""},\n\nThis is a test from INSPECT PRO alerts. You are on the recipients list for: ${scope}.\nAlerts will arrive from this address, with the details and the documents attached.`;
   const html = `<div style="font-family:Arial,sans-serif;max-width:560px">
     <h2 style="color:#0f2740;margin:0 0 8px">✅ Test e-mail — INSPECT PRO alerts</h2>
     <p style="color:#334155">Hello${name ? ` <b>${esc(name)}</b>` : ""}, you are on the alert recipients list for: <b>${esc(scope)}</b>.</p>
     <p style="color:#334155">Alerts will arrive from this address with the details and the documents attached — add it to your contacts so they never land in spam.</p></div>`;
-  return sendPlatformMail({ to: [to], subject: "✅ INSPECT PRO alerts — test e-mail", text, html });
+  let sent = false;
+  try {
+    sent = await sendPlatformMail({ to: [to], subject, text, html });
+  } finally {
+    if (pool) await logMail(pool, companyId, { to, subject, rule: "test", method: "test", sentBy, status: sent ? "sent" : "failed", note: `Scope: ${scope}` });
+  }
+  return sent;
 }
 
 /* ───────── EVENT: a CCP monitoring record outside its critical limit ─────────
@@ -1041,6 +1121,7 @@ module.exports = {
   mailAlerts,
   _companyMayMail: companyMayMail,
   sendTestMail,
+  sendRemindersNow,
   recipientsFor,
   cleanContacts,
   // for tests
