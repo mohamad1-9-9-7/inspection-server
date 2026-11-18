@@ -386,7 +386,7 @@ module.exports = function registerMailerRoutes(app, deps = {}) {
 /* Platform notifications (e.g. a new demo request) sent from the same
    MAIL_* mailbox. Resolves to false when SMTP is not configured, so a
    caller can treat mail as best-effort. */
-module.exports.sendPlatformMail = async function sendPlatformMail({ to, subject, text, html, attachments }) {
+module.exports.sendPlatformMail = async function sendPlatformMail({ to, cc, subject, text, html, attachments }) {
   const cfg = smtpConfig();
   if (!cfg.configured) return false;
   const recipients = cleanList(to);
@@ -394,6 +394,7 @@ module.exports.sendPlatformMail = async function sendPlatformMail({ to, subject,
   await getTransporter(cfg).sendMail({
     from: cfg.fromName ? `"${cfg.fromName}" <${cfg.user}>` : cfg.user,
     to: recipients.join(", "),
+    cc: cleanList(cc || []).filter((e) => !recipients.includes(e)).join(", ") || undefined,
     subject: String(subject || "").slice(0, 300),
     text: text || "",
     html: html || undefined,

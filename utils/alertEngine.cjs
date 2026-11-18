@@ -139,6 +139,8 @@ function cleanContacts(list) {
       branches,
       rules: rules.length === RULE_KEYS().length ? [] : rules,
       onlyCritical: !!c.onlyCritical,
+      // "to" = a mail of their own; "cc" = copied on the mails of the alerts they follow
+      mode: c.mode === "cc" ? "cc" : "to",
       active: c.active !== false,
     });
     if (out.length >= 200) break;
@@ -304,22 +306,29 @@ function recipientsFor(rules, ruleKey, alert) {
   }
   return [...out];
 }
+/** The CC people among an alert's recipients (contacts with mode "cc"). */
+function ccFor(rules, ruleKey, alert) {
+  const cc = new Set(
+    (Array.isArray(rules?.contacts) ? rules.contacts : []).filter((c) => c && c.mode === "cc").map((c) => c.email)
+  );
+  return new Set(recipientsFor(rules, ruleKey, alert).filter((e) => cc.has(e)));
+}
 
 /* ───────── the send log ─────────
    Every alert e-mail (scheduled, "send now" from the Alerts page, test) is
    written to email_history — the same log the E-mail Center shows — with
    report_type "alerts:<rule>" and method auto / manual / test. One row per
    recipient, failures included (status "failed"). Best-effort. */
-async function logMail(pool, companyId, { to, subject, rule, method, sentBy, status, attachments = 0, note = "" }) {
+async function logMail(pool, companyId, { to, cc = [], subject, rule, method, sentBy, status, attachments = 0, note = "" }) {
   try {
     await pool.query(
-      `INSERT INTO email_history (sent_by, report_type, report_title, report_date, subject, to_emails, recipient_count,
+      `INSERT INTO email_history (sent_by, report_type, report_title, report_date, subject, to_emails, cc_emails, recipient_count,
                                   classification, priority, method, attachment_count, note, status, company_id)
-       VALUES ($1, $2, $3, $4::date, $5, $6::jsonb, 1, 'internal', $7, $8, $9, $10, $11, $12)`,
+       VALUES ($1, $2, $3, $4::date, $5, $6::jsonb, $7::jsonb, $8, 'internal', $9, $10, $11, $12, $13, $14)`,
       [
         clean(sentBy || "system", 100), clean(`alerts:${rule}`, 100), "Alerts", uaeToday(), clean(subject, 500),
-        JSON.stringify([to]), method === "test" ? "normal" : "high", clean(method, 20), Number(attachments) || 0,
-        clean(note, 2000), clean(status, 20), companyId ?? 1,
+        JSON.stringify([to]), JSON.stringify(cc), 1 + cc.length, method === "test" ? "normal" : "high", clean(method, 20),
+        Number(attachments) || 0, clean(note, 2000), clean(status, 20), companyId ?? 1,
       ]
     );
   } catch (e) {
@@ -329,8 +338,9 @@ async function logMail(pool, companyId, { to, subject, rule, method, sentBy, sta
 
 /** One mail to one person: the alerts routed to them, their documents
     attached, no links; logged either way. Returns true when sent. */
-async function deliver(pool, companyId, email, alerts, subject, { rule, method = "auto", sentBy = "", cache = new Map() } = {}) {
+async function deliver(pool, companyId, email, alerts, subject, { rule, method = "auto", sentBy = "", cache = new Map(), cc = [] } = {}) {
   let attachments = [];
+  cc = [...new Set(cc)].filter((e) => e && e !== email).slice(0, 20);
   try {
     const got = await attachmentsFor(alerts, cache);
     attachments = got.attachments;
@@ -340,34 +350,45 @@ async function deliver(pool, companyId, email, alerts, subject, { rule, method =
       got.skipped.length && `Not attached (too large or unavailable): ${got.skipped.join(", ")}`,
     ].filter(Boolean).join("\n");
     const sent = await sendPlatformMail({
-      to: [email], subject, attachments,
+      to: [email], cc, subject, attachments,
       text: alertsText(alerts) + (note ? `\n\n${note}` : ""),
       html: alertsHtml(alerts) + (note ? `<div style="color:#475569;font-size:13px;margin-top:8px;white-space:pre-line">${note.replace(/[&<>"]/g, "")}</div>` : ""),
     });
     await logMail(pool, companyId, {
-      to: email, subject, rule, method, sentBy, status: sent ? "sent" : "failed", attachments: attachments.length,
+      to: email, cc, subject, rule, method, sentBy, status: sent ? "sent" : "failed", attachments: attachments.length,
       note: alerts.map((a) => a.title).join("\n") + (sent ? "" : "\nSMTP not configured"),
     });
     return !!sent;
   } catch (err) {
     console.warn("[alerts] e-mail failed:", email, err?.message || err);
     await logMail(pool, companyId, {
-      to: email, subject, rule, method, sentBy, status: "failed", attachments: attachments.length,
+      to: email, cc, subject, rule, method, sentBy, status: "failed", attachments: attachments.length,
       note: `${alerts.map((a) => a.title).join("\n")}\n${err?.message || err}`,
     });
     return false;
   }
 }
 
-/** alerts → Map(email → its alerts), by the rule's routing. */
+/** alerts → Map(To email → { alerts, cc:Set }), by the rule's routing.
+    A "cc" person is copied on the mails of the alerts they follow; when an
+    alert has no "to" person at all, its CC people get it as To instead (it
+    must reach someone). `only` (send now to one person) = that person as To,
+    no copies. */
 function routeAlerts(rules, ruleKey, list, only = "") {
   const byEmail = new Map();
+  const add = (e, a, cc) => {
+    if (!byEmail.has(e)) byEmail.set(e, { alerts: [], cc: new Set() });
+    const slot = byEmail.get(e);
+    slot.alerts.push(a);
+    cc.forEach((x) => { if (x !== e) slot.cc.add(x); });
+  };
   for (const a of list) {
-    for (const e of recipientsFor(rules, ruleKey, a)) {
-      if (only && e !== only) continue;
-      if (!byEmail.has(e)) byEmail.set(e, []);
-      byEmail.get(e).push(a);
-    }
+    const all = recipientsFor(rules, ruleKey, a);
+    if (only) { if (all.includes(only)) add(only, a, []); continue; }
+    const cc = ccFor(rules, ruleKey, a);
+    const to = all.filter((e) => !cc.has(e));
+    if (to.length) to.forEach((e) => add(e, a, cc));
+    else cc.forEach((e) => add(e, a, []));
   }
   return byEmail;
 }
@@ -381,9 +402,9 @@ async function mailAlerts(pool, companyId, rules, ruleKey, list, subject) {
      other recipients (QA, management, other branches) in the To line. */
   const mailed = new Set();
   const cache = new Map();
-  for (const [e, alerts] of [...routeAlerts(rules, ruleKey, list)].slice(0, 100)) {
+  for (const [e, { alerts, cc }] of [...routeAlerts(rules, ruleKey, list)].slice(0, 100)) {
     const subj = typeof subject === "function" ? subject(alerts) : subject;
-    if (await deliver(pool, companyId, e, alerts, subj, { rule: ruleKey, method: "auto", cache })) alerts.forEach((a) => mailed.add(a.id));
+    if (await deliver(pool, companyId, e, alerts, subj, { rule: ruleKey, method: "auto", cache, cc: [...cc] })) alerts.forEach((a) => mailed.add(a.id));
   }
   if (mailed.size) {
     await pool.query(`UPDATE alerts SET emailed_at = now() WHERE id = ANY($1::bigint[])`, [[...mailed]]).catch(() => {});
@@ -410,10 +431,10 @@ async function sendRemindersNow(pool, companyId, { email = "", sentBy = "" } = {
   const cache = new Map();
   let sent = 0;
   let failed = 0;
-  for (const [e, list] of [...routed].slice(0, 100)) {
+  for (const [e, { alerts: list, cc }] of [...routed].slice(0, 100)) {
     const brs = [...new Set(list.map((a) => a.branch).filter(Boolean))];
     const subject = `⏳ Reminder — ${list.length} expiring / expired${brs.length === 1 ? ` · ${brs[0]}` : ""}`;
-    if (await deliver(pool, companyId, e, list, subject, { rule: "expiries", method: "manual", sentBy, cache })) sent++;
+    if (await deliver(pool, companyId, e, list, subject, { rule: "expiries", method: "manual", sentBy, cache, cc: [...cc] })) sent++;
     else failed++;
   }
   return { ok: true, items: items.length, recipients: routed.size, sent, failed };
@@ -1134,6 +1155,7 @@ module.exports = {
   sendTestMail,
   sendRemindersNow,
   recipientsFor,
+  routeAlerts,
   cleanContacts,
   // for tests
   EXPIRY_KINDS,
