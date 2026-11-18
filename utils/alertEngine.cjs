@@ -13,7 +13,9 @@
        recheck back inside the range closes it again by itself.
      • SCHEDULE — fixed UAE times (ALERT_TIMES, default "08:00,13:00"):
          first slot  → yesterday's daily logs not filed, expiries
-                       (calibration, certificates, licences, mock recall)
+                       (calibration, certificates, licences, mock recall;
+                       licences & contracts step 30/20/10 days, the day,
+                       then weekly until renewed)
                        and overdue CAPA / NCR;
          later slots → temperature logs with no reading at all yet today.
        The database is touched only at those slots — polling every few
@@ -492,14 +494,73 @@ const EXPIRY_SOURCES = [
   {
     types: ["licenses_contracts"],
     link: "/haccp-iso/licenses-contracts/view",
+    /* The page saves the branch's main licence as payload.license (one
+       object), extra licences as payload.licenses[] and contracts as
+       payload.contracts[] — each extra item with its own uid. Keys follow
+       the uid (same rule as the page's flattenRecords), never the list
+       position, so deleting a row does not re-send the rows below it.
+       `milestones` = reminded at 30 / 20 / 10 days, on the day and weekly
+       after expiry (licenceStep). */
     items: (row) => {
       const p = row.payload || {};
-      const lic = (Array.isArray(p.licenses) ? p.licenses : []).map((l, i) => ({ key: `lic:${row.id}:${i}`, name: `Licence — ${l?.name || `#${i + 1}`}`, branch: p.branch || "", due: toDay(l?.expiryDate) }));
-      const ct = (Array.isArray(p.contracts) ? p.contracts : []).map((c, i) => ({ key: `ct:${row.id}:${i}`, name: `Contract — ${[c?.contractType, c?.companyName].filter(Boolean).join(" · ") || `#${i + 1}`}`, branch: p.branch || "", due: toDay(c?.expiryDate) }));
-      return [...lic, ...ct];
+      const branch = p.branch || "";
+      const out = [];
+      const main = p.license && typeof p.license === "object" ? p.license : null;
+      if (main && (main.name || main.expiryDate)) {
+        out.push({ key: `lic:${row.id}:license`, name: `Licence — ${main.name || "Licence"}`, branch, due: toDay(main.expiryDate), milestones: true });
+      }
+      (Array.isArray(p.licenses) ? p.licenses : []).forEach((l, i) => {
+        if (!l || typeof l !== "object") return;
+        out.push({ key: `lic:${row.id}:${l.uid || `lidx${i}`}`, name: `Licence — ${l.name || `#${i + 1}`}`, branch, due: toDay(l.expiryDate), milestones: true });
+      });
+      (Array.isArray(p.contracts) ? p.contracts : []).forEach((c, i) => {
+        if (!c || typeof c !== "object") return;
+        out.push({ key: `ct:${row.id}:${c.uid || `idx${i}`}`, name: `Contract — ${[c.contractType, c.companyName].filter(Boolean).join(" · ") || `#${i + 1}`}`, branch, due: toDay(c.expiryDate), milestones: true });
+      });
+      return out;
     },
   },
 ];
+
+/* Licences & contracts: one reminder per step, each step e-mailed once
+   (the step is part of the dedupe key). A day missed (server down) is
+   caught the next morning, because a step covers a range of days.
+     d30 = 30…21 days left · d20 = 20…11 · d10 = 10…1 · d0 = the expiry day
+     after-w0 = 1…7 days past, after-w1 = 8…14, … — weekly until renewed. */
+const LICENCE_WINDOW = 30;
+function licenceStep(left) {
+  if (!Number.isFinite(left) || left > LICENCE_WINDOW) return null;
+  if (left > 20) return "d30";
+  if (left > 10) return "d20";
+  if (left > 0) return "d10";
+  if (left === 0) return "d0";
+  return `after-w${Math.floor((-left - 1) / 7)}`;
+}
+
+function expiryTitle(x) {
+  if (x.key.startsWith("drill:")) {
+    return x.stage === "expired" ? `${x.name} — OVERDUE since ${dmy(x.due)}` : `${x.name} — due ${dmy(x.due)} (${x.left} day(s))`;
+  }
+  if (x.stage === "today") return `${x.name} — EXPIRES TODAY (${dmy(x.due)})`;
+  if (x.stage === "expired") {
+    return x.step && x.step !== "after-w0"
+      ? `${x.name} — EXPIRED on ${dmy(x.due)}, still not renewed (${-x.left} day(s) ago)`
+      : `${x.name} — EXPIRED on ${dmy(x.due)}`;
+  }
+  return `${x.name} — expires ${dmy(x.due)} (${x.left} day(s))`;
+}
+
+async function closeStaleLicenceAlerts(pool, companyId, keepKeys) {
+  const { rowCount } = await pool.query(
+    `UPDATE alerts SET status = 'resolved', resolved_at = now(),
+            data = data || jsonb_build_object('resolvedNote', 'renewed, removed or a newer reminder'::text)
+      WHERE COALESCE(company_id, 1) = COALESCE($1::int, 1) AND status <> 'resolved' AND rule = 'expiries'
+        AND (dedupe_key LIKE 'exp:lic:%' OR dedupe_key LIKE 'exp:ct:%')
+        AND NOT (dedupe_key = ANY($2::text[]))`,
+    [companyId, keepKeys]
+  );
+  return rowCount;
+}
 
 async function checkExpiries(pool, companyId, days, today) {
   const types = EXPIRY_SOURCES.flatMap((s) => s.types);
@@ -536,6 +597,11 @@ async function checkExpiries(pool, companyId, days, today) {
     if (isRecordCal(x) && newest.get(devKey(x)) !== x) return;
     if (x.group && latest.get(x.group) !== x) return;
     const left = daysBetween(today, x.due);
+    if (x.milestones) {
+      const step = licenceStep(left);
+      if (step) out.push({ ...x, left, step, stage: left < 0 ? "expired" : left === 0 ? "today" : "soon" });
+      return;
+    }
     if (left > days) return;
     out.push({ ...x, left, stage: left < 0 ? "expired" : "soon" });
   });
@@ -630,15 +696,19 @@ async function runCompanyChecks(pool, companyId, { first = true, today = uaeToda
     }
   }
   if (first && rules.expiries.enabled) {
-    for (const x of await checkExpiries(pool, companyId, rules.expiries.days, today)) {
+    const found = await checkExpiries(pool, companyId, rules.expiries.days, today);
+    const keyOf = (x) => `exp:${x.key}:${x.due}:${x.step || x.stage}`;
+    for (const x of found) {
       push("expiries", await raiseAlert(pool, {
-        companyId, rule: "expiries", severity: x.stage === "expired" || x.failed ? "critical" : "warning", branch: x.branch,
-        title: x.key.startsWith("drill:")
-          ? (x.stage === "expired" ? `${x.name} — OVERDUE since ${dmy(x.due)}` : `${x.name} — due ${dmy(x.due)} (${x.left} day(s))`)
-          : x.stage === "expired" ? `${x.name} — EXPIRED on ${dmy(x.due)}` : `${x.name} — expires ${dmy(x.due)} (${x.left} day(s))`,
-        link: x.link, dedupeKey: `exp:${x.key}:${x.due}:${x.stage}`, data: { due: x.due, stage: x.stage },
+        companyId, rule: "expiries",
+        severity: x.stage === "expired" || x.stage === "today" || x.failed ? "critical" : "warning", branch: x.branch,
+        title: expiryTitle(x),
+        link: x.link, dedupeKey: keyOf(x), data: { due: x.due, stage: x.stage, step: x.step || null },
       }));
     }
+    // Licences & contracts: only the current step stays open in the bell —
+    // earlier steps, renewed items (new due date) and deleted rows close.
+    await closeStaleLicenceAlerts(pool, companyId, found.filter((x) => x.milestones).map(keyOf));
   }
   if (first && rules.capa.enabled) {
     for (const x of await checkCapa(pool, companyId, rules.capa.openDays, today)) {
@@ -724,5 +794,5 @@ module.exports = {
   mailAlerts,
   _companyMayMail: companyMayMail,
   // for tests
-  _internal: { toDay, checkCapa, checkExpiries, addDays, daysBetween, cleanEmails, sheetReadings },
+  _internal: { toDay, checkCapa, checkExpiries, licenceStep, expiryTitle, addDays, daysBetween, cleanEmails, sheetReadings },
 };
