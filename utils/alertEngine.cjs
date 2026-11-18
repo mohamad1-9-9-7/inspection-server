@@ -354,6 +354,11 @@ function cleanReminders(list) {
       rules: rules.length === RULE_KEYS().length ? [] : rules,
       kinds: kinds.length === EXPIRY_KINDS.length ? [] : kinds,
       onlyCritical: !!r.onlyCritical, active: r.active !== false, to, cc, bcc,
+      // when: auto (on the spot) or a digest daily / weekly / monthly / quarterly at `time` (UAE)
+      freq: FREQS.includes(r.freq) ? r.freq : "auto",
+      time: /^([01]\d|2[0-3]):[0-5]\d$/.test(String(r.time || "")) ? r.time : "08:00",
+      weekday: Math.min(6, Math.max(0, Math.round(Number(r.weekday)) || 0)),
+      monthDay: Math.min(28, Math.max(1, Math.round(Number(r.monthDay)) || 1)),
     });
     if (out.length >= 300) break;
   }
@@ -373,8 +378,9 @@ function reminderMatches(rem, ruleKey, alert) {
   if (rem.onlyCritical && alert?.severity !== "critical") return false;
   return true;
 }
-const remindersFor = (rules, ruleKey, alert) =>
-  (Array.isArray(rules?.reminders) ? rules.reminders : []).filter((r) => reminderMatches(r, ruleKey, alert));
+const remindersFor = (rules, ruleKey, alert, { autoOnly = false } = {}) =>
+  (Array.isArray(rules?.reminders) ? rules.reminders : [])
+    .filter((r) => (!autoOnly || !r.freq || r.freq === "auto") && reminderMatches(r, ruleKey, alert));
 
 /** { to, cc, bcc } — everyone an alert reaches, over all its reminders. */
 function resolveRecipients(rules, ruleKey, alert) {
@@ -454,7 +460,7 @@ async function deliver(pool, companyId, to, alerts, subject, { rule, method = "a
     With no To, CC moves up to To (then BCC) so the mail has an addressee.
     `only` (send now to one person) = that person as To, alone, with every
     alert of every reminder they are on. `reminderId` = that reminder only. */
-function routeAlerts(rules, ruleKey, list, only = "", reminderId = "") {
+function routeAlerts(rules, ruleKey, list, only = "", reminderId = "", { autoOnly = false } = {}) {
   const groups = new Map();
   const legacy = cleanEmails(rules?.[ruleKey]?.emails);
   const add = (key, base, a) => {
@@ -462,7 +468,7 @@ function routeAlerts(rules, ruleKey, list, only = "", reminderId = "") {
     groups.get(key).alerts.push(a);
   };
   for (const a of list) {
-    const rems = remindersFor(rules, ruleKey, a).filter((r) => !reminderId || r.id === reminderId);
+    const rems = remindersFor(rules, ruleKey, a, { autoOnly }).filter((r) => !reminderId || r.id === reminderId);
     if (only) {
       const on = rems.some((r) => [...r.to, ...r.cc, ...r.bcc].includes(only)) || (!reminderId && legacy.includes(only));
       if (on) add("only", { id: "only", name: "", to: [only], cc: [], bcc: [] }, a);
@@ -484,7 +490,8 @@ async function mailAlerts(pool, companyId, rules, ruleKey, list, subject) {
   if (!list.length || !companyMayMail(companyId)) return false;
   const mailed = new Set();
   const cache = new Map();
-  for (const g of routeAlerts(rules, ruleKey, list).slice(0, 100)) {
+  // scheduled reminders wait for their digest — only the "auto" ones mail on the spot
+  for (const g of routeAlerts(rules, ruleKey, list, "", "", { autoOnly: true }).slice(0, 100)) {
     const base = typeof subject === "function" ? subject(g.alerts) : subject;
     const subj = g.name ? `${base} — ${g.name}` : base;
     if (await deliver(pool, companyId, g.to, g.alerts, subj, { rule: ruleKey, method: "auto", cache, cc: g.cc, bcc: g.bcc })) {
@@ -1188,6 +1195,109 @@ async function activeCompanies(pool) {
   return rows.length ? rows.map((r) => Number(r.id)) : [1];
 }
 
+/* ───────── scheduled reminders ─────────
+   A reminder's freq: "auto" (default) = mailed the moment an alert is raised;
+   "daily" / "weekly" / "monthly" / "quarterly" = a DIGEST at its time (UAE):
+   everything expiring / expired that it covers + the open alerts of its
+   types. weekly → weekday (0 = Sunday); monthly → monthDay (1-28, capped to
+   the month's last day); quarterly → monthDay of Jan / Apr / Jul / Oct.
+   The schedules live in memory (schedCache, refreshed at boot, at the
+   morning run and whenever the rules are saved), so the 5-minute tick
+   touches the database only when a reminder is actually due. */
+const FREQS = ["auto", "daily", "weekly", "monthly", "quarterly"];
+const FREQ_LABEL = { daily: "Daily", weekly: "Weekly", monthly: "Monthly", quarterly: "Quarterly" };
+
+function reminderDue(rem, day, hm) {
+  if (!rem || rem.active === false || !rem.freq || rem.freq === "auto") return false;
+  if (hm < (rem.time || "08:00")) return false;
+  const d = new Date(`${day}T00:00:00Z`);
+  const last = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth() + 1, 0)).getUTCDate();
+  const target = Math.min(Number(rem.monthDay) || 1, last);
+  if (rem.freq === "daily") return true;
+  if (rem.freq === "weekly") return d.getUTCDay() === (Number(rem.weekday) || 0);
+  if (rem.freq === "monthly") return d.getUTCDate() === target;
+  if (rem.freq === "quarterly") return d.getUTCMonth() % 3 === 0 && d.getUTCDate() === target;
+  return false;
+}
+
+/** One reminder's digest, now: what it covers, to its people. Used by the
+    schedule (method "scheduled") and by Send now on a reminder ("manual"). */
+async function sendReminderDigest(pool, companyId, reminderId, { sentBy = "", method = "scheduled" } = {}) {
+  if (!companyMayMail(companyId)) return { ok: false, error: "no_mailbox" };
+  const rules = await loadRules(pool, companyId);
+  const rem = (rules.reminders || []).find((r) => r.id === reminderId);
+  if (!rem || rem.active === false) return { ok: false, error: "no_reminder" };
+  const today = uaeToday();
+  const covers = (k) => !rem.rules?.length || rem.rules.includes(k);
+  const items = [];
+  if (covers("expiries")) {
+    const found = await checkExpiries(pool, companyId, rules.expiries.days, today, rules.expiries.kinds);
+    for (const x of found) {
+      const a = {
+        id: null, rule: "expiries", branch: x.branch, title: expiryTitle(x),
+        severity: x.stage === "expired" || x.stage === "today" || x.failed ? "critical" : "warning",
+        body: Array.isArray(x.details) ? x.details.join("\n") : "",
+        data: { files: Array.isArray(x.files) ? x.files : [], kind: expiryKindOf(x.key) },
+      };
+      if (reminderMatches(rem, "expiries", a)) items.push(a);
+    }
+  }
+  const others = RULE_KEYS().filter((k) => k !== "expiries" && covers(k));
+  if (others.length) {
+    const { rows } = await pool.query(
+      `SELECT id, rule, severity, branch, title, body, link, data FROM alerts
+        WHERE COALESCE(company_id, 1) = COALESCE($1::int, 1) AND status <> 'resolved' AND rule = ANY($2)
+        ORDER BY created_at DESC LIMIT 300`,
+      [companyId, others]
+    );
+    for (const a of rows) if (reminderMatches(rem, a.rule, a)) items.push(a);
+  }
+  if (!items.length) return { ok: true, items: 0, sent: 0, failed: 0, recipients: 0 };
+  let { to, cc, bcc } = rem;
+  if (!to.length) { if (cc.length) { to = cc; cc = []; } else if (bcc.length) { to = bcc; bcc = []; } }
+  if (!to.length) return { ok: true, items: items.length, sent: 0, failed: 0, recipients: 0 };
+  const label = FREQ_LABEL[rem.freq] || "Reminder";
+  const subject = `🗓️ ${label} reminder${rem.name ? ` — ${rem.name}` : ""} — ${items.length} item(s)${rem.branch !== ALL ? ` · ${rem.branch}` : ""}`;
+  const sent = await deliver(pool, companyId, to, items, subject, { rule: "reminder", method, sentBy, cc, bcc });
+  return { ok: true, items: items.length, mails: 1, sent: sent ? 1 : 0, failed: sent ? 0 : 1, recipients: sent ? new Set([...to, ...cc, ...bcc]).size : 0 };
+}
+
+const schedCache = new Map(); // companyId → its scheduled reminders
+const schedRan = new Set();   // `${companyId}:${id}:${day}` — once per process
+let schedLoaded = false;
+/** Re-reads the scheduled reminders (one company, or all). */
+async function refreshSchedules(pool, companyId = null) {
+  const ids = companyId != null ? [companyId] : await activeCompanies(pool);
+  for (const id of ids) {
+    try {
+      const rules = await loadRules(pool, id);
+      const list = (rules.reminders || []).filter((r) => r.active !== false && r.freq && r.freq !== "auto");
+      if (list.length) schedCache.set(id, list); else schedCache.delete(id);
+    } catch (e) {
+      console.warn(`[alerts] schedules for company ${id}:`, e?.message || e);
+    }
+  }
+  if (companyId == null) schedLoaded = true;
+}
+async function runDueReminders(pool, day, hm) {
+  for (const [companyId, list] of schedCache) {
+    for (const rem of list) {
+      if (!reminderDue(rem, day, hm)) continue;
+      const key = `${companyId}:${rem.id}:${day}`;
+      if (schedRan.has(key)) continue;
+      schedRan.add(key);
+      // claim it — another instance / an earlier boot today may have sent it
+      const claim = await pool.query(
+        `INSERT INTO alert_job_runs (job, day) VALUES ($1, $2) ON CONFLICT DO NOTHING RETURNING job`,
+        [`rem:${companyId}:${rem.id}`.slice(0, 200), day]
+      );
+      if (!claim.rowCount) continue;
+      const r = await sendReminderDigest(pool, companyId, rem.id).catch((e) => ({ error: e?.message || e }));
+      console.log(`[alerts] scheduled reminder ${rem.id} (company ${companyId}):`, JSON.stringify(r));
+    }
+  }
+}
+
 /* ───────── the scheduler ───────── */
 const slots = () =>
   String(process.env.ALERT_TIMES || "08:00,13:00").split(",").map((s) => s.trim()).filter((s) => /^\d{2}:\d{2}$/.test(s)).sort();
@@ -1216,7 +1326,11 @@ async function tick(pool) {
       }
     }
     console.log(`[alerts] ${slot} checks done — ${n} new alert(s)`);
+    if (first) await refreshSchedules(pool).catch(() => {}); // pick up any edit made elsewhere
   }
+  // scheduled reminders: memory only, the database only when one is due
+  if (!schedLoaded) await refreshSchedules(pool);
+  await runDueReminders(pool, day, hm);
 }
 
 let timer = null;
@@ -1241,6 +1355,9 @@ module.exports = {
   isTempSheet,
   onCcpRecordSave,
   runCompanyChecks,
+  sendReminderDigest,
+  refreshSchedules,
+  reminderDue,
   startAlertScheduler,
   mailAlerts,
   _companyMayMail: companyMayMail,

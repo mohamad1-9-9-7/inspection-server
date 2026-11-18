@@ -137,7 +137,11 @@ module.exports = function registerAlertRoutes(app, deps = {}) {
     try {
       const branch = String(req.body?.branch || "").slice(0, 120);
       const reminderId = String(req.body?.reminderId || "").slice(0, 40);
-      const r = await engine.sendRemindersNow(pool, companyId, { email, branch, reminderId, sentBy: String(userOf(req)?.username || "") });
+      const sentBy = String(userOf(req)?.username || "");
+      // one reminder → its full digest (every type it covers), like its schedule would send
+      const r = reminderId && !email
+        ? await engine.sendReminderDigest(pool, companyId, reminderId, { sentBy, method: "manual" })
+        : await engine.sendRemindersNow(pool, companyId, { email, branch, reminderId, sentBy });
       if (!r.ok) return res.status(409).json(r);
       res.json(r);
     } catch (e) {
@@ -177,6 +181,7 @@ module.exports = function registerAlertRoutes(app, deps = {}) {
         [payload.updatedBy || "alerts", engine.RULES_TYPE, JSON.stringify(payload), companyId]
       );
     }
+    engine.refreshSchedules(pool, companyId).catch(() => {}); // new times take effect at once
     res.json({ ok: true, rules });
   });
 
