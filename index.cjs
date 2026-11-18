@@ -114,10 +114,17 @@ const ORIGIN_PATTERNS = ALLOWED_ORIGINS.filter((o) => o.includes("*")).map((o) =
   return new RegExp(`^${m[1]}://[a-z0-9-]+\\.${esc}$`, "i");
 }).filter(Boolean);
 
+/* The Android app (Capacitor) serves the same frontend from inside the APK,
+   so its pages call us from this fixed origin. Always allowed, whatever
+   ALLOWED_ORIGINS says: the app must keep working when the list is narrowed.
+   CORS is not the guard here; every route still needs its auth token. */
+const APP_ORIGINS = ["https://localhost", "capacitor://localhost"];
+
 function originAllowed(origin) {
   if (!origin) return true;
   if (!ALLOWED_ORIGINS.length) return true;
   const o = String(origin).replace(/\/$/, "");
+  if (APP_ORIGINS.includes(o)) return true;
   return ALLOWED_ORIGINS.includes(o) || ORIGIN_PATTERNS.some((re) => re.test(o));
 }
 
